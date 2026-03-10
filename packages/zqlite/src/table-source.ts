@@ -205,12 +205,12 @@ export class TableSource implements Source {
     );
   }
 
-  #getSchema(connection: Connection): SourceSchema {
+  #getSchema(connection: Connection, unordered: boolean): SourceSchema {
     return {
       tableName: this.#table,
       columns: this.#columns,
       primaryKey: this.#primaryKey,
-      sort: connection.sort,
+      sort: unordered ? undefined : connection.sort,
       relationships: {},
       isHidden: false,
       system: 'client',
@@ -219,12 +219,16 @@ export class TableSource implements Source {
   }
 
   connect(
-    sort: Ordering,
+    sort: Ordering | undefined,
     filters?: Condition,
     splitEditKeys?: Set<string>,
     debug?: DebugDelegate,
   ) {
     const transformedFilters = transformFilters(filters);
+    const unordered = sort === undefined;
+    const primaryKeySort: Ordering = this.#primaryKey.map(k => [k, 'asc']);
+    const internalSort = sort ?? primaryKeySort;
+
     const input: SourceInput = {
       getSchema: () => schema,
       fetch: req => this.#fetch(req, connection),
@@ -243,7 +247,7 @@ export class TableSource implements Source {
       input,
       debug,
       output: undefined,
-      sort,
+      sort: internalSort,
       splitEditKeys,
       filters: transformedFilters.filters
         ? {
@@ -251,11 +255,13 @@ export class TableSource implements Source {
             predicate: createPredicate(transformedFilters.filters),
           }
         : undefined,
-      compareRows: makeComparator(sort),
+      compareRows: makeComparator(internalSort),
       lastPushedEpoch: 0,
     };
-    const schema = this.#getSchema(connection);
-    assertOrderingIncludesPK(sort, this.#primaryKey);
+    const schema = this.#getSchema(connection, unordered);
+    if (!unordered) {
+      assertOrderingIncludesPK(internalSort, this.#primaryKey);
+    }
 
     this.#connections.push(connection);
     return input;

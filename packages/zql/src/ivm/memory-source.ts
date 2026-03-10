@@ -140,12 +140,12 @@ export class MemorySource implements Source {
     return this.#getPrimaryIndex().data;
   }
 
-  #getSchema(connection: Connection): SourceSchema {
+  #getSchema(connection: Connection, unordered: boolean): SourceSchema {
     return {
       tableName: this.#tableName,
       columns: this.#columns,
       primaryKey: this.#primaryKey,
-      sort: connection.sort,
+      sort: unordered ? undefined : connection.sort,
       system: 'client',
       relationships: {},
       isHidden: false,
@@ -154,11 +154,13 @@ export class MemorySource implements Source {
   }
 
   connect(
-    sort: Ordering,
+    sort: Ordering | undefined,
     filters?: Condition,
     splitEditKeys?: Set<string>,
   ): SourceInput {
     const transformedFilters = transformFilters(filters);
+    const unordered = sort === undefined;
+    const internalSort = sort ?? this.#primaryIndexSort;
 
     const input: SourceInput = {
       getSchema: () => schema,
@@ -175,9 +177,9 @@ export class MemorySource implements Source {
     const connection: Connection = {
       input,
       output: undefined,
-      sort,
+      sort: internalSort,
       splitEditKeys,
-      compareRows: makeComparator(sort),
+      compareRows: makeComparator(internalSort),
       filters: transformedFilters.filters
         ? {
             condition: transformedFilters.filters,
@@ -186,8 +188,10 @@ export class MemorySource implements Source {
         : undefined,
       lastPushedEpoch: 0,
     };
-    const schema = this.#getSchema(connection);
-    assertOrderingIncludesPK(sort, this.#primaryKey);
+    const schema = this.#getSchema(connection, unordered);
+    if (!unordered) {
+      assertOrderingIncludesPK(internalSort, this.#primaryKey);
+    }
     this.#connections.push(connection);
     return input;
   }

@@ -63,10 +63,9 @@ export class Take implements Operator {
     partitionKey?: PartitionKey,
   ) {
     assert(limit >= 0, 'Limit must be non-negative');
-    assertOrderingIncludesPK(
-      input.getSchema().sort,
-      input.getSchema().primaryKey,
-    );
+    const {sort} = input.getSchema();
+    assert(sort !== undefined, 'Take requires sorted input');
+    assertOrderingIncludesPK(sort, input.getSchema().primaryKey);
     input.setOutput(this);
     this.#input = input;
     this.#storage = storage as TakeStorage;
