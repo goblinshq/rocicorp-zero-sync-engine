@@ -226,8 +226,9 @@ export class TableSource implements Source {
   ) {
     const transformedFilters = transformFilters(filters);
     const unordered = sort === undefined;
+    // PK comparator is used for source-level overlay matching (remove by PK
+    // equality) even when no ordering is requested.
     const primaryKeySort: Ordering = this.#primaryKey.map(k => [k, 'asc']);
-    const internalSort = sort ?? primaryKeySort;
 
     const input: SourceInput = {
       getSchema: () => schema,
@@ -247,7 +248,7 @@ export class TableSource implements Source {
       input,
       debug,
       output: undefined,
-      sort: internalSort,
+      sort,
       splitEditKeys,
       filters: transformedFilters.filters
         ? {
@@ -255,12 +256,12 @@ export class TableSource implements Source {
             predicate: createPredicate(transformedFilters.filters),
           }
         : undefined,
-      compareRows: makeComparator(internalSort),
+      compareRows: sort ? makeComparator(sort) : makeComparator(primaryKeySort),
       lastPushedEpoch: 0,
     };
     const schema = this.#getSchema(connection, unordered);
     if (!unordered) {
-      assertOrderingIncludesPK(internalSort, this.#primaryKey);
+      assertOrderingIncludesPK(sort, this.#primaryKey);
     }
 
     this.#connections.push(connection);
@@ -289,7 +290,9 @@ export class TableSource implements Source {
         ...sqlAndBindings.values,
       );
 
-      const comparator = makeComparator(sort, req.reverse);
+      const comparator = sort
+        ? makeComparator(sort, req.reverse)
+        : connection.compareRows;
 
       debug?.initQuery(this.#table, sqlAndBindings.text);
 
@@ -493,7 +496,7 @@ export class TableSource implements Source {
   #requestToSQL(
     request: FetchRequest,
     filters: NoSubqueryCondition | undefined,
-    order: Ordering,
+    order: Ordering | undefined,
   ): SQLQuery {
     return buildSelectQuery(
       this.#table,

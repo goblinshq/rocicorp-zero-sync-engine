@@ -1,6 +1,7 @@
 import {assert, unreachable} from '../../../shared/src/asserts.ts';
 import {BTreeSet} from '../../../shared/src/btree-set.ts';
 import {hasOwn} from '../../../shared/src/has-own.ts';
+import {must} from '../../../shared/src/must.ts';
 import {once} from '../../../shared/src/iterables.ts';
 import type {
   Condition,
@@ -69,7 +70,7 @@ type Index = {
 export type Connection = {
   input: Input;
   output: Output | undefined;
-  sort: Ordering;
+  sort?: Ordering | undefined;
   splitEditKeys: Set<string> | undefined;
   compareRows: Comparator;
   filters:
@@ -254,7 +255,8 @@ export class MemorySource implements Source {
   }
 
   *#fetch(req: FetchRequest, conn: Connection): Stream<Node | 'yield'> {
-    const {sort: requestedSort, compareRows} = conn;
+    const requestedSort = must(conn.sort);
+    const {compareRows} = conn;
     const connectionComparator = (r1: Row, r2: Row) =>
       compareRows(r1, r2) * (req.reverse ? -1 : 1);
 
