@@ -21,6 +21,7 @@ import {
 import {makeComparator, type Node} from '../../zql/src/ivm/data.ts';
 import {
   generateWithOverlay,
+  generateWithOverlayUnordered,
   generateWithStart,
   genPushAndWriteWithSplitEdit,
   type Connection,
@@ -290,16 +291,34 @@ export class TableSource implements Source {
         ...sqlAndBindings.values,
       );
 
-      const comparator = sort
-        ? makeComparator(sort, req.reverse)
-        : connection.compareRows;
-
       debug?.initQuery(this.#table, sqlAndBindings.text);
 
-      yield* generateWithStart(
-        generateWithYields(
-          generateWithOverlay(
-            req.start?.row,
+      if (sort) {
+        const comparator = makeComparator(sort, req.reverse);
+        yield* generateWithStart(
+          generateWithYields(
+            generateWithOverlay(
+              req.start?.row,
+              this.#mapFromSQLiteTypes(
+                this.#columns,
+                rowIterator,
+                sqlAndBindings.text,
+                debug,
+              ),
+              req.constraint,
+              this.#overlay,
+              connection.lastPushedEpoch,
+              comparator,
+              connection.filters?.predicate,
+            ),
+            this.#shouldYield,
+          ),
+          req.start,
+          comparator,
+        );
+      } else {
+        yield* generateWithYields(
+          generateWithOverlayUnordered(
             this.#mapFromSQLiteTypes(
               this.#columns,
               rowIterator,
@@ -309,14 +328,12 @@ export class TableSource implements Source {
             req.constraint,
             this.#overlay,
             connection.lastPushedEpoch,
-            comparator,
+            this.#primaryKey,
             connection.filters?.predicate,
           ),
           this.#shouldYield,
-        ),
-        req.start,
-        comparator,
-      );
+        );
+      }
     } finally {
       if (debug) {
         let totalNvisit = 0;

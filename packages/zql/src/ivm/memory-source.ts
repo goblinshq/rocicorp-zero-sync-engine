@@ -765,6 +765,80 @@ export function* generateWithOverlayInner(
 }
 
 /**
+ * Like {@link generateWithOverlay} but for unordered streams.
+ * No `startAt` or comparator needed. Injects remove/old-edit rows eagerly
+ * at the start, and suppresses add/new-edit rows inline by PK match.
+ */
+export function* generateWithOverlayUnordered(
+  rows: Iterable<Row>,
+  constraint: Constraint | undefined,
+  overlay: Overlay | undefined,
+  lastPushedEpoch: number,
+  primaryKey: PrimaryKey,
+  filterPredicate?: ((row: Row) => boolean) | undefined,
+) {
+  let overlayToApply: Overlay | undefined = undefined;
+  if (overlay && lastPushedEpoch >= overlay.epoch) {
+    overlayToApply = overlay;
+  }
+  let overlays: Overlays = {add: undefined, remove: undefined};
+  switch (overlayToApply?.change.type) {
+    case 'add':
+      overlays = {add: overlayToApply.change.row, remove: undefined};
+      break;
+    case 'remove':
+      overlays = {add: undefined, remove: overlayToApply.change.row};
+      break;
+    case 'edit':
+      overlays = {
+        add: overlayToApply.change.row,
+        remove: overlayToApply.change.oldRow,
+      };
+      break;
+  }
+  if (constraint) {
+    overlays = overlaysForConstraint(overlays, constraint);
+  }
+  if (filterPredicate) {
+    overlays = overlaysForFilterPredicate(overlays, filterPredicate);
+  }
+  yield* generateWithOverlayInnerUnordered(rows, overlays, primaryKey);
+}
+
+export function* generateWithOverlayInnerUnordered(
+  rowIterator: Iterable<Row>,
+  overlays: Overlays,
+  primaryKey: PrimaryKey,
+) {
+  // Eager inject: yield the add overlay at the start (row not yet in storage)
+  if (overlays.add) {
+    yield {row: overlays.add, relationships: {}};
+  }
+  // Stream with inline suppress: skip the remove overlay (row still in storage)
+  let removeSkipped = false;
+  for (const row of rowIterator) {
+    if (
+      !removeSkipped &&
+      overlays.remove &&
+      rowMatchesPK(overlays.remove, row, primaryKey)
+    ) {
+      removeSkipped = true;
+      continue;
+    }
+    yield {row, relationships: {}};
+  }
+}
+
+function rowMatchesPK(a: Row, b: Row, primaryKey: PrimaryKey): boolean {
+  for (const key of primaryKey) {
+    if (!valuesEqual(a[key], b[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * A location to begin scanning an index from. Can either be a specific value
  * or the min or max possible value for the type. This is used to start a scan
  * at the beginning of the rows matching a constraint.
