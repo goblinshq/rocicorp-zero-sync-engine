@@ -12,10 +12,7 @@ import {newQuery} from '../../zql/src/query/query-impl.ts';
 import type {Query} from '../../zql/src/query/query.ts';
 import {createTableSQL, schema} from '../../zql/src/query/test/test-schemas.ts';
 import {Database} from '../../zqlite/src/db.ts';
-import {
-  mapResultToClientNames,
-  newQueryDelegate,
-} from '../../zqlite/src/test/source-factory.ts';
+import {newQueryDelegate} from '../../zqlite/src/test/source-factory.ts';
 
 const lc = createSilentLogContext();
 
@@ -77,23 +74,12 @@ function makeQuery() {
   return issueQuery.whereExists('comments').related('comments');
 }
 
-function mapped(data: unknown) {
-  return mapResultToClientNames(data, schema, 'issue');
-}
-
-function expectConsistent(
-  view: {data: unknown},
-  q: ReturnType<typeof makeQuery>,
-) {
-  expect(mapped(view.data)).toEqual(mapped(queryDelegate.materialize(q).data));
-}
-
 test('initial materialization — issue1 excluded, issue2/3/4 included', () => {
   const q = makeQuery();
   const view = queryDelegate.materialize(q);
-  const data = mapped(view.data) as Array<{
-    id: string;
-    comments: Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{
+    readonly id: string;
+    readonly comments: ReadonlyArray<{readonly id: string}>;
   }>;
 
   // issue1 has no comments → excluded by EXISTS
@@ -107,7 +93,7 @@ test('initial materialization — issue1 excluded, issue2/3/4 included', () => {
   const issue4 = data.find(r => r.id === 'issue4')!;
   expect(issue4.comments).toHaveLength(5);
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
 
 test('add comment to commentless issue → issue appears', () => {
@@ -127,10 +113,10 @@ test('add comment to commentless issue → issue appears', () => {
     }),
   );
 
-  const data = mapped(view.data) as Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{readonly id: string}>;
   expect(data.map(r => r.id)).toContain('issue1');
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
 
 test('add beyond cap limit → issue stays, related shows all', () => {
@@ -151,9 +137,9 @@ test('add beyond cap limit → issue stays, related shows all', () => {
     }),
   );
 
-  const data = mapped(view.data) as Array<{
-    id: string;
-    comments: Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{
+    readonly id: string;
+    readonly comments: ReadonlyArray<{readonly id: string}>;
   }>;
   expect(data.map(r => r.id)).toContain('issue3');
 
@@ -161,7 +147,7 @@ test('add beyond cap limit → issue stays, related shows all', () => {
   const issue3 = data.find(r => r.id === 'issue3')!;
   expect(issue3.comments).toHaveLength(4);
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
 
 test('remove tracked comment with overflow → issue stays', () => {
@@ -182,10 +168,10 @@ test('remove tracked comment with overflow → issue stays', () => {
     }),
   );
 
-  const data = mapped(view.data) as Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{readonly id: string}>;
   expect(data.map(r => r.id)).toContain('issue4');
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
 
 test('remove untracked overflow comment → issue stays', () => {
@@ -206,10 +192,10 @@ test('remove untracked overflow comment → issue stays', () => {
     }),
   );
 
-  const data = mapped(view.data) as Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{readonly id: string}>;
   expect(data.map(r => r.id)).toContain('issue4');
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
 
 test('remove only comment → issue disappears', () => {
@@ -230,10 +216,10 @@ test('remove only comment → issue disappears', () => {
     }),
   );
 
-  const data = mapped(view.data) as Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{readonly id: string}>;
   expect(data.map(r => r.id)).not.toContain('issue1');
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
 
 test('re-add comment → issue reappears', () => {
@@ -253,8 +239,8 @@ test('re-add comment → issue reappears', () => {
     }),
   );
 
-  const data = mapped(view.data) as Array<{id: string}>;
+  const data = view.data as ReadonlyArray<{readonly id: string}>;
   expect(data.map(r => r.id)).toContain('issue1');
 
-  expectConsistent(view, q);
+  expect(view.data).toEqual(queryDelegate.materialize(q).data);
 });
