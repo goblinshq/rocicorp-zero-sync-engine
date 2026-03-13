@@ -132,4 +132,3 @@ export class ArrayView<V extends View> implements Output, TypedView<V> {
     this.#updateTTL(ttl);
   }
 }
-

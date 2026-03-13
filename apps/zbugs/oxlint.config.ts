@@ -1,5 +1,5 @@
-import { defineConfig } from 'oxlint';
-import { baseConfig } from '../../oxlint.base.ts';
+import {defineConfig} from 'oxlint';
+import {baseConfig} from '../../oxlint.base.ts';
 
 /**
  * Zbugs-specific oxlint configuration.
