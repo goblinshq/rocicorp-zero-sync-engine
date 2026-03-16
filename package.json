@@ -34,9 +34,9 @@
     "@vitest/coverage-v8": "4.1.0",
     "@vitest/runner": "4.1.0",
     "baseline-browser-mapping": "^2.9.6",
-    "oxlint": "^1.55.0",
+    "oxlint": "^1.56.0",
     "oxlint-tsgolint": "^0.17.0",
-    "prettier": "^3.5.3",
+    "prettier": "^3.8.1",
     "tsx": "^4.21.0",
     "turbo": "^2.4.4",
     "vitest": "4.1.0"
