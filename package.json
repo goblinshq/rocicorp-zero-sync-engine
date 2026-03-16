@@ -1,6 +1,6 @@
 {
   "name": "@rocicorp/mono",
-  "packageManager": "npm@11.11.1",
+  "packageManager": "npm@10.9.6",
   "engines": {
     "node": ">=22"
   },
