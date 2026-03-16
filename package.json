@@ -1,6 +1,6 @@
 {
   "name": "@rocicorp/mono",
-  "packageManager": "npm@10.9.2",
+  "packageManager": "npm@11.11.1",
   "engines": {
     "node": ">=22"
   },
@@ -30,15 +30,15 @@
     "verify-deps:fix": "cd tools/verify-package-deps && npm run verify:fix"
   },
   "devDependencies": {
-    "@vitest/browser-playwright": "^4.0.15",
-    "@vitest/coverage-v8": "4.0.15",
-    "@vitest/runner": "4.0.15",
+    "@vitest/browser-playwright": "^4.1.0",
+    "@vitest/coverage-v8": "4.1.0",
+    "@vitest/runner": "4.1.0",
     "baseline-browser-mapping": "^2.9.6",
     "oxlint": "^1.55.0",
     "oxlint-tsgolint": "^0.17.0",
     "prettier": "^3.5.3",
     "tsx": "^4.21.0",
     "turbo": "^2.4.4",
-    "vitest": "4.0.15"
+    "vitest": "4.1.0"
   }
 }

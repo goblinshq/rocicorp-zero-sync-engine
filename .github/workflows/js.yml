@@ -22,6 +22,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - run: npx syncpack@13 list-mismatches
 
   verify-deps:
@@ -33,6 +34,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - run: npm install --prefix tools/verify-package-deps
       - run: npm run verify-deps
 
@@ -49,6 +51,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -68,6 +71,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -87,6 +91,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - run: npm ci
       - run: npm run check-types
 
@@ -108,6 +113,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - run: npm ci
       - name: Install Playwright
         run: npx playwright install chromium firefox webkit --with-deps
@@ -132,6 +138,7 @@ jobs:
         with:
           node-version: 22.x
           cache: 'npm'
+      - run: npm install -g npm@11
       - run: npm ci
       - name: Run tests
         run: TEST_PG_MODE=pg-${{ matrix.pg-version }} npm run test
