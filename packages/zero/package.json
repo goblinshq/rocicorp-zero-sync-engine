@@ -99,10 +99,14 @@
     "zqlite": "0.0.0"
   },
   "peerDependencies": {
+    "@tanstack/react-virtual": "^3.10.9",
     "expo-sqlite": ">=15",
     "@op-engineering/op-sqlite": ">=15"
   },
   "peerDependenciesMeta": {
+    "@tanstack/react-virtual": {
+      "optional": true
+    },
     "expo-sqlite": {
       "optional": true
     },
