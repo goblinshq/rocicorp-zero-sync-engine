@@ -1,4 +1,5 @@
 import type {LogContext} from '@rocicorp/logger';
+import {sleep} from '../../../shared/src/sleep.ts';
 import * as v from '../../../shared/src/valita.ts';
 import {Database} from '../../../zqlite/src/db.ts';
 import type {ReplicaOptions} from '../config/zero-config.ts';
@@ -14,6 +15,10 @@ import {
   getAscendingEvents,
   recordEvent,
 } from '../services/replicator/schema/replication-state.ts';
+import {
+  applyPragmas,
+  type PragmaConfig,
+} from '../services/replicator/write-worker-client.ts';
 import type {Worker} from '../types/processes.ts';
 
 export const replicaFileModeSchema = v.literalUnion(
@@ -24,6 +29,8 @@ export const replicaFileModeSchema = v.literalUnion(
 
 export type ReplicaFileMode = v.Infer<typeof replicaFileModeSchema>;
 
+export type WalMode = 'wal' | 'wal2';
+
 export function replicaFileName(replicaFile: string, mode: ReplicaFileMode) {
   return mode === 'serving-copy' ? `${replicaFile}-serving-copy` : replicaFile;
 }
@@ -31,12 +38,12 @@ export function replicaFileName(replicaFile: string, mode: ReplicaFileMode) {
 const MILLIS_PER_HOUR = 1000 * 60 * 60;
 const MB = 1024 * 1024;
 
-async function connect(
+async function prepare(
   lc: LogContext,
   {file, vacuumIntervalHours}: ReplicaOptions,
-  walMode: 'wal' | 'wal2',
+  walMode: WalMode,
   mode: ReplicaFileMode,
-): Promise<Database> {
+): Promise<{file: string; walMode: WalMode}> {
   const replica = new Database(lc, file);
 
   // Perform any upgrades to the replica in case the backup is an
@@ -44,7 +51,7 @@ async function connect(
   await upgradeReplica(lc, `${mode}-replica`, file);
 
   // Start by folding any (e.g. restored) WAL(2) files into the main db.
-  replica.pragma('journal_mode = delete');
+  await setJournalMode(lc, replica, 'delete');
 
   const [{page_size: pageSize}] = replica.pragma<{page_size: number}>(
     'page_size',
@@ -81,37 +88,64 @@ async function connect(
     }
   }
 
-  lc.info?.(`setting ${file} to ${walMode} mode`);
-  replica.pragma(`journal_mode = ${walMode}`);
+  await setJournalMode(lc, replica, walMode);
 
-  // The duration of the loop in which the replicator attempts
-  // to begin a transaction while litestream is performing a
-  // checkpoint.
-  replica.pragma('busy_timeout = 30000');
+  const pragmas = getPragmaConfig(mode);
+  applyPragmas(replica, pragmas);
 
   replica.pragma('optimize = 0x10002');
-  // Cap the running time of `PRAGMA optimize` calls that happen
-  // after replicating schema changes. 1000 is the limit recommended
-  // in https://sqlite.org/lang_analyze.html#approx
-  replica.pragma('analysis_limit = 1000');
   lc.info?.(`optimized ${file}`);
-  return replica;
+  replica.close();
+  return {file, walMode};
 }
 
-export async function setupReplica(
+// Setting the journal_mode requires an exclusive lock on the replica.
+// Add resilience against random replica reads (for stats, etc.) by
+// retrying if the database is locked. Note that the busy_timeout doesn't
+// work here.
+async function setJournalMode(
+  lc: LogContext,
+  replica: Database,
+  mode: 'delete' | 'wal' | 'wal2',
+) {
+  lc.info?.(`setting ${replica.name} to ${mode} mode`);
+  let err: unknown;
+  for (let i = 0; i < 5; i++) {
+    try {
+      replica.pragma(`journal_mode = ${mode}`);
+      return;
+    } catch (e) {
+      lc.warn?.(`error setting journal_mode to ${mode} (attempt ${i + 1})`, e);
+      err = e;
+    }
+    await sleep(500);
+  }
+  throw err;
+}
+
+/**
+ * Returns the PragmaConfig for a given replica file mode.
+ * This is used by both the main thread (setupReplica) and
+ * the write worker thread to apply the same pragma settings.
+ */
+export function getPragmaConfig(mode: ReplicaFileMode): PragmaConfig {
+  return {
+    busyTimeout: 30000,
+    analysisLimit: 1000,
+    walAutocheckpoint: mode === 'backup' ? 0 : undefined,
+  };
+}
+
+export function setupReplica(
   lc: LogContext,
   mode: ReplicaFileMode,
   replicaOptions: ReplicaOptions,
-): Promise<Database> {
+) {
   lc.info?.(`setting up ${mode} replica`);
 
   switch (mode) {
-    case 'backup': {
-      const replica = await connect(lc, replicaOptions, 'wal', mode);
-      // https://litestream.io/tips/#disable-autocheckpoints-for-high-write-load-servers
-      replica.pragma('wal_autocheckpoint = 0');
-      return replica;
-    }
+    case 'backup':
+      return prepare(lc, replicaOptions, 'wal', mode);
 
     case 'serving-copy': {
       // In 'serving-copy' mode, the original file is being used for 'backup'
@@ -127,11 +161,11 @@ export async function setupReplica(
       replica.close();
       lc.info?.(`finished copy (${Date.now() - start} ms)`);
 
-      return connect(lc, {...replicaOptions, file: copyLocation}, 'wal2', mode);
+      return prepare(lc, {...replicaOptions, file: copyLocation}, 'wal2', mode);
     }
 
     case 'serving':
-      return connect(lc, replicaOptions, 'wal2', mode);
+      return prepare(lc, replicaOptions, 'wal2', mode);
 
     default:
       throw new Error(`Invalid ReplicaMode ${mode}`);
@@ -162,7 +196,23 @@ export function handleSubscriptionsFrom(
     });
 
     for await (const msg of subscription) {
-      subscriber.send<Notification>(['notify', msg]);
+      try {
+        subscriber.send<Notification>(['notify', msg]);
+      } catch (e) {
+        const log =
+          e instanceof Error &&
+          'code' in e &&
+          // This can happen in a race condition if the subscribing process
+          // is closed before the 'close' message is processed.
+          e.code === 'ERR_IPC_CHANNEL_CLOSED'
+            ? 'warn'
+            : 'error';
+
+        lc[log]?.(
+          `error sending replicator notification to ${subscriber.pid}: ${String(e)}`,
+          e,
+        );
+      }
     }
   });
 }

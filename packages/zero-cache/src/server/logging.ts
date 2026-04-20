@@ -6,18 +6,23 @@ import {
   getLogSink,
   type LogConfig,
 } from '../../../shared/src/logging.ts';
+import {UNHANDLED_EXCEPTION_ERROR_CODE} from '../services/life-cycle.ts';
 import {OtelLogSink} from './otel-log-sink.ts';
 
 export function createLogContext(
   {log}: {log: LogConfig},
-  context: {worker: string},
+  worker: string,
+  workerIndex = 0,
   includeOtel = true,
 ): LogContext {
-  return createLogContextShared(
-    {log},
-    context,
-    createLogSink(log, includeOtel),
-  );
+  const logSink = createLogSink(log, includeOtel);
+  const lc = createLogContextShared({log}, {worker, workerIndex}, logSink);
+  process.on('uncaughtException', async (err, origin) => {
+    lc.error?.(origin, err);
+    await logSink.flush?.();
+    process.exit(UNHANDLED_EXCEPTION_ERROR_CODE);
+  });
+  return lc;
 }
 
 function createLogSink(config: LogConfig, includeOtel: boolean): LogSink {

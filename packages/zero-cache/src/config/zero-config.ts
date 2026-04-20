@@ -2,8 +2,8 @@
  * These types represent the _compiled_ config whereas `define-config` types represent the _source_ config.
  */
 
-import type {LogContext} from '@rocicorp/logger';
 import {timingSafeEqual} from 'node:crypto';
+import type {LogContext} from '@rocicorp/logger';
 import {logOptions} from '../../../otel/src/log-options.ts';
 import {
   flagToEnv,
@@ -194,6 +194,20 @@ const authOptions = {
       `Use cookie-based authentication or an auth token instead - see https://zero.rocicorp.dev/docs/auth.`,
     ],
   },
+  revalidateIntervalSeconds: {
+    type: v.number().optional(),
+    desc: [
+      `The interval in seconds between periodic /query auth revalidation for validated connections.`,
+      `If unset, periodic auth revalidation is disabled.`,
+    ],
+  },
+  retransformIntervalSeconds: {
+    type: v.number().optional(),
+    desc: [
+      `The interval in seconds between periodic shared /query retransform work for a client group.`,
+      `If unset, periodic shared retransform is disabled.`,
+    ],
+  },
 };
 
 const makeDeprecationMessage = (flag: string) =>
@@ -297,8 +311,13 @@ const getQueriesOptions = makeMutatorQueryOptions(
   'send synced queries',
 );
 
-/** @deprecated */
 export type AuthConfig = Config<typeof authOptions>;
+
+/** @deprecated used only by legacy JWT verification helpers */
+export type LegacyJWTAuthConfig = Pick<
+  AuthConfig,
+  'jwk' | 'jwksUrl' | 'secret' | 'issuer' | 'audience'
+>;
 
 // Note: --help will list flags in the order in which they are defined here,
 // so order the fields such that the important (e.g. required) ones are first.
@@ -341,6 +360,20 @@ export const zeroOptions = {
       type: v.number().optional(),
       hidden: true, // Passed from main thread to sync workers
     },
+
+    pgReplicationSlotFailover: {
+      type: v.boolean().optional(),
+      desc: [
+        `For upstream Postgres versions 17+, creates replication slots with the`,
+        `{bold failover} parameter set to {bold true} to enable slot synchronization`,
+        `and failover. Note that additional Postgres-level configuration is necessary`,
+        `when enabling this option. For details, see:`,
+        ``,
+        `https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION`,
+        ``,
+        `(Note that this option has no effect for Postgres versions before 17.)`,
+      ],
+    },
   },
 
   /** @deprecated */
@@ -349,6 +382,15 @@ export const zeroOptions = {
   /** @deprecated */
   getQueries: getQueriesOptions,
   query: queryOptions,
+
+  enableCrudMutations: {
+    type: v.boolean().default(true),
+    desc: [
+      `Enables support for legacy CRUD mutations. When this is {bold false}, no connections`,
+      `are made from view-syncers to the upstream db, and push messages with CRUD mutations`,
+      `result in an InvalidPush response.`,
+    ],
+  },
 
   cvr: {
     db: {
@@ -455,6 +497,17 @@ export const zeroOptions = {
         `{bold zero-cache} replication subscriptions.`,
       ],
     },
+
+    statementTimeoutMs: {
+      type: v.number().default(20_000),
+      desc: [
+        `Fail change-log transactions if a statement response from postgres is not received within`,
+        `the specified timeout. This differs from a postgres {bold statement_timeout} in that`,
+        `it is implemented to handle a pathological case in which Postgres does not return a`,
+        `response but otherwise believes the transaction to be idle.`,
+      ],
+      hidden: true, // make visible if proven to be effective/necessary
+    },
   },
 
   replica: replicaOptions,
@@ -465,7 +518,6 @@ export const zeroOptions = {
 
   shard: shardOptions,
 
-  /** @deprecated */
   auth: authOptions,
 
   port: {
@@ -636,6 +688,21 @@ export const zeroOptions = {
     ],
   },
 
+  replicationLag: {
+    reportIntervalMs: {
+      type: v.number().default(30000),
+      desc: [
+        `The minimum interval at which replication lag reports are written upstream and`,
+        `reported via the {bold zero.replication.total_lag} opentelemetry metric. Because`,
+        `replication lag reports are only issued after the previous one was received, the`,
+        `actual interval between reports may be longer when there is a backlog in the`,
+        `replication stream. A negative or 0 value disables lag reporting.`,
+        ``,
+        `This monitoring feature is only support on the postgres upstream type.`,
+      ],
+    },
+  },
+
   adminPassword: {
     type: v.string().optional(),
     desc: [
@@ -684,7 +751,29 @@ export const zeroOptions = {
   litestream: {
     executable: {
       type: v.string().optional(),
-      desc: [`Path to the {bold litestream} executable.`],
+      desc: [
+        `Path to the {bold litestream} executable. This must be built from the`,
+        `{bold rocicorp/litestream} fork. Support for the official binary at v0.5.x`,
+        `is planned.`,
+      ],
+    },
+
+    executableV5: {
+      type: v.string().optional(),
+      desc: [
+        `The v0.5.x litestream executable which is used for restoring the backup`,
+        `backup when {bold ZERO_LITESTREAM_RESTORE_USING_V5} is specified.`,
+        `litestream v0.5.8+ can restore from both v0.3.x and v0.5.x backup formats,`,
+        `affording forwards compatibility with a future zero-cache`,
+        `version that will use litestream v0.5.x to backup the replica.`,
+      ],
+    },
+
+    restoreUsingV5: {
+      type: v.boolean().default(false),
+      desc: [
+        `Restores the backup using the {bold ZERO_LITESTREAM_EXECUTABLE_V5} if specified.`,
+      ],
     },
 
     configPath: {
@@ -832,6 +921,54 @@ export const zeroOptions = {
       desc: [
         `Takes a cpu profile during the copy phase initial-sync, storing it as a JSON file`,
         `initial-copy.cpuprofile in the tmp directory.`,
+      ],
+    },
+
+    textCopy: {
+      type: v.boolean().default(false),
+      desc: [
+        `Use text-format COPY instead of binary COPY for initial sync and`,
+        `backfill streaming. This is slower but can work around issues with`,
+        `binary encoding of certain data types.`,
+      ],
+    },
+  },
+
+  shadowSync: {
+    enabled: {
+      type: v.boolean().default(false),
+      desc: [
+        `Periodically exercises the initial-sync code path against a sample of`,
+        `rows from every published table, writing to a throwaway SQLite database.`,
+        `This acts as a canary: if the real initial-sync path ever breaks (schema`,
+        `drift, PG version quirks, etc.), the shadow run fails before a customer`,
+        `actually needs a full reset.`,
+      ],
+    },
+
+    intervalHours: {
+      type: v.number().default(24),
+      desc: [
+        `The interval between shadow initial-sync runs, in hours. The first run`,
+        `is additionally staggered by a random fraction of this interval so that`,
+        `a fleet restart does not cause all tasks to canary simultaneously.`,
+      ],
+    },
+
+    sampleRate: {
+      type: v.number().default(0.1),
+      desc: [
+        `The BERNOULLI sampling rate for each table (0 < rate <= 1). A value of`,
+        `1 disables sampling and copies all rows (still subject to`,
+        `{bold max-rows-per-table}).`,
+      ],
+    },
+
+    maxRowsPerTable: {
+      type: v.number().default(10000),
+      desc: [
+        `The hard upper bound on rows copied per table per shadow run. Guards`,
+        `against unexpectedly large tables consuming disk / upstream bandwidth.`,
       ],
     },
   },

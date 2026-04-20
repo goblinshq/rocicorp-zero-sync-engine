@@ -1,4 +1,4 @@
-import {trace} from '@opentelemetry/api';
+import {ROOT_CONTEXT, context, propagation, trace} from '@opentelemetry/api';
 import {Lock} from '@rocicorp/lock';
 import type {LogContext} from '@rocicorp/logger';
 import {startAsyncSpan, startSpan} from '../../../otel/src/span.ts';
@@ -11,43 +11,50 @@ import type {Upstream} from '../../../zero-protocol/src/up.ts';
 import type {Mutagen} from '../services/mutagen/mutagen.ts';
 import type {Pusher} from '../services/mutagen/pusher.ts';
 import {
-  type SyncContext,
-  type ViewSyncer,
-} from '../services/view-syncer/view-syncer.ts';
+  type ConnectionContextManager,
+  type ConnectionSelector,
+} from '../services/view-syncer/connection-context-manager.ts';
+import {type ViewSyncer} from '../services/view-syncer/view-syncer.ts';
 import type {ConnectParams} from './connect-params.ts';
 import type {HandlerResult, MessageHandler} from './connection.ts';
 
 const tracer = trace.getTracer('syncer-ws-server', version);
 
+/**
+ * Wraps a function in an OTEL context extracted from a W3C traceparent header.
+ * This enables distributed tracing from the client through zero-cache to
+ * the user's API server.
+ */
+function withTraceparent<T>(traceparent: string | undefined, fn: () => T): T {
+  if (!traceparent) {
+    return fn();
+  }
+  const extracted = propagation.extract(ROOT_CONTEXT, {traceparent});
+  return context.with(extracted, fn);
+}
+
 export class SyncerWsMessageHandler implements MessageHandler {
   readonly #viewSyncer: ViewSyncer;
-  readonly #mutagen: Mutagen;
+  readonly #mutagen: Mutagen | undefined;
   readonly #mutationLock: Lock;
   readonly #lc: LogContext;
   readonly #clientGroupID: string;
-  readonly #syncContext: SyncContext;
+  readonly #connectionSelector: ConnectionSelector;
+  readonly #contextManager: ConnectionContextManager;
   readonly #pusher: Pusher | undefined;
 
   constructor(
     lc: LogContext,
     connectParams: ConnectParams,
+    contextManager: ConnectionContextManager,
     viewSyncer: ViewSyncer,
-    mutagen: Mutagen,
+    mutagen: Mutagen | undefined,
     pusher: Pusher | undefined,
   ) {
-    const {
-      clientGroupID,
-      clientID,
-      profileID,
-      wsID,
-      baseCookie,
-      protocolVersion,
-      httpCookie,
-      origin,
-      userID,
-    } = connectParams;
+    const {clientGroupID, clientID, wsID} = connectParams;
     this.#viewSyncer = viewSyncer;
     this.#mutagen = mutagen;
+    this.#contextManager = contextManager;
     this.#mutationLock = new Lock();
     this.#lc = lc
       .withContext('connection')
@@ -56,15 +63,9 @@ export class SyncerWsMessageHandler implements MessageHandler {
       .withContext('wsID', wsID);
     this.#clientGroupID = clientGroupID;
     this.#pusher = pusher;
-    this.#syncContext = {
+    this.#connectionSelector = {
       clientID,
-      profileID,
       wsID,
-      baseCookie,
-      protocolVersion,
-      httpCookie,
-      origin,
-      userID,
     };
   }
 
@@ -80,146 +81,176 @@ export class SyncerWsMessageHandler implements MessageHandler {
         lc.error?.('Pull is not supported by Zero');
         break;
       case 'push': {
-        return startAsyncSpan<HandlerResult[]>(
-          tracer,
-          'connection.push',
-          async () => {
-            const {clientGroupID, mutations, auth: pushAuth} = msg[1];
-            if (clientGroupID !== this.#clientGroupID) {
-              return [
-                {
-                  type: 'fatal',
-                  error: {
-                    kind: ErrorKind.InvalidPush,
-                    message:
-                      `clientGroupID in mutation "${clientGroupID}" does not match ` +
-                      `clientGroupID of connection "${this.#clientGroupID}`,
-                    origin: ErrorOrigin.ZeroCache,
+        return withTraceparent(msg[1].traceparent, () =>
+          startAsyncSpan<HandlerResult[]>(
+            tracer,
+            'connection.push',
+            async () => {
+              const {clientGroupID, mutations} = msg[1];
+              if (clientGroupID !== this.#clientGroupID) {
+                return [
+                  {
+                    type: 'fatal',
+                    error: {
+                      kind: ErrorKind.InvalidPush,
+                      message:
+                        `clientGroupID in mutation "${clientGroupID}" does not match ` +
+                        `clientGroupID of connection "${this.#clientGroupID}`,
+                      origin: ErrorOrigin.ZeroCache,
+                    },
+                  } satisfies HandlerResult,
+                ];
+              }
+
+              if (mutations.length === 0) {
+                return [
+                  {
+                    type: 'ok',
                   },
-                } satisfies HandlerResult,
-              ];
-            }
+                ];
+              }
 
-            // for backwards compatibility, if the push contains auth, we update it
-            if (pushAuth) {
-              await viewSyncer.updateAuth(this.#syncContext, [
-                'updateAuth',
-                {auth: pushAuth},
-              ]);
-            }
-
-            if (mutations.length === 0) {
-              return [
-                {
-                  type: 'ok',
-                },
-              ];
-            }
-
-            // The client only ever sends 1 mutation per push.
-            // #pusher will throw if it sees a CRUD mutation.
-            // #mutagen will throw if it see a custom mutation.
-            if (mutations[0].type === 'custom') {
-              assert(
-                this.#pusher,
-                'A ZERO_MUTATE_URL must be set in order to process custom mutations.',
-              );
-              return [
-                this.#pusher.enqueuePush(
-                  this.#syncContext.clientID,
-                  msg[1],
-                  viewSyncer.auth?.raw,
-                  this.#syncContext.httpCookie,
-                  this.#syncContext.origin,
-                ),
-              ];
-            }
-
-            const auth = viewSyncer.auth;
-            assert(
-              auth?.type !== 'opaque',
-              'Only JWT auth is supported for CRUD mutations',
-            );
-
-            // Hold a connection-level lock while processing mutations so that:
-            // 1. Mutations are processed in the order in which they are received and
-            // 2. A single view syncer connection cannot hog multiple upstream connections.
-            const ret = await this.#mutationLock.withLock(async () => {
-              const errors: ErrorBody[] = [];
-              for (const mutation of mutations) {
-                const maybeError = await this.#mutagen.processMutation(
-                  mutation,
-                  auth?.decoded,
-                  this.#pusher !== undefined,
-                );
-                if (maybeError !== undefined) {
-                  errors.push({
-                    kind: maybeError[0],
-                    message: maybeError[1],
-                    origin: ErrorOrigin.ZeroCache,
-                  });
+              // The client only ever sends 1 mutation per push.
+              // #pusher will throw if it sees a CRUD mutation.
+              // #mutagen will throw if it see a custom mutation.
+              if (mutations[0].type === 'custom') {
+                if (!this.#pusher) {
+                  return [
+                    {
+                      type: 'fatal',
+                      error: {
+                        kind: ErrorKind.InvalidPush,
+                        message:
+                          'A ZERO_MUTATE_URL must be set in order to process custom mutations.',
+                        origin: ErrorOrigin.ZeroCache,
+                      },
+                    } satisfies HandlerResult,
+                  ];
                 }
+                return [
+                  this.#pusher.enqueuePush(this.#connectionSelector, msg[1]),
+                ];
               }
-              if (errors.length > 0) {
-                return {type: 'transient', errors} satisfies HandlerResult;
+
+              const mutagen = this.#mutagen;
+              if (!mutagen) {
+                return [
+                  {
+                    type: 'fatal',
+                    error: {
+                      kind: ErrorKind.InvalidPush,
+                      message: `Support for legacy CRUD mutations is disabled`,
+                      origin: ErrorOrigin.ZeroCache,
+                    },
+                  } satisfies HandlerResult,
+                ];
               }
-              return {type: 'ok'} satisfies HandlerResult;
-            });
-            return [ret];
-          },
+
+              const auth = this.#contextManager.mustGetConnectionContext(
+                this.#connectionSelector,
+              ).auth;
+              assert(
+                auth?.type !== 'opaque',
+                'Only JWT auth is supported for CRUD mutations',
+              );
+
+              // Hold a connection-level lock while processing mutations so that:
+              // 1. Mutations are processed in the order in which they are received and
+              // 2. A single view syncer connection cannot hog multiple upstream connections.
+              const ret = await this.#mutationLock.withLock(async () => {
+                const errors: ErrorBody[] = [];
+                for (const mutation of mutations) {
+                  const maybeError = await mutagen.processMutation(
+                    mutation,
+                    auth?.decoded,
+                    this.#pusher !== undefined,
+                  );
+                  if (maybeError !== undefined) {
+                    errors.push({
+                      kind: maybeError[0],
+                      message: maybeError[1],
+                      origin: ErrorOrigin.ZeroCache,
+                    });
+                  }
+                }
+                if (errors.length > 0) {
+                  return {type: 'transient', errors} satisfies HandlerResult;
+                }
+                return {type: 'ok'} satisfies HandlerResult;
+              });
+              return [ret];
+            },
+          ),
         );
       }
       case 'changeDesiredQueries':
-        await startAsyncSpan(tracer, 'connection.changeDesiredQueries', () =>
-          viewSyncer.changeDesiredQueries(this.#syncContext, msg),
+        await withTraceparent(msg[1].traceparent, () =>
+          startAsyncSpan(tracer, 'connection.changeDesiredQueries', () =>
+            viewSyncer.changeDesiredQueries(this.#connectionSelector, msg),
+          ),
         );
         break;
       case 'updateAuth':
         await startAsyncSpan(tracer, 'connection.updateAuth', async () => {
-          await viewSyncer.updateAuth(this.#syncContext, msg);
+          const initialConnection =
+            this.#contextManager.mustGetConnectionContext(
+              this.#connectionSelector,
+            );
+          const updatedConnection = await this.#contextManager.updateAuth(
+            this.#connectionSelector,
+            msg[1],
+          );
+          const authRevisionChanged =
+            updatedConnection.revision !== initialConnection.revision;
+
+          await viewSyncer.updateAuth(
+            this.#connectionSelector,
+            msg,
+            authRevisionChanged,
+          );
         });
         break;
       case 'deleteClients': {
         const deletedClientIDs = await startAsyncSpan(
           tracer,
           'connection.deleteClients',
-          () => viewSyncer.deleteClients(this.#syncContext, msg),
+          () => viewSyncer.deleteClients(this.#connectionSelector, msg),
         );
         if (this.#pusher && deletedClientIDs.length > 0) {
-          await this.#pusher.deleteClientMutations(deletedClientIDs);
+          await this.#pusher.deleteClientMutations(
+            this.#connectionSelector,
+            deletedClientIDs,
+          );
         }
         break;
       }
       case 'initConnection': {
-        const ret: HandlerResult[] = [
-          {
-            type: 'stream',
-            source: 'viewSyncer',
-            stream: startSpan(tracer, 'connection.initConnection', () =>
-              viewSyncer.initConnection(this.#syncContext, msg),
-            ),
-          },
-        ];
+        this.#contextManager.initConnection(this.#connectionSelector, msg[1]);
+        return withTraceparent(msg[1].traceparent, () => {
+          const ret: HandlerResult[] = [
+            {
+              type: 'stream',
+              source: 'viewSyncer',
+              stream: startSpan(tracer, 'connection.initConnection', () =>
+                viewSyncer.initConnection(this.#connectionSelector, msg),
+              ),
+            },
+          ];
 
-        // Given we support both CRUD and Custom mutators,
-        // we do not initialize the `pusher` unless the user has opted
-        // into custom mutations. We detect that by checking
-        // if the pushURL has been set.
-        if (this.#pusher) {
-          ret.push({
-            type: 'stream',
-            source: 'pusher',
-            stream: this.#pusher.initConnection(
-              this.#syncContext.clientID,
-              this.#syncContext.wsID,
-              msg[1].userPushURL,
-              msg[1].userPushHeaders,
-              () => viewSyncer.clearAuth(),
-            ),
-          });
-        }
+          // Given we support both CRUD and Custom mutators,
+          // we do not initialize the `pusher` unless the user has opted
+          // into custom mutations. We detect that by checking
+          // if the pushURL has been set.
+          if (this.#pusher) {
+            ret.push({
+              type: 'stream',
+              source: 'pusher',
+              stream: this.#pusher.initConnection(this.#connectionSelector),
+            });
+          }
 
-        return ret;
+          return ret;
+        });
       }
       case 'closeConnection':
         // This message is deprecated and no longer used.
@@ -227,13 +258,16 @@ export class SyncerWsMessageHandler implements MessageHandler {
 
       case 'inspect':
         await startAsyncSpan(tracer, 'connection.inspect', () =>
-          viewSyncer.inspect(this.#syncContext, msg),
+          viewSyncer.inspect(this.#connectionSelector, msg),
         );
         break;
 
       case 'ackMutationResponses':
         if (this.#pusher) {
-          await this.#pusher.ackMutationResponses(msg[1]);
+          await this.#pusher.ackMutationResponses(
+            this.#connectionSelector,
+            msg[1],
+          );
         }
         break;
 

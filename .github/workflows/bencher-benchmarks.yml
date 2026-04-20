@@ -5,103 +5,36 @@ on:
     branches: main
 
 jobs:
-  file_sizes:
-    name: File Sizes
-    permissions:
-      checks: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22.x
-          cache: 'npm'
-      - uses: bencherdev/bencher@main
-
-      - run: npm ci
-      - run: npm run build
-
-      - name: Build npm zero package
-        working-directory: packages/zero
-        run: |
-          npm pack --pack-destination ./out
-          mv ./out/*.tgz ./out/zero-package.tgz
-
-      - name: Build zero client single file package
-        working-directory: packages/zero
-        run: npx tsx tool/build.ts --bundle-sizes
-
-      - name: Compress
-        working-directory: packages/zero
-        run: brotli out/zero.js
-
-      - name: Upload benchmarks results to bencher.dev
-        working-directory: packages/zero
-        run: |
-          bencher run \
-          --project zero \
-          --token '${{ secrets.BENCHER_API_TOKEN }}' \
-          --adapter json \
-          --github-actions '${{ secrets.GITHUB_TOKEN }}' \
-          --start-point main \
-          --threshold-measure file-size \
-          --threshold-test percentage \
-          --threshold-upper-boundary 0.02 \
-          --threshold-max-sample-size 2 \
-          --err \
-          --file-size out/zero-package.tgz \
-          --file-size out/zero.js.br \
-          --file-size out/zero.js
-
-  perf:
-    name: Perf
-    uses: ./.github/workflows/reusable-benchmark.yml
-    strategy:
-      matrix:
-        package:
-          - name: 'zero-client'
-            directory: 'packages/zero-client'
-          # Replicache has no vitest benchs
-          # - name: 'replicache'
-          #   directory: 'packages/replicache'
-    with:
-      package_name: ${{ matrix.package.name }}
-      working_directory: ${{ matrix.package.directory }}
-    secrets:
-      BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
-
-  zql_benchmarks:
-    name: ZQL Benchmarks
-    permissions:
-      checks: write
+  playwright-install:
+    name: Install Playwright
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
-      - uses: bencherdev/bencher@main
-
       - run: npm ci
+      - uses: ./.github/actions/playwright-install
 
-      - name: Run ZQL benchmarks
-        uses: ./.github/actions/run-zql-benchmarks
-
-      - name: Upload benchmarks results to bencher.dev
-        working-directory: packages/zql-benchmarks
-        run: |
-          cat output.json |
-          bencher run \
-          --project zero \
-          --testbed self-hosted \
-          --token '${{ secrets.BENCHER_API_TOKEN }}' \
-          --adapter json \
-          --github-actions '${{ secrets.GITHUB_TOKEN }}' \
-          --start-point main \
-          --threshold-measure throughput \
-          --threshold-test t_test \
-          --threshold-lower-boundary 0.99 \
-          --threshold-min-sample-size 20 \
-          --threshold-max-sample-size 60 \
-          --err
+  perf:
+    name: Perf
+    needs: playwright-install
+    uses: ./.github/workflows/reusable-benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - name: 'shared'
+            directory: 'packages/shared'
+          - name: 'zero-client'
+            directory: 'packages/zero-client'
+          - name: 'zero-cache'
+            directory: 'packages/zero-cache'
+          - name: 'zql-benchmarks'
+            directory: 'packages/zql-benchmarks'
+    with:
+      package_name: ${{ matrix.package.name }}
+      working_directory: ${{ matrix.package.directory }}
+    secrets:
+      BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}

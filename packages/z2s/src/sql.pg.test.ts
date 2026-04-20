@@ -1,6 +1,6 @@
 import type {SQLQuery} from '@databases/sql';
 import type {JSONValue} from 'postgres';
-import {beforeAll, describe, expect, test} from 'vitest';
+import {afterAll, beforeAll, describe, expect, test} from 'vitest';
 import {testDBs} from '../../zero-cache/src/test/db.ts';
 import type {PostgresDB} from '../../zero-cache/src/types/pg.ts';
 import {formatPgInternalConvert, sql, sqlConvertColumnArg} from './sql.ts';
@@ -21,6 +21,10 @@ beforeAll(async () => {
       tags TEXT[]
     );
   `);
+});
+
+afterAll(async () => {
+  await testDBs.drop(pg);
 });
 
 describe('SQL builder with PostgreSQL', () => {
@@ -100,6 +104,181 @@ describe('SQL builder with PostgreSQL', () => {
       tags: ['tag1', 'tag2'],
     });
   });
+
+  test.each([
+    {label: 'empty string', type: 'json', value: ''},
+    {label: 'empty string', type: 'jsonb', value: ''},
+    {label: 'non-empty string', type: 'json', value: 'same'},
+    {label: 'non-empty string', type: 'jsonb', value: 'same'},
+  ] as const)(
+    'writes equal $label values correctly when text is formatted before $type',
+    async ({label: _label, type, value}) => {
+      const table = `mixed_values_${type}`;
+      await pg.unsafe(`
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          summary TEXT NOT NULL,
+          content ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const stmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (summary, content)
+        VALUES (${sqlConvertArg('text', value)}, ${sqlConvertArg(type, value)})
+        RETURNING summary, content
+      `);
+      const result = await pg.unsafe(stmt.text, stmt.values as JSONValue[]);
+
+      expect(result).toEqual([{summary: value, content: value}]);
+    },
+  );
+
+  test.each([
+    {label: 'empty string', type: 'json', value: ''},
+    {label: 'empty string', type: 'jsonb', value: ''},
+    {label: 'non-empty string', type: 'json', value: 'same'},
+    {label: 'non-empty string', type: 'jsonb', value: 'same'},
+  ] as const)(
+    'writes equal $label values correctly when $type is formatted before text',
+    async ({label: _label, type, value}) => {
+      const table = `mixed_values_${type}`;
+      await pg.unsafe(`
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          summary TEXT NOT NULL,
+          content ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const stmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (content, summary)
+        VALUES (${sqlConvertArg(type, value)}, ${sqlConvertArg('text', value)})
+        RETURNING content, summary
+      `);
+      const result = await pg.unsafe(stmt.text, stmt.values as JSONValue[]);
+
+      expect(result).toEqual([{content: value, summary: value}]);
+    },
+  );
+
+  test.each([
+    {type: 'timestamp', value: 1712345678901.5},
+    {type: 'timestamptz', value: 1712345678901.5},
+  ] as const)(
+    'numeric $type with fractional milliseconds round-trips correctly',
+    async ({type, value}) => {
+      await using pg = await testDBs.create(
+        `${DB_NAME}_${type}_frac`,
+        undefined,
+        {},
+      );
+
+      const table = `round_trip_${type}_frac`;
+      await pg.unsafe(`
+        SET TIME ZONE 'UTC';
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          value ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      // Insert a fractional-millisecond timestamp.
+      // With the old ::bigint cast this would fail:
+      //   "invalid input syntax for type bigint: 1712345678901.5"
+      const insertStmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (value)
+        VALUES (${sqlConvertArg(type, value)})
+      `);
+      await pg.unsafe(insertStmt.text, insertStmt.values as JSONValue[]);
+
+      // Query it back using the same fractional value as a filter.
+      const selectStmt = formatPgInternalConvert(sql`
+        SELECT value FROM ${sql.ident(table)}
+        WHERE value = ${sqlConvertArg(type, value, singularComparison)}
+      `);
+      const result = await pg.unsafe(
+        selectStmt.text,
+        selectStmt.values as JSONValue[],
+      );
+      expect(result).toHaveLength(1);
+    },
+  );
+
+  test.each([
+    // 0001-01-01 00:00:00 BC  (year 0 in proleptic Gregorian / JS)
+    {type: 'timestamp', value: -62167219200000},
+    {type: 'timestamptz', value: -62167219200000},
+    // 0044-03-15 00:00:00 BC  (44 BC, year -43 in JS)
+    {type: 'timestamp', value: -63492537600000},
+    {type: 'timestamptz', value: -63492537600000},
+  ] as const)(
+    'numeric $type with BC date ($value) round-trips correctly',
+    async ({type, value}) => {
+      await using pg = await testDBs.create(
+        `${DB_NAME}_${type}_bc`,
+        undefined,
+        {},
+      );
+
+      const table = `round_trip_${type}_bc`;
+      await pg.unsafe(`
+        SET TIME ZONE 'UTC';
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          value ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const insertStmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (value)
+        VALUES (${sqlConvertArg(type, value)})
+      `);
+      await pg.unsafe(insertStmt.text, insertStmt.values as JSONValue[]);
+
+      const selectStmt = formatPgInternalConvert(sql`
+        SELECT value FROM ${sql.ident(table)}
+        WHERE value = ${sqlConvertArg(type, value, singularComparison)}
+      `);
+      const result = await pg.unsafe(
+        selectStmt.text,
+        selectStmt.values as JSONValue[],
+      );
+      expect(result).toHaveLength(1);
+    },
+  );
+
+  test.each([
+    {type: 'time', value: 32887654},
+    {type: 'timetz', value: 32887654},
+  ] as const)(
+    'numeric $type inserts round-trip as milliseconds',
+    async ({type, value}) => {
+      await using pg = await testDBs.create(
+        `${DB_NAME}_${type}`,
+        undefined,
+        {},
+      );
+
+      const table = `round_trip_${type}`;
+      await pg.unsafe(`
+        SET TIME ZONE 'UTC';
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          value ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const stmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (value)
+        VALUES (${sqlConvertArg(type, value)})
+        RETURNING value
+      `);
+
+      const result = await pg.unsafe(stmt.text, stmt.values as JSONValue[]);
+
+      expect(result).toEqual([{value}]);
+    },
+  );
 });
 
 const pluralComparison = {

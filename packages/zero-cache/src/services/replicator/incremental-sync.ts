@@ -1,35 +1,45 @@
 import type {LogContext} from '@rocicorp/logger';
-import type {Database} from '../../../../zqlite/src/db.ts';
-import {StatementRunner} from '../../db/statements.ts';
+import {AbortError} from '../../../../shared/src/abort-error.ts';
+import type {Enum} from '../../../../shared/src/enum.ts';
 import {getOrCreateCounter} from '../../observability/metrics.ts';
 import type {Source} from '../../types/streams.ts';
 import type {DownloadStatus} from '../change-source/protocol/current.ts';
+import type {ChangeStreamData} from '../change-source/protocol/current/downstream.ts';
 import {
+  errorTypeToReadableName,
   PROTOCOL_VERSION,
   type ChangeStreamer,
   type Downstream,
 } from '../change-streamer/change-streamer.ts';
+import type * as ErrorType from '../change-streamer/error-type-enum.ts';
 import {RunningState} from '../running-state.ts';
-import {ChangeProcessor} from './change-processor.ts';
+import type {CommitResult} from './change-processor.ts';
 import {Notifier} from './notifier.ts';
-import {ReplicationStatusPublisher} from './replication-status.ts';
+import type {ReplicationStatusPublisher} from './replication-status.ts';
 import type {ReplicaState, ReplicatorMode} from './replicator.ts';
-import {getSubscriptionState} from './schema/replication-state.ts';
+import {ReplicationReportRecorder} from './reporter/recorder.ts';
+import type {ReplicationReport} from './reporter/report-schema.ts';
+import type {WriteWorkerClient} from './write-worker-client.ts';
+
+type ErrorType = Enum<typeof ErrorType>;
 
 /**
  * The {@link IncrementalSyncer} manages a logical replication stream from upstream,
  * handling application lifecycle events (start, stop) and retrying the
  * connection with exponential backoff. The actual handling of the logical
- * replication messages is done by the {@link ChangeProcessor}.
+ * replication messages is done by the {@link ChangeProcessor}, which runs
+ * in a worker thread via the {@link WriteWorkerClient}.
  */
 export class IncrementalSyncer {
+  readonly #lc: LogContext;
   readonly #taskID: string;
   readonly #id: string;
   readonly #changeStreamer: ChangeStreamer;
-  readonly #replica: StatementRunner;
+  readonly #worker: WriteWorkerClient;
   readonly #mode: ReplicatorMode;
-  readonly #publishReplicationStatus: boolean;
+  readonly #statusPublisher: ReplicationStatusPublisher | null;
   readonly #notifier: Notifier;
+  readonly #reporter: ReplicationReportRecorder;
 
   readonly #state = new RunningState('IncrementalSyncer');
 
@@ -40,41 +50,38 @@ export class IncrementalSyncer {
   );
 
   constructor(
+    lc: LogContext,
     taskID: string,
     id: string,
     changeStreamer: ChangeStreamer,
-    replica: Database,
+    worker: WriteWorkerClient,
     mode: ReplicatorMode,
-    publishReplicationStatus: boolean,
+    statusPublisher: ReplicationStatusPublisher | null,
   ) {
+    this.#lc = lc;
     this.#taskID = taskID;
     this.#id = id;
     this.#changeStreamer = changeStreamer;
-    this.#replica = new StatementRunner(replica);
+    this.#worker = worker;
     this.#mode = mode;
-    this.#publishReplicationStatus = publishReplicationStatus;
+    this.#statusPublisher = statusPublisher;
     this.#notifier = new Notifier();
+    this.#reporter = new ReplicationReportRecorder(lc);
   }
 
-  async run(lc: LogContext) {
+  async run() {
+    const lc = this.#lc;
+    this.#worker.onError(err => this.#state.stop(lc, err));
     lc.info?.(`Starting IncrementalSyncer`);
-    const {watermark: initialWatermark} = getSubscriptionState(this.#replica);
+    const {watermark: initialWatermark} =
+      await this.#worker.getSubscriptionState();
 
     // Notify any waiting subscribers that the replica is ready to be read.
     void this.#notifier.notifySubscribers();
 
-    // Only the backup replicator publishes replication status events.
-    const statusPublisher = this.#publishReplicationStatus
-      ? new ReplicationStatusPublisher(this.#replica.db)
-      : undefined;
-
     while (this.#state.shouldRun()) {
-      const {replicaVersion, watermark} = getSubscriptionState(this.#replica);
-      const processor = new ChangeProcessor(
-        this.#replica,
-        this.#mode,
-        (lc: LogContext, err: unknown) => this.stop(lc, err),
-      );
+      const {replicaVersion, watermark} =
+        await this.#worker.getSubscriptionState();
 
       let downstream: Source<Downstream> | undefined;
       let unregister = () => {};
@@ -92,7 +99,7 @@ export class IncrementalSyncer {
         });
         this.#state.resetBackoff();
         unregister = this.#state.cancelOnStop(downstream);
-        statusPublisher?.publish(
+        this.#statusPublisher?.publish(
           lc,
           'Replicating',
           `Replicating from ${watermark}`,
@@ -103,15 +110,35 @@ export class IncrementalSyncer {
         for await (const message of downstream) {
           this.#replicationEvents.add(1);
           switch (message[0]) {
-            case 'status':
-              // Used for checking if a replica can be caught up. Not
-              // relevant here.
-              lc.debug?.(`Received initial status`, message[1]);
+            case 'status': {
+              const {lagReport} = message[1];
+              if (lagReport) {
+                const report: ReplicationReport = {
+                  nextSendTimeMs: lagReport.nextSendTimeMs,
+                };
+                if (lagReport.lastTimings) {
+                  report.lastTimings = {
+                    ...lagReport.lastTimings,
+                    replicateTimeMs: Date.now(),
+                  };
+                }
+                this.#reporter.record(report);
+              }
               break;
-            case 'error':
-              // Unrecoverable error. Stop the service.
-              this.stop(lc, message[1]);
+            }
+            case 'error': {
+              // Signal from the replication-manager that the view-syncer must
+              // shut down and restore a new backup from litestream.
+              const {type, message: msg} = message[1];
+              this.stop(
+                lc,
+                // Note: The AbortError indicates a clean / intentional shutdown.
+                new AbortError(
+                  `${errorTypeToReadableName(type as ErrorType)}: ${msg}`,
+                ),
+              );
               break;
+            }
             default: {
               const msg = message[1];
               if (msg.tag === 'backfill' && msg.status) {
@@ -119,7 +146,7 @@ export class IncrementalSyncer {
                 if (!backfillStatus) {
                   // Start publishing the status every 3 seconds.
                   backfillStatus = status;
-                  statusPublisher?.publish(
+                  this.#statusPublisher?.publish(
                     lc,
                     'Replicating',
                     `Backfilling ${msg.relation.name} table`,
@@ -144,40 +171,52 @@ export class IncrementalSyncer {
                 backfillStatus = status; // Update the current status
               }
 
-              const result = processor.processMessage(lc, message);
+              const result = await this.#worker.processMessage(
+                message as ChangeStreamData,
+              );
+
+              this.#handleResult(lc, result);
               if (result?.completedBackfill) {
-                // Publish the final status
-                const status = result.completedBackfill;
-                statusPublisher?.publish(
-                  lc,
-                  'Replicating',
-                  `Backfilled ${status.table} table`,
-                  0,
-                  () => ({downloadStatus: [status]}),
-                );
                 backfillStatus = undefined;
-              } else if (result?.schemaUpdated) {
-                statusPublisher?.publish(lc, 'Replicating', 'Schema updated');
-              }
-              if (result?.watermark && result?.changeLogUpdated) {
-                void this.#notifier.notifySubscribers({state: 'version-ready'});
               }
               break;
             }
           }
         }
-        processor.abort(lc);
+        this.#worker.abort();
       } catch (e) {
         err = e;
-        processor.abort(lc);
+        this.#worker.abort();
       } finally {
         downstream?.cancel();
         unregister();
-        statusPublisher?.stop();
+        this.#statusPublisher?.stop();
       }
       await this.#state.backoff(lc, err);
     }
     lc.info?.('IncrementalSyncer stopped');
+  }
+
+  #handleResult(lc: LogContext, result: CommitResult | null) {
+    if (!result) {
+      return;
+    }
+    if (result.completedBackfill) {
+      // Publish the final status
+      const status = result.completedBackfill;
+      this.#statusPublisher?.publish(
+        lc,
+        'Replicating',
+        `Backfilled ${status.table} table`,
+        0,
+        () => ({downloadStatus: [status]}),
+      );
+    } else if (result.schemaUpdated) {
+      this.#statusPublisher?.publish(lc, 'Replicating', 'Schema updated');
+    }
+    if (result.watermark && result.changeLogUpdated) {
+      void this.#notifier.notifySubscribers({state: 'version-ready'});
+    }
   }
 
   subscribe(): Source<ReplicaState> {

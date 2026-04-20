@@ -46,6 +46,7 @@ lerna-debug.log*
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea
 .DS_Store
 *.suo
@@ -102,3 +103,5 @@ bun.lock
 
 .claude/
 packages/zql-integration-tests/Chinook_Sqlite.sqlite
+
+*.ignore.*

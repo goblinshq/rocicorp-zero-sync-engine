@@ -1,16 +1,18 @@
 {
   "name": "functions",
-  "private": true,
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "check-types": "tsc",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts"
   },
   "dependencies": {
     "@rocicorp/zero": "file:rocicorp-zero.tgz"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "oxfmt": "^0.43.0"
+  }
 }

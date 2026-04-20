@@ -1,3 +1,4 @@
+import {stripVTControlCharacters as stripAnsi} from 'node:util';
 import type {OptionalLogger} from '@rocicorp/logger';
 import {template} from 'chalk-template';
 import type {OptionDefinition} from 'command-line-args';
@@ -5,7 +6,6 @@ import commandLineArgs from 'command-line-args';
 import commandLineUsage, {type Section} from 'command-line-usage';
 import {createDefu} from 'defu';
 import {toKebabCase, toSnakeCase} from 'kasi';
-import {stripVTControlCharacters as stripAnsi} from 'node:util';
 import {assert} from './asserts.ts';
 import {must} from './must.ts';
 import type {
@@ -271,7 +271,7 @@ export function parseOptionsAdvanced<T extends Options>(
 
     const typeLabel = [
       literals.size
-        ? String([...literals].map(l => `{underline ${l}}`))
+        ? String(Array.from(literals, l => `{underline ${l}}`))
         : multiple
           ? `{underline ${terminalType}[]}`
           : `{underline ${terminalType}}`,

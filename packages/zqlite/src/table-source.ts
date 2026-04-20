@@ -18,9 +18,11 @@ import {
   createPredicate,
   transformFilters,
 } from '../../zql/src/builder/filter.ts';
+import {ChangeType} from '../../zql/src/ivm/change-type.ts';
 import {makeComparator, type Node} from '../../zql/src/ivm/data.ts';
 import {
   generateWithOverlay,
+  generateWithOverlayUnordered,
   generateWithStart,
   genPushAndWriteWithSplitEdit,
   type Connection,
@@ -28,12 +30,14 @@ import {
 } from '../../zql/src/ivm/memory-source.ts';
 import {type FetchRequest} from '../../zql/src/ivm/operator.ts';
 import type {SourceSchema} from '../../zql/src/ivm/schema.ts';
+import {SourceChangeIndex} from '../../zql/src/ivm/source-change-index.ts';
 import {
   type Source,
   type SourceChange,
   type SourceInput,
 } from '../../zql/src/ivm/source.ts';
 import type {Stream} from '../../zql/src/ivm/stream.ts';
+import {assertOrderingIncludesPK} from '../../zql/src/query/complete-ordering.ts';
 import type {Database, Statement} from './db.ts';
 import {compile, format, sql} from './internal/sql.ts';
 import {StatementCache} from './internal/statement-cache.ts';
@@ -42,7 +46,6 @@ import {
   toSQLiteType,
   type NoSubqueryCondition,
 } from './query-builder.ts';
-import {assertOrderingIncludesPK} from '../../zql/src/query/complete-ordering.ts';
 
 type Statements = {
   readonly cache: StatementCache;
@@ -109,7 +112,7 @@ export class TableSource implements Source {
     this.#shouldYield = shouldYield;
 
     assert(
-      this.#uniqueIndexes.has(JSON.stringify([...primaryKey].sort())),
+      this.#uniqueIndexes.has(JSON.stringify(primaryKey.toSorted())),
       `primary key ${primaryKey} does not have a UNIQUE index`,
     );
   }
@@ -205,12 +208,12 @@ export class TableSource implements Source {
     );
   }
 
-  #getSchema(connection: Connection): SourceSchema {
+  #getSchema(connection: Connection, unordered: boolean): SourceSchema {
     return {
       tableName: this.#table,
       columns: this.#columns,
       primaryKey: this.#primaryKey,
-      sort: connection.sort,
+      sort: unordered ? undefined : connection.sort,
       relationships: {},
       isHidden: false,
       system: 'client',
@@ -219,12 +222,17 @@ export class TableSource implements Source {
   }
 
   connect(
-    sort: Ordering,
+    sort: Ordering | undefined,
     filters?: Condition,
     splitEditKeys?: Set<string>,
     debug?: DebugDelegate,
   ) {
     const transformedFilters = transformFilters(filters);
+    const unordered = sort === undefined;
+    // PK comparator is used for source-level overlay matching (remove by PK
+    // equality) even when no ordering is requested.
+    const primaryKeySort: Ordering = this.#primaryKey.map(k => [k, 'asc']);
+
     const input: SourceInput = {
       getSchema: () => schema,
       fetch: req => this.#fetch(req, connection),
@@ -251,11 +259,13 @@ export class TableSource implements Source {
             predicate: createPredicate(transformedFilters.filters),
           }
         : undefined,
-      compareRows: makeComparator(sort),
+      compareRows: sort ? makeComparator(sort) : makeComparator(primaryKeySort),
       lastPushedEpoch: 0,
     };
-    const schema = this.#getSchema(connection);
-    assertOrderingIncludesPK(sort, this.#primaryKey);
+    const schema = this.#getSchema(connection, unordered);
+    if (!unordered) {
+      assertOrderingIncludesPK(sort, this.#primaryKey);
+    }
 
     this.#connections.push(connection);
     return input;
@@ -277,20 +287,39 @@ export class TableSource implements Source {
     const sqlAndBindings = format(query);
 
     const cachedStatement = this.#stmts.cache.get(sqlAndBindings.text);
+    cachedStatement.statement.safeIntegers(true);
+    const rowIterator = cachedStatement.statement.iterate<Row>(
+      ...sqlAndBindings.values,
+    );
     try {
-      cachedStatement.statement.safeIntegers(true);
-      const rowIterator = cachedStatement.statement.iterate<Row>(
-        ...sqlAndBindings.values,
-      );
-
-      const comparator = makeComparator(sort, req.reverse);
-
       debug?.initQuery(this.#table, sqlAndBindings.text);
 
-      yield* generateWithStart(
-        generateWithYields(
-          generateWithOverlay(
-            req.start?.row,
+      if (sort) {
+        const comparator = makeComparator(sort, req.reverse);
+        yield* generateWithStart(
+          generateWithYields(
+            generateWithOverlay(
+              req.start?.row,
+              this.#mapFromSQLiteTypes(
+                this.#columns,
+                rowIterator,
+                sqlAndBindings.text,
+                debug,
+              ),
+              req.constraint,
+              this.#overlay,
+              connection.lastPushedEpoch,
+              comparator,
+              connection.filters?.predicate,
+            ),
+            this.#shouldYield,
+          ),
+          req.start,
+          comparator,
+        );
+      } else {
+        yield* generateWithYields(
+          generateWithOverlayUnordered(
             this.#mapFromSQLiteTypes(
               this.#columns,
               rowIterator,
@@ -300,15 +329,15 @@ export class TableSource implements Source {
             req.constraint,
             this.#overlay,
             connection.lastPushedEpoch,
-            comparator,
+            this.#primaryKey,
             connection.filters?.predicate,
           ),
           this.#shouldYield,
-        ),
-        req.start,
-        comparator,
-      );
+        );
+      }
     } finally {
+      // Ensure the SQLite iterate() is closed.
+      rowIterator.return?.();
       if (debug) {
         let totalNvisit = 0;
         let i = 0;
@@ -339,27 +368,23 @@ export class TableSource implements Source {
     debug: DebugDelegate | undefined,
   ): IterableIterator<Row> {
     let result;
-    try {
-      do {
-        result = timeSampled(
-          this.#lc,
-          ++eventCount,
-          this.#logConfig.ivmSampling,
-          () => rowIterator.next(),
-          this.#logConfig.slowRowThreshold,
-          () =>
-            `table-source.next took too long for ${query}. Are you missing an index?`,
-        );
-        if (result.done) {
-          break;
-        }
-        const row = fromSQLiteTypes(valueTypes, result.value, this.#table);
-        debug?.rowVended(this.#table, query, row);
-        yield row;
-      } while (!result.done);
-    } finally {
-      rowIterator.return?.();
-    }
+    do {
+      result = timeSampled(
+        this.#lc,
+        ++eventCount,
+        this.#logConfig.ivmSampling,
+        () => rowIterator.next(),
+        this.#logConfig.slowRowThreshold,
+        () =>
+          `table-source.next took too long for ${query}. Are you missing an index?`,
+      );
+      if (result.done) {
+        break;
+      }
+      const row = fromSQLiteTypes(valueTypes, result.value, this.#table);
+      debug?.rowVended(this.#table, query, row);
+      yield row;
+    } while (!result.done);
   }
 
   *push(change: SourceChange): Stream<'yield'> {
@@ -389,34 +414,39 @@ export class TableSource implements Source {
   }
 
   #writeChange(change: SourceChange) {
-    switch (change.type) {
-      case 'add':
+    switch (change[SourceChangeIndex.TYPE]) {
+      case ChangeType.ADD:
         this.#stmts.insert.run(
           ...toSQLiteTypes(
+            // TODO(arv): Compute this once!
             Object.keys(this.#columns),
-            change.row,
+            change[SourceChangeIndex.ROW],
             this.#columns,
           ),
         );
         break;
-      case 'remove':
+      case ChangeType.REMOVE:
         this.#stmts.delete.run(
-          ...toSQLiteTypes(this.#primaryKey, change.row, this.#columns),
+          ...toSQLiteTypes(
+            this.#primaryKey,
+            change[SourceChangeIndex.ROW],
+            this.#columns,
+          ),
         );
         break;
-      case 'edit': {
+      case ChangeType.EDIT: {
         // If the PK is the same, use UPDATE.
         if (
           canUseUpdate(
-            change.oldRow,
-            change.row,
+            change[SourceChangeIndex.OLD_ROW],
+            change[SourceChangeIndex.ROW],
             this.#columns,
             this.#primaryKey,
           )
         ) {
           const mergedRow = {
-            ...change.oldRow,
-            ...change.row,
+            ...change[SourceChangeIndex.OLD_ROW],
+            ...change[SourceChangeIndex.ROW],
           };
           const params = [
             ...nonPrimaryValues(this.#columns, this.#primaryKey, mergedRow),
@@ -425,12 +455,16 @@ export class TableSource implements Source {
           must(this.#stmts.update).run(params);
         } else {
           this.#stmts.delete.run(
-            ...toSQLiteTypes(this.#primaryKey, change.oldRow, this.#columns),
+            ...toSQLiteTypes(
+              this.#primaryKey,
+              change[SourceChangeIndex.OLD_ROW],
+              this.#columns,
+            ),
           );
           this.#stmts.insert.run(
             ...toSQLiteTypes(
               Object.keys(this.#columns),
-              change.row,
+              change[SourceChangeIndex.ROW],
               this.#columns,
             ),
           );
@@ -487,7 +521,7 @@ export class TableSource implements Source {
   #requestToSQL(
     request: FetchRequest,
     filters: NoSubqueryCondition | undefined,
-    order: Ordering,
+    order: Ordering | undefined,
   ): SQLQuery {
     return buildSelectQuery(
       this.#table,

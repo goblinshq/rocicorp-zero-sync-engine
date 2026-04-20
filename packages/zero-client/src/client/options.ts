@@ -1,4 +1,4 @@
-import type {LogLevel} from '@rocicorp/logger';
+import type {LogLevel, LogSink} from '@rocicorp/logger';
 import type {StoreProvider} from '../../../replicache/src/kv/store.ts';
 import * as v from '../../../shared/src/valita.ts';
 import type {
@@ -45,6 +45,9 @@ export type ZeroOptions<
    * The call to `connect` is handled automatically by the ZeroProvider component
    * for React and SolidJS when the `auth` prop changes.
    *
+   * Transitions between authenticated and logged-out states recreate the Zero
+   * instance instead.
+   *
    * When `auth` changes while connected, Zero refreshes server-side auth context
    * and re-transforms queries without reconnecting.
    *
@@ -55,15 +58,14 @@ export type ZeroOptions<
   auth?: string | null | undefined;
 
   /**
-   * A unique identifier for the user. Must be non-empty.
+   * A unique identifier for the user.
+   *
+   * Omit this, or set to `null`, for logged-out clients.
    *
    * Each userID gets its own client-side storage so that the app can switch
    * between users without losing state.
-   *
-   * This must match the `sub` claim of the `auth` token if
-   * `auth` is provided.
    */
-  userID: string;
+  userID?: string | null | undefined;
 
   /**
    * Distinguishes the storage used by this Zero instance from that of other
@@ -85,6 +87,19 @@ export type ZeroOptions<
    * Default is `'error'`.
    */
   logLevel?: LogLevel | undefined;
+
+  /**
+   * Destination for Zero's log output. When omitted, logs are written with
+   * `console.log`/`info`/`warn`/`error` etc.
+   *
+   * Provide a custom {@linkcode LogSink} to redirect logs — for example, to
+   * `process.stderr` in a CLI so that the tool's structured stdout output
+   * isn't polluted by log lines.
+   *
+   * Note: this overrides only the console sink. When analytics logging is
+   * enabled, the Datadog sink is still installed alongside this one.
+   */
+  logSink?: LogSink | undefined;
 
   /**
    * This defines the schema of the tables used in Zero and their relationships
@@ -165,6 +180,30 @@ export type ZeroOptions<
    * These headers are passed through zero-cache to the query endpoint.
    */
   queryHeaders?: Record<string, string> | undefined;
+
+  /**
+   * Optional callback that returns a W3C `traceparent` header value for
+   * distributed tracing. Called before sending WebSocket messages that
+   * trigger API server calls (`push`, `changeDesiredQueries`,
+   * `initConnection`).
+   *
+   * This enables end-to-end trace correlation from your frontend through
+   * zero-cache to your API server.
+   *
+   * @example
+   * ```ts
+   * import {propagation, context} from '@opentelemetry/api';
+   *
+   * new Zero({
+   *   getTraceparent: () => {
+   *     const carrier: Record<string, string> = {};
+   *     propagation.inject(context.active(), carrier);
+   *     return carrier.traceparent;
+   *   },
+   * });
+   * ```
+   */
+  getTraceparent?: (() => string | undefined) | undefined;
 
   /**
    * `onOnlineChange` is called when the Zero instance's online status changes.

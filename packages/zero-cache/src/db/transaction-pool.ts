@@ -38,6 +38,50 @@ export type ReadTask<T> = (
   lc: LogContext,
 ) => MaybePromise<T>;
 
+export type Options = {
+  mode: Mode;
+
+  /**
+   * A {@link Task} that is run in each Transaction before it begins
+   * processing general tasks. This can be used to to set the transaction
+   * mode, export/set snapshots, etc. This will be run even if
+   * {@link fail} has been called on the pool.
+   */
+  init?: Task | undefined;
+
+  /**
+   * A {@link Task} that is run in each Transaction before it closes.
+   * This will be run even if {@link fail} has been called, or if a
+   * preceding Task threw an Error.
+   */
+  cleanup?: Task | undefined;
+
+  /**
+   * The initial number of transaction workers to process tasks.
+   * This is the steady state number of workers that will be kept
+   * alive if the TransactionPool is long lived.
+   * This must be greater than 0. Defaults to 1.
+   */
+  initialWorkers?: number;
+
+  /**
+   * When specified, allows the pool to grow to `maxWorkers`. This
+   * must be greater than or equal to `initialWorkers`. On-demand
+   * workers will be shut down after an idle timeout of 5 seconds.
+   */
+  maxWorkers?: number;
+
+  /**
+   * Aborts the transaction if the response for a statement is not received
+   * within the specified timeout. Note that this is different from a Postgres
+   * `statement_timeout` or `lock_timeout` in that it is specifically intended
+   * to detect situations in which Postgres either never received the
+   * statement, or the application never got the response for the executed
+   * statement.
+   */
+  statementResponseTimeout?: number;
+};
+
 /**
  * A TransactionPool is a pool of one or more {@link postgres.TransactionSql}
  * objects that participate in processing a dynamic queue of tasks.
@@ -55,40 +99,29 @@ export class TransactionPool {
   readonly #workers: Promise<unknown>[] = [];
   readonly #initialWorkers: number;
   readonly #maxWorkers: number;
+  readonly #responseTimeout: number | undefined;
   readonly #timeoutTask: TimeoutTasks;
   #numWorkers: number;
   #numWorking = 0;
   #db: PostgresDB | undefined; // set when running. stored to allow adaptive pool sizing.
 
-  #refCount = 1;
   #done = false;
   #failure: Error | undefined;
+  #orphanedQueryCheckInterval: NodeJS.Timeout;
 
-  /**
-   * @param init A {@link Task} that is run in each Transaction before it begins
-   *             processing general tasks. This can be used to to set the transaction
-   *             mode, export/set snapshots, etc. This will be run even if
-   *             {@link fail} has been called on the pool.
-   * @param cleanup A {@link Task} that is run in each Transaction before it closes.
-   *                This will be run even if {@link fail} has been called, or if a
-   *                preceding Task threw an Error.
-   * @param initialWorkers The initial number of transaction workers to process tasks.
-   *                       This is the steady state number of workers that will be kept
-   *                       alive if the TransactionPool is long lived.
-   *                       This must be greater than 0. Defaults to 1.
-   * @param maxWorkers When specified, allows the pool to grow to `maxWorkers`. This
-   *                   must be greater than or equal to `initialWorkers`. On-demand
-   *                   workers will be shut down after an idle timeout of 5 seconds.
-   */
   constructor(
     lc: LogContext,
-    mode: Mode,
-    init?: Task,
-    cleanup?: Task,
-    initialWorkers = 1,
-    maxWorkers = initialWorkers,
+    opts: Options,
     timeoutTasks = TIMEOUT_TASKS, // Overridden for tests.
   ) {
+    const {
+      mode,
+      init,
+      cleanup,
+      initialWorkers = 1,
+      maxWorkers = initialWorkers,
+      statementResponseTimeout,
+    } = opts;
     assert(initialWorkers > 0, 'initialWorkers must be positive');
     assert(
       maxWorkers >= initialWorkers,
@@ -103,6 +136,12 @@ export class TransactionPool {
     this.#numWorkers = initialWorkers;
     this.#maxWorkers = maxWorkers;
     this.#timeoutTask = timeoutTasks;
+    this.#responseTimeout = statementResponseTimeout;
+
+    this.#orphanedQueryCheckInterval = setInterval(
+      this.#checkForOrphanedQueries,
+      Math.min(5_000, statementResponseTimeout ?? 5_000),
+    );
   }
 
   /**
@@ -166,6 +205,19 @@ export class TransactionPool {
       await Promise.all(this.#workers);
     }
     this.#lc.debug?.('transaction pool done');
+
+    const elapsed = performance.now() - this.#start;
+    if (elapsed > 60_000) {
+      if (this.#stmts > 0) {
+        this.#lc.warn?.(
+          `finished long transaction with ${this.#stmts} statements (${elapsed.toFixed(3)} ms)`,
+        );
+      } else {
+        this.#lc.warn?.(
+          `finished long read transaction (${elapsed.toFixed(3)} ms)`,
+        );
+      }
+    }
   }
 
   #addWorker(db: PostgresDB) {
@@ -280,6 +332,13 @@ export class TransactionPool {
 
   readonly #start = performance.now();
   #stmts = 0;
+  #latestDoneIndex = 0;
+  #latestDoneTime = 0;
+
+  readonly #pending = new Map<
+    Query,
+    {index: number; time: number; abort: (e: ResponseTimeoutError) => void}
+  >();
 
   /**
    * Implements the semantics specified in {@link process()}.
@@ -312,28 +371,89 @@ export class TransactionPool {
         // Execute the statements (i.e. send to the db) immediately.
         // The last result is returned for the worker to await before
         // closing the transaction.
-        const last = stmts.reduce(
-          (_, stmt) =>
-            stmt
-              .execute()
-              .then(() => {
-                if (++this.#stmts % 1000 === 0) {
-                  const log = this.#stmts % 10000 === 0 ? 'info' : 'debug';
-                  const q = stmt as unknown as Query;
-                  lc[log]?.(
-                    `executed ${this.#stmts}th statement (${(performance.now() - this.#start).toFixed(3)} ms)`,
-                    {statement: q.string},
-                  );
-                }
-              })
-              .catch(e => this.fail(e)),
-          promiseVoid,
-        );
-        return {pending: last.then(r.resolve)};
+        const time = Date.now();
+        const last = stmts.reduce((_, stmt) => {
+          const query = stmt as unknown as Query;
+          const index = ++this.#stmts;
+          const {promise: aborted, reject: abort} = resolver();
+          aborted.catch(() => {}); // always consider it "handled"
+
+          this.#pending.set(query, {index, time, abort});
+          const responded = stmt
+            .execute()
+            .then(() => {
+              if (index % 1000 === 0) {
+                const log = index % 10000 === 0 ? 'info' : 'debug';
+                lc[log]?.(
+                  `executed ${this.#stmts}th statement (${(performance.now() - this.#start).toFixed(3)} ms)`,
+                  {statement: query.string},
+                );
+              }
+            })
+            .catch(e => this.fail(e))
+            .finally(() => {
+              this.#pending.delete(query);
+              if (index > this.#latestDoneIndex) {
+                this.#latestDoneIndex = index;
+                this.#latestDoneTime = Date.now();
+              }
+            });
+
+          const done = Promise.race([responded, aborted]);
+          done.catch(() => {});
+
+          return done;
+        }, promiseVoid);
+        return {pending: last.finally(r.resolve)};
       },
       rejected: r.resolve,
     };
   }
+
+  /**
+   * Periodically checks the map of `#pending` queries for which Promises
+   * have yet to be resolved. Checks for pathological scenarios that have
+   * been observed:
+   *
+   * * A promise does not resolve, even though the transaction is otherwise
+   *   healthy with keepalives being sent.
+   * * A transaction never "finishes" at the postgres.js level after the
+   *   worker exits, implying that postgres.js is awaiting the `last` promise
+   *   returned. In this case Postgres disconnected the application with an
+   *   idle-in-transaction timeout, suggesting that all statements did in
+   *   fact complete.
+   */
+  readonly #checkForOrphanedQueries = () => {
+    if (this.#pending.size === 0) {
+      return;
+    }
+    const now = Date.now();
+    for (const [query, {index, time, abort}] of this.#pending.entries()) {
+      const statement = query.string;
+      const abortWith = (msg: string) => {
+        this.#lc.warn?.(msg, {statement});
+        const err = new ResponseTimeoutError(msg);
+        abort(err);
+        this.fail(err);
+        this.#pending.delete(query);
+      };
+
+      if (index < this.#latestDoneIndex) {
+        const elapsed = now - this.#latestDoneTime;
+        if (this.#responseTimeout && elapsed > this.#responseTimeout) {
+          abortWith(
+            `statement ${this.#latestDoneIndex} completed ${elapsed} ms ago, but statement ${index} has not.`,
+          );
+        }
+      } else {
+        // Nothing out of order, but checking for a response timeout.
+        const elapsed = now - time;
+        if (this.#responseTimeout && elapsed > this.#responseTimeout) {
+          abortWith(`response for statement timed out after ${elapsed} ms`);
+        }
+      }
+    }
+  };
 
   /**
    * Processes and returns the result of executing the {@link ReadTask} from
@@ -414,48 +534,9 @@ export class TransactionPool {
     for (let i = 0; i < this.#numWorkers; i++) {
       this.#tasks.enqueue('done');
     }
-  }
-
-  /**
-   * An alternative to explicitly calling {@link setDone}, `ref()` increments an internal reference
-   * count, and {@link unref} decrements it. When the reference count reaches 0, {@link setDone} is
-   * automatically called. A TransactionPool is initialized with a reference count of 1.
-   *
-   * `ref()` should be called before sharing the pool with another component, and only after the
-   * pool has been started with {@link run()}. It must not be called on a TransactionPool that is
-   * already done (either via {@link unref()} or {@link setDone()}. (Doing so indicates a logical
-   * error in the code.)
-   *
-   * It follows that:
-   * * The creator of the TransactionPool is responsible for running it.
-   * * The TransactionPool should be ref'ed before being sharing.
-   * * The receiver of the TransactionPool is only responsible for unref'ing it.
-   *
-   * On the other hand, a transaction pool that fails with a runtime error can still be ref'ed;
-   * attempts to use the pool will result in the runtime error as expected.
-   */
-  // TODO: Get rid of the ref-counting stuff. It's no longer needed.
-  ref(count = 1) {
-    assert(
-      this.#db !== undefined && !this.#done,
-      `Cannot ref() a TransactionPool that is not running`,
+    void Promise.allSettled(this.#workers).then(() =>
+      clearInterval(this.#orphanedQueryCheckInterval),
     );
-    this.#refCount += count;
-  }
-
-  /**
-   * Decrements the internal reference count, automatically invoking {@link setDone} when it reaches 0.
-   */
-  unref(count = 1) {
-    assert(
-      count <= this.#refCount,
-      () => `Cannot unref ${count} when refCount is ${this.#refCount}`,
-    );
-
-    this.#refCount -= count;
-    if (this.#refCount === 0) {
-      this.setDone();
-    }
   }
 
   isRunning(): boolean {
@@ -466,7 +547,7 @@ export class TransactionPool {
    * Signals all workers to fail their transactions with the given {@link err}.
    */
   fail(err: unknown) {
-    if (!this.#failure) {
+    if (!this.#done && !this.#failure) {
       this.#failure = ensureError(err); // Fail fast: this is checked in the worker loop.
       // Logged for informational purposes. It is the responsibility of
       // higher level logic to classify and handle the exception.
@@ -478,6 +559,9 @@ export class TransactionPool {
         // Enqueue the Error to terminate any workers waiting for tasks.
         this.#tasks.enqueue(this.#failure);
       }
+      void Promise.allSettled(this.#workers).then(() =>
+        clearInterval(this.#orphanedQueryCheckInterval),
+      );
     }
   }
 }
@@ -589,15 +673,21 @@ export function sharedSnapshot(): {
   // exporting the snapshot.
   let firstWorkerRun = false;
 
-  // Set when any worker is done, signalling that all non-sentinel Tasks have been
-  // dequeued, and thus any subsequently spawned workers should skip their initTask
-  // since the snapshot is no longer needed (and soon to become invalid).
+  // The LogContext of the exporting worker, used to identify its cleanup call.
+  // Each worker receives a unique lc instance (via withContext('tx', id)), so
+  // reference equality reliably identifies the exporting worker.
+  let exporterLc: LogContext | undefined;
+
+  // Set when the exporting worker's cleanup runs, signalling that the snapshot
+  // is no longer needed and any subsequently spawned workers should skip their
+  // initTask.
   let firstWorkerDone = false;
 
   return {
     init: (tx, lc) => {
       if (!firstWorkerRun) {
         firstWorkerRun = true;
+        exporterLc = lc; // Remember which worker is the exporter.
         const stmt = tx`SELECT pg_export_snapshot() AS snapshot;`.simple();
         // Intercept the promise to propagate the information to `snapshotExported`.
         stmt.then(result => exportSnapshot(result[0].snapshot), failExport);
@@ -612,8 +702,14 @@ export function sharedSnapshot(): {
       return [];
     },
 
-    cleanup: () => {
-      firstWorkerDone = true;
+    cleanup: (_tx, lc) => {
+      // Only the exporting worker's cleanup should disable snapshot-setting.
+      // Non-exporter workers may finish early; letting them flip this flag
+      // would cause subsequently spawned workers to skip SET TRANSACTION SNAPSHOT
+      // and read a newer database view, violating snapshot isolation.
+      if (lc === exporterLc) {
+        firstWorkerDone = true;
+      }
       return [];
     },
 
@@ -757,3 +853,11 @@ export const TIMEOUT_TASKS: TimeoutTasks = {
 // The slice of information from the Query object in Postgres.js that gets logged for debugging.
 // https://github.com/porsager/postgres/blob/f58cd4f3affd3e8ce8f53e42799672d86cd2c70b/src/connection.js#L219
 type Query = {string: string; parameters: object[]};
+
+export class ResponseTimeoutError extends Error {
+  static readonly name = 'ResponseTimeoutError';
+
+  constructor(msg: string) {
+    super(msg);
+  }
+}

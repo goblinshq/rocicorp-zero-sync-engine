@@ -6,17 +6,13 @@ import {
   type LogRecord,
 } from '@opentelemetry/api-logs';
 import type {Context, LogLevel, LogSink} from '@rocicorp/logger';
-import {errorOrObject} from '../../../shared/src/logging.ts';
 import {stringify} from '../../../shared/src/bigint-json.ts';
-import {startOtelAuto} from './otel-start.ts';
+import {errorOrObject} from '../../../shared/src/logging.ts';
 
 export class OtelLogSink implements LogSink {
   readonly #logger: Logger;
 
   constructor() {
-    // start otel in case it was not started yet
-    // this is a no-op if already started
-    startOtelAuto();
     this.#logger = logs.getLogger('zero-cache');
   }
 

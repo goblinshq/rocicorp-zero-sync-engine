@@ -20,6 +20,10 @@ import {
   ProtocolError,
   isProtocolError,
 } from '../../../zero-protocol/src/error.ts';
+import type {
+  ConnectionContext,
+  HeaderOptions,
+} from '../services/view-syncer/connection-context-manager.ts';
 import type {ShardID} from '../types/shards.ts';
 import {
   compileUrlPattern,
@@ -44,6 +48,62 @@ describe('fetchFromAPIServer', () => {
   const body = {test: 'data'};
   const validator = v.object({success: v.boolean()});
 
+  type FetchContextOptions = {
+    url?: string | undefined;
+    allowedUrlPatterns?: URLPattern[] | undefined;
+    headerOptions?: HeaderOptions | undefined;
+    auth?: string | undefined;
+    userID?: string | undefined;
+  };
+
+  function makeContext(options: FetchContextOptions = {}): ConnectionContext {
+    const url = options.url ?? baseUrl;
+    const allowedUrlPatterns = options.allowedUrlPatterns ?? allowedPatterns;
+    const headerOptions = options.headerOptions ?? {};
+
+    return {
+      state: 'provisional',
+      clientID: 'test-client',
+      wsID: 'test-ws',
+      userID: options.userID,
+      auth: options.auth ? {type: 'opaque', raw: options.auth} : undefined,
+      profileID: null,
+      baseCookie: null,
+      protocolVersion: 0,
+      revision: 0,
+      revalidateAt: undefined,
+      insertionOrder: 0,
+      queryContext: {
+        url,
+        allowedUrlPatterns,
+        headerOptions,
+      },
+      pushContext: {
+        url,
+        allowedUrlPatterns,
+        headerOptions,
+      },
+    };
+  }
+
+  function fetchWithContext<
+    TValidator extends Parameters<typeof fetchFromAPIServer>[0],
+  >(
+    validator: TValidator,
+    source: Parameters<typeof fetchFromAPIServer>[1],
+    options: FetchContextOptions = {},
+    requestBody: typeof body = body,
+  ) {
+    return fetchFromAPIServer(
+      validator,
+      source,
+      lc,
+      makeContext(options),
+      shard,
+      requestBody,
+    );
+  }
+
   beforeEach(() => {
     mockFetch.mockReset();
     vi.useRealTimers();
@@ -55,20 +115,13 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify(responsePayload), {status: 200}),
     );
 
-    const result = await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    const result = await fetchWithContext(validator, 'push', {
+      headerOptions: {
         apiKey: 'key-123',
-        token: 'token-abc',
         cookie: 'session=xyz',
       },
-      body,
-    );
+      auth: 'token-abc',
+    });
 
     expect(result).toEqual(responsePayload);
     const [calledUrl, init] = mockFetch.mock.calls[0]!;
@@ -92,16 +145,7 @@ describe('fetchFromAPIServer', () => {
     );
     const urlWithQuery = `${baseUrl}?foo=bar`;
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      urlWithQuery,
-      allowedPatterns,
-      shard,
-      {},
-      body,
-    );
+    await fetchWithContext(validator, 'push', {url: urlWithQuery});
 
     const calledUrl = mockFetch.mock.calls[0]![0] as string;
     const url = new URL(calledUrl);
@@ -115,16 +159,7 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {},
-      body,
-    );
+    await fetchWithContext(validator, 'push');
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({'Content-Type': 'application/json'});
@@ -135,14 +170,8 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    await fetchWithContext(validator, 'push', {
+      headerOptions: {
         customHeaders: {
           'x-vercel-automation-bypass-secret': 'my-secret',
           'x-custom-header': 'custom-value',
@@ -152,8 +181,7 @@ describe('fetchFromAPIServer', () => {
           'x-custom-header',
         ],
       },
-      body,
-    );
+    });
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({
@@ -168,23 +196,16 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    await fetchWithContext(validator, 'push', {
+      headerOptions: {
         apiKey: 'api-key',
         customHeaders: {
           'x-vercel-automation-bypass-secret': 'my-secret',
         },
         allowedClientHeaders: ['x-vercel-automation-bypass-secret'],
-        token: 'jwt-token',
       },
-      body,
-    );
+      auth: 'jwt-token',
+    });
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({
@@ -200,22 +221,14 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    await fetchWithContext(validator, 'push', {
+      headerOptions: {
         customHeaders: {
           'x-request-id': '123',
           'x-custom': 'value',
         },
-        // allowedClientHeaders not set
       },
-      body,
-    );
+    });
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({
@@ -228,22 +241,15 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    await fetchWithContext(validator, 'push', {
+      headerOptions: {
         customHeaders: {
           'x-request-id': '123',
           'x-custom': 'value',
         },
         allowedClientHeaders: [],
       },
-      body,
-    );
+    });
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({
@@ -256,14 +262,8 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    await fetchWithContext(validator, 'push', {
+      headerOptions: {
         customHeaders: {
           'x-request-id': '123',
           'x-forbidden': 'bad',
@@ -271,8 +271,7 @@ describe('fetchFromAPIServer', () => {
         },
         allowedClientHeaders: ['x-request-id', 'x-correlation-id'],
       },
-      body,
-    );
+    });
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({
@@ -287,22 +286,15 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
+    await fetchWithContext(validator, 'push', {
+      headerOptions: {
         customHeaders: {
           'X-REQUEST-ID': 'uppercase',
           'x-custom-header': 'lowercase',
         },
         allowedClientHeaders: ['x-request-id', 'X-CUSTOM-HEADER'],
       },
-      body,
-    );
+    });
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({
@@ -318,10 +310,8 @@ describe('fetchFromAPIServer', () => {
         validator,
         'push',
         lc,
-        'https://evil.example.com/endpoint',
-        allowedPatterns,
+        makeContext({url: 'https://evil.example.com/endpoint'}),
         shard,
-        {},
         body,
       ),
     ).rejects.toThrow(
@@ -336,10 +326,8 @@ describe('fetchFromAPIServer', () => {
         validator,
         'transform',
         lc,
-        'https://evil.example.com/endpoint',
-        allowedPatterns,
+        makeContext({url: 'https://evil.example.com/endpoint'}),
         shard,
-        {},
         body,
       ),
     ).rejects.toThrow(
@@ -357,10 +345,8 @@ describe('fetchFromAPIServer', () => {
           validator,
           'push',
           lc,
-          url,
-          allowedPatterns,
+          makeContext({url}),
           shard,
-          {},
           body,
         ),
       ).rejects.toThrow(
@@ -376,16 +362,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'push');
     } catch (error) {
       caught = error;
     }
@@ -417,16 +394,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'push');
     } catch (error) {
       caught = error;
     }
@@ -452,16 +420,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'transform');
     } catch (error) {
       caught = error;
     }
@@ -484,16 +443,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'transform');
     } catch (error) {
       caught = error;
     }
@@ -520,16 +470,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        strictValidator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(strictValidator, 'push');
     } catch (error) {
       caught = error;
     }
@@ -554,16 +495,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        strictValidator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(strictValidator, 'transform');
     } catch (error) {
       caught = error;
     }
@@ -585,16 +517,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'push');
     } catch (error) {
       caught = error;
     }
@@ -616,16 +539,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'transform');
     } catch (error) {
       caught = error;
     }
@@ -655,16 +569,7 @@ describe('fetchFromAPIServer', () => {
           new Response(JSON.stringify({success: true}), {status: 200}),
         );
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push');
 
       // 1st retry
       await vi.advanceTimersByTimeAsync(1200);
@@ -683,16 +588,7 @@ describe('fetchFromAPIServer', () => {
           new Response(JSON.stringify({success: true}), {status: 200}),
         );
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push');
 
       await vi.advanceTimersByTimeAsync(1200);
 
@@ -708,16 +604,7 @@ describe('fetchFromAPIServer', () => {
           new Response(JSON.stringify({success: true}), {status: 200}),
         );
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push');
 
       await vi.advanceTimersByTimeAsync(1200);
 
@@ -729,16 +616,7 @@ describe('fetchFromAPIServer', () => {
     test('fails after max retries (status code)', async () => {
       mockFetch.mockResolvedValue(new Response('bad gateway', {status: 502}));
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push');
 
       // Exhaust all retries
       await Promise.all([
@@ -753,16 +631,7 @@ describe('fetchFromAPIServer', () => {
     test('fails after max retries (fetch failed)', async () => {
       mockFetch.mockRejectedValue(new TypeError('fetch failed'));
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push');
 
       // Exhaust all retries
       await Promise.all([
@@ -777,16 +646,7 @@ describe('fetchFromAPIServer', () => {
     test('does not retry on other errors', async () => {
       mockFetch.mockResolvedValue(new Response('bad request', {status: 400}));
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push');
 
       await expect(promise).rejects.toThrow(/non-OK status 400/);
       expect(mockFetch).toHaveBeenCalledTimes(1);

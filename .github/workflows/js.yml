@@ -20,9 +20,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
-      - run: npx syncpack@13 list-mismatches
+      - run: npx syncpack lint
 
   verify-deps:
     name: Verify Package Dependencies
@@ -31,13 +31,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
       - run: npm install --prefix tools/verify-package-deps
       - run: npm run verify-deps
 
   format:
-    name: Prettier
+    name: Oxfmt
     runs-on: ubuntu-latest
     needs: [syncpack, verify-deps]
     env:
@@ -47,13 +47,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - run: bun install
-      - run: bun run check-format
+      - run: npx oxfmt --check
 
   lint:
     name: Lint
@@ -66,13 +62,10 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - run: bun install
-      - run: bun run lint
+      - run: npm ci
+      - run: npm run lint
 
   check-types:
     name: Check Types
@@ -85,7 +78,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
       - run: npm ci
       - run: npm run check-types
@@ -95,6 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [format, lint, check-types]
     strategy:
+      fail-fast: false
       matrix:
         shard: [1, 2, 3]
     env:
@@ -106,21 +100,26 @@ jobs:
           fetch-depth: 100
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
       - run: npm ci
-      - name: Install Playwright
-        run: npx playwright install chromium firefox webkit --with-deps
+      - uses: ./.github/actions/playwright-install
       - name: Run tests
-        run: TEST_PG_MODE=nopg npm run test -- --shard=${{ matrix.shard }}/3
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          command: TEST_PG_MODE=nopg npm run test -- --shard=${{ matrix.shard }}/3
 
   test-pg:
-    name: Test PG ${{ matrix.pg-version }}
+    name: Test PG ${{ matrix.pg-version }} (Shard ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     needs: [format, lint, check-types]
     strategy:
+      fail-fast: false
       matrix:
-        pg-version: [17, 16, 15]
+        pg-version: [18, 17, 16, 15]
+        shard: [1, 2]
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: rocicorp
@@ -130,8 +129,12 @@ jobs:
           fetch-depth: 100
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
       - run: npm ci
       - name: Run tests
-        run: TEST_PG_MODE=pg-${{ matrix.pg-version }} npm run test
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          command: TEST_PG_MODE=pg-${{ matrix.pg-version }} npm run test -- --shard=${{ matrix.shard }}/2

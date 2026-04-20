@@ -15,38 +15,56 @@ import {
   TIMETZ,
 } from './pg-types.ts';
 
+// Matches: YEAR-MM-DD HH:MM:SS[.fraction][+-TZ[:MM]][ BC]
+const pgTimestampRe =
+  /^(\d+)-(\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d+)?)([+-]\d{1,2}(?::\d{2})?)?(?: BC)?$/;
+
 // exported for testing.
 export function timestampToFpMillis(timestamp: string): number {
-  // Convert from PG's time string, e.g. "1999-01-08 12:05:06+00" to "Z"
-  // format expected by PreciseDate.
-  timestamp = timestamp.replace(' ', 'T');
-  const positiveOffset = timestamp.includes('+');
-  const tzSplitIndex = positiveOffset
-    ? timestamp.lastIndexOf('+')
-    : timestamp.indexOf('-', timestamp.indexOf('T'));
-  const timezoneOffset =
-    tzSplitIndex === -1 ? undefined : timestamp.substring(tzSplitIndex);
-  const tsWithoutTimezone =
-    (tzSplitIndex === -1 ? timestamp : timestamp.substring(0, tzSplitIndex)) +
-    'Z';
+  if (timestamp === 'infinity') return Infinity;
+  if (timestamp === '-infinity') return -Infinity;
+  const match = timestamp.match(pgTimestampRe);
+  if (!match) {
+    throw new Error(`Error parsing ${timestamp}`);
+  }
+
+  const [, yearStr, monthDay, time, tz] = match;
+  const bc = timestamp.endsWith(' BC');
+
+  let year = Number(yearStr);
+  if (bc) {
+    // Postgres: 1 BC = JS year 0, 2 BC = JS year -1, N BC = -(N-1)
+    year = -(year - 1);
+  }
+
+  // Format year as ISO 8601 expanded year if needed.
+  // https://tc39.es/ecma262/#sec-expanded-years
+  let isoYear: string;
+  if (year >= 0 && year <= 9999) {
+    isoYear = String(year).padStart(4, '0');
+  } else if (year >= 0) {
+    isoYear = '+' + String(year).padStart(6, '0');
+  } else {
+    isoYear = '-' + String(Math.abs(year)).padStart(6, '0');
+  }
+
+  // Build a UTC ISO string so PreciseDate returns microsecond precision.
+  const utcString = `${isoYear}-${monthDay}T${time}Z`;
 
   try {
-    // PreciseDate does not return microsecond precision unless the provided
-    // timestamp is in UTC time so we need to add the timezone offset back in.
-    const fullTime = new PreciseDate(tsWithoutTimezone).getFullTime();
+    const fullTime = new PreciseDate(utcString).getFullTime();
     const millis = Number(fullTime / 1_000_000n);
     const nanos = Number(fullTime % 1_000_000n);
     const ret = millis + nanos * 1e-6; // floating point milliseconds
 
-    // add back in the timezone offset
-    if (timezoneOffset) {
-      const [hours, minutes] = timezoneOffset.split(':');
+    // Add back in the timezone offset. We passed local time as UTC,
+    // so a positive offset means we need to subtract, and vice versa.
+    if (tz) {
+      const positiveOffset = tz.startsWith('+');
+      const [hours, minutes] = tz.split(':');
       const offset =
         Math.abs(Number(hours)) * 60 + (minutes ? Number(minutes) : 0);
       const offsetMillis = offset * 60 * 1_000;
-      // If it is a positive offset, we subtract the offset from the UTC
-      // because we passed in the "local time" as if it was UTC.
-      // The opposite is true for negative offsets.
       return positiveOffset ? ret - offsetMillis : ret + offsetMillis;
     }
     return ret;
@@ -81,6 +99,17 @@ function serializeTimestamp(val: unknown): string {
 }
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function serializeTime(x: unknown, type: 'time' | 'timetz'): string {
+  switch (typeof x) {
+    case 'string':
+      return x; // Let Postgres parse it
+    case 'number':
+      return millisecondsToPostgresTime(x);
+  }
+  throw new Error(`Unsupported type "${typeof x}" for ${type}: ${x}`);
+}
+
 export function millisecondsToPostgresTime(milliseconds: number): string {
   if (milliseconds < 0) {
     throw new Error('Milliseconds cannot be negative');
@@ -103,16 +132,17 @@ export function millisecondsToPostgresTime(milliseconds: number): string {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}+00`;
 }
 
+// Regular expression to match HH:MM:SS, HH:MM:SS.mmm, or HH:MM:SS+00 / HH:MM:SS.mmm+00
+// Supports optional timezone offset
+const timeRegex =
+  /^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/;
+
 export function postgresTimeToMilliseconds(timeString: string): number {
   // Validate basic format
   if (!timeString || typeof timeString !== 'string') {
     throw new Error('Invalid time string: must be a non-empty string');
   }
 
-  // Regular expression to match HH:MM:SS, HH:MM:SS.mmm, or HH:MM:SS+00 / HH:MM:SS.mmm+00
-  // Supports optional timezone offset
-  const timeRegex =
-    /^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/;
   const match = timeString.match(timeRegex);
 
   if (!match) {
@@ -188,6 +218,8 @@ export function postgresTimeToMilliseconds(timeString: string): number {
 }
 
 function dateToUTCMidnight(date: string): number {
+  if (date === 'infinity') return Infinity;
+  if (date === '-infinity') return -Infinity;
   const d = new Date(date);
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 }
@@ -243,18 +275,17 @@ export const postgresTypeConfig = ({sendStringAsJson}: TypeOptions = {}) => ({
     time: {
       to: TIME,
       from: [TIME, TIMETZ],
-      serialize: (x: unknown) => {
-        switch (typeof x) {
-          case 'string':
-            return x; // Let Postgres parse it
-          case 'number':
-            return millisecondsToPostgresTime(x);
-        }
-
-        throw new Error(`Unsupported type "${typeof x}" for time: ${x}`);
-      },
+      serialize: (x: unknown) => serializeTime(x, 'time'),
       parse: postgresTimeToMilliseconds,
     },
+
+    timetz: {
+      to: TIMETZ,
+      from: [TIME, TIMETZ],
+      serialize: (x: unknown) => serializeTime(x, 'timetz'),
+      parse: postgresTimeToMilliseconds,
+    },
+
     // The DATE type is stored directly as the PG normalized date string.
     date: {
       to: DATE,
@@ -303,6 +334,8 @@ export function pgClient(
         lc.debug?.(n);
         return;
       case 'WARNING':
+        lc.warn?.(n);
+        return;
       case 'EXCEPTION':
         lc.error?.(n);
         return;
@@ -349,7 +382,7 @@ export function pgClient(
  * these operations from timing out.
  */
 export function disableStatementTimeout(sql: PostgresTransaction) {
-  void sql`SET LOCAL statement_timeout = 0;`.execute();
+  void sql`SET LOCAL statement_timeout = 0;`.execute().catch(() => {});
 }
 
 export const typeNameByOID: Record<number, string> = Object.freeze(
@@ -360,3 +393,7 @@ export const typeNameByOID: Record<number, string> = Object.freeze(
     ]),
   ),
 );
+
+export function isPostgresError(e: unknown, ...codes: [string, ...string[]]) {
+  return e instanceof postgres.PostgresError && codes.includes(e.code);
+}

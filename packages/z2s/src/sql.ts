@@ -3,7 +3,7 @@ import {
   escapeSQLiteIdentifier,
 } from '@databases/escape-identifier';
 import type {FormatConfig, SQLItem, SQLQuery} from '@databases/sql';
-import baseSql, {SQLItemType} from '@databases/sql';
+import sql, {SQLItemType} from '@databases/sql';
 import {assert, unreachable} from '../../shared/src/asserts.ts';
 import {
   isPgNumberType,
@@ -11,8 +11,6 @@ import {
 } from '../../zero-cache/src/types/pg-data-type.ts';
 import type {LiteralValue} from '../../zero-protocol/src/ast.ts';
 import type {ServerColumnSchema} from '../../zero-types/src/server-schema.ts';
-
-export const Z2S_COLLATION = 'ucs_basic';
 
 export function formatPg(sql: SQLQuery) {
   const format = new ReusingFormat(escapePostgresIdentifier);
@@ -137,7 +135,8 @@ function stringify(arg: SqlConvertArg): string | null {
 }
 
 class SQLConvertFormat implements FormatConfig {
-  readonly #seen: Map<unknown, number> = new Map();
+  readonly #seen: Map<unknown, Map<string, number>> = new Map();
+  #size = 0;
   readonly escapeIdentifier: (str: string) => string;
 
   constructor(escapeIdentifier: (str: string) => string) {
@@ -146,16 +145,21 @@ class SQLConvertFormat implements FormatConfig {
 
   formatValue = (value: unknown) => {
     assert(isSqlConvert(value), 'JsonPackedFormat can only take JsonPackArgs.');
-    const key = value.value;
-    if (this.#seen.has(key)) {
+    const byType = this.#seen.get(value.value);
+    if (byType?.has(value.type)) {
       return {
-        placeholder: createPlaceholder(this.#seen.get(key)!, value),
+        placeholder: createPlaceholder(byType.get(value.type)!, value),
         value: PREVIOUSLY_SEEN_VALUE,
       };
     }
-    this.#seen.set(key, this.#seen.size + 1);
+    this.#size++;
+    if (byType) {
+      byType.set(value.type, this.#size);
+    } else {
+      this.#seen.set(value.value, new Map([[value.type, this.#size]]));
+    }
     return {
-      placeholder: createPlaceholder(this.#seen.size, value),
+      placeholder: createPlaceholder(this.#size, value),
       value: stringify(value),
     };
   };
@@ -168,14 +172,17 @@ function createPlaceholder(index: number, arg: SqlConvertArg) {
     return `$${index}`;
   }
 
+  if (arg.value === null && arg.plural) {
+    return `$${index}`;
+  }
+
   if (arg[sqlConvert] === 'literal') {
-    const collate = arg.type === 'string' ? ` COLLATE "${Z2S_COLLATION}"` : '';
     const {value} = arg;
     if (Array.isArray(value)) {
       const elType = pgTypeForLiteralType(arg.type);
-      return formatPlural(index, `value::${elType}${collate}`);
+      return formatPlural(index, `value::${elType}`);
     }
-    return `$${index}::text::${pgTypeForLiteralType(arg.type)}${collate}`;
+    return `$${index}::text::${pgTypeForLiteralType(arg.type)}`;
   }
 
   const common = formatCommonToSingularAndPlural(index, arg);
@@ -193,24 +200,35 @@ function formatCommonToSingularAndPlural(
   // being bool/json/numeric/whatever and the bindings try to coerce
   // the inputs to those types.
   const valuePlaceholder = arg.plural ? 'value' : `$${index}`;
+  let atTimeZone = ` AT TIME ZONE 'UTC'`;
   switch (arg.type) {
+    case 'timestamptz':
+    // @ts-expect-error Fallthrough intended
+    case 'timestamp with time zone':
+      atTimeZone = '';
+    // fallthrough
+
     case 'date':
     case 'timestamp':
     case 'timestamp without time zone':
-      return `to_timestamp(${valuePlaceholder}::text::bigint / 1000.0) AT TIME ZONE 'UTC'`;
-    case 'timestamptz':
-    case 'timestamp with time zone':
-      return `to_timestamp(${valuePlaceholder}::text::bigint / 1000.0)`;
-    // uuid doesn't support collation, so we compare as text
+      return `to_timestamp(${valuePlaceholder}::text::numeric / 1000.0)${atTimeZone}`;
+
+    case 'timetz':
+    // @ts-expect-error Fallthrough intended
+    case 'time with time zone':
+      atTimeZone = '';
+    // fallthrough
+
+    case 'time':
+    case 'time without time zone':
+      return `(${valuePlaceholder}::text::int * interval'1ms')::time${atTimeZone}`;
+
+    // uuid: cast to native uuid type for proper comparison and index usage
     case 'uuid':
-      return arg.isComparison
-        ? `${valuePlaceholder}::text COLLATE "${Z2S_COLLATION}"`
-        : `${valuePlaceholder}::text::uuid`;
+      return `${valuePlaceholder}::text::uuid`;
   }
   if (arg.isEnum) {
-    return arg.isComparison
-      ? `${valuePlaceholder}::text COLLATE "${Z2S_COLLATION}"`
-      : `${valuePlaceholder}::text::"${arg.type}"`;
+    return `${valuePlaceholder}::text::"${arg.type}"`;
   }
   if (isPgStringType(arg.type)) {
     // For comparison cast to the general `text` type, not the
@@ -218,7 +236,7 @@ function formatCommonToSingularAndPlural(
     // force the value being compared to the size/max-size of the column
     // type before comparison.
     return arg.isComparison
-      ? `${valuePlaceholder}::text COLLATE "${Z2S_COLLATION}"`
+      ? `${valuePlaceholder}::text`
       : `${valuePlaceholder}::text::${arg.type}`;
   }
   if (isPgNumberType(arg.type)) {
@@ -256,9 +274,11 @@ function pgTypeForLiteralType(type: Exclude<LiteralType, 'null'>) {
   }
 }
 
-export const sql = baseSql.default;
+export {sql};
 
 const PREVIOUSLY_SEEN_VALUE = Symbol('PREVIOUSLY_SEEN_VALUE');
+
+const whitespacePrefixRe = /^\s*/;
 
 function formatFn(
   items: readonly SQLItem[],
@@ -311,8 +331,9 @@ function formatFn(
           .map((name): string => {
             if (typeof name === 'string') return escapeIdentifier(name);
 
-            if (!localIdentifiers.has(name))
+            if (!localIdentifiers.has(name)) {
               localIdentifiers.set(name, `__local_${localIdentifiers.size}__`);
+            }
 
             return escapeIdentifier(localIdentifiers.get(name)!);
           })
@@ -325,7 +346,9 @@ function formatFn(
   if (text.trim()) {
     const lines = text.split('\n');
     const min = Math.min(
-      ...lines.filter(l => l.trim() !== '').map(l => /^\s*/.exec(l)![0].length),
+      ...lines
+        .filter(l => l.trim() !== '')
+        .map(l => whitespacePrefixRe.exec(l)![0].length),
     );
     if (min) {
       text = lines.map(line => line.substr(min)).join('\n');

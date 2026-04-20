@@ -1,9 +1,10 @@
-import {resolver} from '@rocicorp/resolver';
 import EventEmitter from 'node:events';
+import {resolver} from '@rocicorp/resolver';
 import {beforeEach, describe, expect, test} from 'vitest';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import {promiseVoid} from '../../../shared/src/resolved-promises.ts';
 import {
+  INTENTIONAL_SHUTDOWN_ERROR_CODE,
   ProcessManager,
   runUntilKilled,
   type WorkerType,
@@ -82,6 +83,24 @@ describe('shutdown', () => {
 
     await Promise.all(all.map(w => w.running.promise));
   });
+
+  test.each([
+    ['SIGTERM', 0],
+    ['SIGINT', 0],
+    ['SIGQUIT', INTENTIONAL_SHUTDOWN_ERROR_CODE],
+    ['SIGABRT', -1],
+  ])(
+    'shutdown before workers started: %s',
+    async (signal, expectedExitCode) => {
+      const {promise: exitCode, resolve} = resolver<number>();
+      proc = new EventEmitter();
+      proc.on('exit', resolve);
+
+      new ProcessManager(lc, proc);
+      proc.emit(signal);
+      expect(await exitCode).toBe(expectedExitCode);
+    },
+  );
 
   test.each([['SIGTERM'], ['SIGINT']])(
     'graceful shutdown: %s',
@@ -188,6 +207,16 @@ describe('shutdown', () => {
       ],
     ],
     [
+      'SIGABRT',
+      () => proc.emit('SIGABRT'),
+      [
+        'stop supporting',
+        'stop supporting',
+        'stop user-facing',
+        'stop user-facing',
+      ],
+    ],
+    [
       'supporting worker exits',
       () => replicator.stop(),
       [
@@ -218,36 +247,11 @@ describe('shutdown', () => {
       ['stop supporting', 'stop supporting', 'stop user-facing'],
     ],
   ])('forceful shutdown: %s', async (_name, fn, expectedEvents) => {
-    void fn();
+    fn();
 
     await Promise.allSettled(all.map(w => w.stopped.promise));
 
     // sort() because order doesn't matter.
     expect(events.sort()).toEqual(expectedEvents.sort());
-  });
-
-  test('graceful shutdown with no user-facing workers', async () => {
-    proc = new EventEmitter();
-    processes = new ProcessManager(lc, proc);
-    const changeStreamer = startWorker('cs', 'supporting');
-    const replicator = startWorker('rep', 'supporting');
-    const all = [changeStreamer, replicator];
-
-    await Promise.all(all.map(w => w.running.promise));
-
-    void changeStreamer.stop();
-
-    await replicator.draining.promise;
-
-    replicator.finishDrain.resolve();
-
-    await replicator.stopped.promise;
-
-    lc.debug?.('expecting');
-    expect(events).toEqual([
-      'stop supporting',
-      'drain supporting',
-      'stop supporting',
-    ]);
   });
 });

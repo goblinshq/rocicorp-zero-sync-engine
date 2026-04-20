@@ -11,6 +11,8 @@ import {
   Debug,
   runtimeDebugFlags,
 } from '../../../../zql/src/builder/debug-delegate.ts';
+import {ChangeIndex} from '../../../../zql/src/ivm/change-index.ts';
+import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
 import type {Change} from '../../../../zql/src/ivm/change.ts';
 import type {Node} from '../../../../zql/src/ivm/data.ts';
 import {
@@ -19,10 +21,13 @@ import {
   type Storage,
 } from '../../../../zql/src/ivm/operator.ts';
 import type {SourceSchema} from '../../../../zql/src/ivm/schema.ts';
-import type {
-  Source,
-  SourceChange,
-  SourceInput,
+import {
+  type Source,
+  type SourceChange,
+  type SourceInput,
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
 } from '../../../../zql/src/ivm/source.ts';
 import type {ConnectionCostModel} from '../../../../zql/src/planner/planner-connection.ts';
 import {MeasurePushOperator} from '../../../../zql/src/query/measure-push-operator.ts';
@@ -47,7 +52,7 @@ import {
 } from '../../observability/metrics.ts';
 import type {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import {type RowKey} from '../../types/row-key.ts';
-import {upstreamSchema, type ShardID} from '../../types/shards.ts';
+import {type ShardID} from '../../types/shards.ts';
 import {
   getSubscriptionState,
   ZERO_VERSION_COLUMN_NAME,
@@ -56,29 +61,19 @@ import {checkClientSchema} from './client-schema.ts';
 import type {Snapshotter} from './snapshotter.ts';
 import {ResetPipelinesSignal, type SnapshotDiff} from './snapshotter.ts';
 
-export type RowAdd = {
-  readonly type: 'add';
+type RowOp<Op extends Omit<ChangeType, ChangeType.CHILD>> = {
+  readonly type: Op;
   readonly queryID: string;
   readonly table: string;
   readonly rowKey: Row;
   readonly row: Row;
 };
 
-export type RowRemove = {
-  readonly type: 'remove';
-  readonly queryID: string;
-  readonly table: string;
-  readonly rowKey: Row;
-  readonly row: undefined;
-};
+export type RowAdd = RowOp<ChangeType.ADD>;
 
-export type RowEdit = {
-  readonly type: 'edit';
-  readonly queryID: string;
-  readonly table: string;
-  readonly rowKey: Row;
-  readonly row: Row;
-};
+export type RowRemove = RowOp<ChangeType.REMOVE>;
+
+export type RowEdit = RowOp<ChangeType.EDIT>;
 
 export type RowChange = RowAdd | RowRemove | RowEdit;
 
@@ -171,8 +166,8 @@ export class PipelineDriver {
     clientGroupID: string,
     inspectorDelegate: InspectorDelegate,
     yieldThresholdMs: () => number,
-    enablePlanner?: boolean | undefined,
-    config?: ZeroConfig | undefined,
+    enablePlanner?: boolean,
+    config?: ZeroConfig,
   ) {
     this.#lc = lc.withContext('clientGroupID', clientGroupID);
     this.#snapshotter = snapshotter;
@@ -246,9 +241,7 @@ export class PipelineDriver {
     this.#primaryKeys = primaryKeys;
     primaryKeys.clear();
     for (const [table, spec] of this.#tableSpecs.entries()) {
-      if (table.startsWith(upstreamSchema(this.#shardID))) {
-        primaryKeys.set(table, spec.tableSpec.primaryKey);
-      }
+      primaryKeys.set(table, spec.tableSpec.primaryKey);
     }
     buildPrimaryKeys(clientSchema, primaryKeys);
     const {replicaVersion} = getSubscriptionState(db);
@@ -476,7 +469,7 @@ export class PipelineDriver {
       for (const {table, row} of companionRows) {
         const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
         yield {
-          type: 'add',
+          type: ChangeType.ADD,
           queryID,
           table,
           rowKey: getRowKey(primaryKey, row),
@@ -516,22 +509,24 @@ export class PipelineDriver {
         companionInput.setOutput({
           push: (change: Change) => {
             let newValue: LiteralValue | null | undefined;
-            switch (change.type) {
-              case 'add':
-              case 'edit':
+            switch (change[ChangeIndex.TYPE]) {
+              case ChangeType.ADD:
+              case ChangeType.EDIT:
                 newValue =
-                  (change.node.row[childField] as LiteralValue) ?? null;
+                  (change[ChangeIndex.NODE].row[childField] as LiteralValue) ??
+                  null;
                 break;
-              case 'remove':
+              case ChangeType.REMOVE:
                 newValue = undefined;
                 break;
-              case 'child':
+              case ChangeType.CHILD:
                 return [];
             }
             if (!scalarValuesEqual(newValue, resolvedValue)) {
               throw new ResetPipelinesSignal(
                 `Scalar subquery value changed for ${meta.ast.table}: ` +
                   `${String(resolvedValue)} -> ${String(newValue)}`,
+                'scalar-subquery',
               );
             }
             const streamer = this.#streamer;
@@ -677,24 +672,23 @@ export class PipelineDriver {
               if (nextValue) {
                 this.#conflictRowsDeleted.add(1);
               }
-              yield* this.#push(tableSource, {
-                type: 'remove',
-                row: prevValue,
-              });
+              yield* this.#push(
+                tableSource,
+                makeSourceChangeRemove(prevValue as Row),
+              );
             }
           }
           if (nextValue) {
             if (editOldRow) {
-              yield* this.#push(tableSource, {
-                type: 'edit',
-                row: nextValue,
-                oldRow: editOldRow,
-              });
+              yield* this.#push(
+                tableSource,
+                makeSourceChangeEdit(nextValue as Row, editOldRow),
+              );
             } else {
-              yield* this.#push(tableSource, {
-                type: 'add',
-                row: nextValue,
-              });
+              yield* this.#push(
+                tableSource,
+                makeSourceChangeAdd(nextValue as Row),
+              );
             }
           }
         } finally {
@@ -785,6 +779,7 @@ export class PipelineDriver {
         `Advancement exceeded timeout at ${pos} of ${numChanges} changes ` +
           `after ${elapsed} ms. Advancement time limited based on total ` +
           `hydration time of ${totalHydrationTimeMs} ms.`,
+        'advancement-timeout',
       );
     }
     return advanceTimer.elapsedLap() > this.#yieldThresholdMs();
@@ -879,16 +874,18 @@ class Streamer {
         yield change;
         continue;
       }
-      const {type} = change;
-
+      const type = change[ChangeIndex.TYPE];
       switch (type) {
-        case 'add':
-        case 'remove': {
-          yield* this.#streamNodes(queryID, schema, type, () => [change.node]);
+        case ChangeType.REMOVE:
+        case ChangeType.ADD: {
+          yield* this.#streamNodes(queryID, schema, type, () => [
+            change[ChangeIndex.NODE],
+          ]);
           break;
         }
-        case 'child': {
-          const {child} = change;
+
+        case ChangeType.CHILD: {
+          const child = change[ChangeIndex.CHILD_DATA];
           const childSchema = must(
             schema.relationships[child.relationshipName],
           );
@@ -896,13 +893,13 @@ class Streamer {
           yield* this.#streamChanges(queryID, childSchema, [child.change]);
           break;
         }
-        case 'edit':
+        case ChangeType.EDIT:
           yield* this.#streamNodes(queryID, schema, type, () => [
-            {row: change.node.row, relationships: {}},
+            {row: change[ChangeIndex.NODE].row, relationships: {}},
           ]);
           break;
         default:
-          unreachable(type);
+          unreachable(change[ChangeIndex.TYPE]);
       }
     }
   }
@@ -910,7 +907,7 @@ class Streamer {
   *#streamNodes(
     queryID: string,
     schema: SourceSchema,
-    op: 'add' | 'remove' | 'edit',
+    op: ChangeType.ADD | ChangeType.REMOVE | ChangeType.EDIT,
     nodes: () => Iterable<Node | 'yield'>,
   ): Iterable<RowChange | 'yield'> {
     const {tableName: table, system} = schema;
@@ -932,7 +929,7 @@ class Streamer {
       const {relationships} = node;
       let {row} = node;
       const rowKey = getRowKey(primaryKey, row);
-      if (op !== 'remove') {
+      if (op !== ChangeType.REMOVE) {
         const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
         if (
           typeof rowVersion === 'string' &&
@@ -947,7 +944,7 @@ class Streamer {
         queryID,
         table,
         rowKey,
-        row: op === 'remove' ? undefined : row,
+        row: op === ChangeType.REMOVE ? undefined : row,
       } as RowChange;
 
       for (const [relationship, children] of Object.entries(relationships)) {
@@ -964,7 +961,7 @@ function* toAdds(nodes: Iterable<Node | 'yield'>): Iterable<Change | 'yield'> {
       yield node;
       continue;
     }
-    yield {type: 'add', node};
+    yield [ChangeType.ADD, node, null];
   }
 }
 
@@ -1022,11 +1019,15 @@ function mustGetPrimaryKey(
 ): PrimaryKey {
   const pKeys = must(primaryKeys, 'primaryKey map must be non-null');
 
-  return must(
-    pKeys.get(table),
-    `table '${table}' is not one of: ${[...pKeys.keys()].sort()}. ` +
+  const rv = pKeys.get(table);
+  assert(
+    rv,
+    () =>
+      // oxlint-disable-next-line typescript/restrict-template-expressions e18e/prefer-array-to-sorted
+      `table '${table}' is not one of: ${[...pKeys.keys()].sort()}. ` +
       `Check the spelling and ensure that the table has a primary key.`,
   );
+  return rv;
 }
 
 /**

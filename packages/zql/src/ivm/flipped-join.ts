@@ -2,8 +2,16 @@ import {assert, unreachable} from '../../../shared/src/asserts.ts';
 import {binarySearch} from '../../../shared/src/binary-search.ts';
 import {emptyArray} from '../../../shared/src/sentinels.ts';
 import type {CompoundKey, System} from '../../../zero-protocol/src/ast.ts';
-import type {Value} from '../../../zero-protocol/src/data.ts';
-import type {Change} from './change.ts';
+import type {Row, Value} from '../../../zero-protocol/src/data.ts';
+import {ChangeIndex} from './change-index.ts';
+import {ChangeType} from './change-type.ts';
+import {
+  makeAddChange,
+  makeChildChange,
+  makeEditChange,
+  makeRemoveChange,
+  type Change,
+} from './change.ts';
 import {constraintsAreCompatible} from './constraint.ts';
 import type {Node} from './data.ts';
 import {
@@ -11,7 +19,6 @@ import {
   generateWithOverlayNoYield,
   isJoinMatch,
   rowEqualsForCompoundKey,
-  type JoinChangeOverlay,
 } from './join-utils.ts';
 import {
   throwOutput,
@@ -52,7 +59,8 @@ export class FlippedJoin implements Input {
 
   #output: Output = throwOutput;
 
-  #inprogressChildChange: JoinChangeOverlay | undefined;
+  #inprogressChildChange: Change | undefined;
+  #inprogressChildChangePosition: Row | undefined;
 
   constructor({
     parent,
@@ -147,8 +155,8 @@ export class FlippedJoin implements Input {
     // related parents with position greater than change.position
     // (which should not yet have the node removed), would not even
     // be fetched here, and would be absent from the output all together.
-    if (this.#inprogressChildChange?.change.type === 'remove') {
-      const removedNode = this.#inprogressChildChange.change.node;
+    if (this.#inprogressChildChange?.[ChangeIndex.TYPE] === ChangeType.REMOVE) {
+      const removedNode = this.#inprogressChildChange[ChangeIndex.NODE];
       const compare = this.#child.getSchema().compareRows;
       const insertPos = binarySearch(childNodes.length, i =>
         compare(removedNode.row, childNodes[i].row),
@@ -239,9 +247,9 @@ export class FlippedJoin implements Input {
         let overlaidRelatedChildNodes = relatedChildNodes;
         if (
           this.#inprogressChildChange &&
-          this.#inprogressChildChange.position &&
+          this.#inprogressChildChangePosition &&
           isJoinMatch(
-            this.#inprogressChildChange.change.node.row,
+            this.#inprogressChildChange[ChangeIndex.NODE].row,
             this.#childKey,
             minParentNode.row,
             this.#parentKey,
@@ -252,21 +260,23 @@ export class FlippedJoin implements Input {
               .getSchema()
               .compareRows(
                 minParentNode.row,
-                this.#inprogressChildChange.position,
+                this.#inprogressChildChangePosition,
               ) <= 0;
-          if (this.#inprogressChildChange.change.type === 'remove') {
+          if (
+            this.#inprogressChildChange[ChangeIndex.TYPE] === ChangeType.REMOVE
+          ) {
             if (hasInprogressChildChangeBeenPushedForMinParentNode) {
               // Remove form relatedChildNodes since the removed child
               // was inserted into childNodes above.
               overlaidRelatedChildNodes = relatedChildNodes.filter(
-                n => n !== this.#inprogressChildChange?.change.node,
+                n => n !== this.#inprogressChildChange?.[ChangeIndex.NODE],
               );
             }
           } else if (!hasInprogressChildChangeBeenPushedForMinParentNode) {
             overlaidRelatedChildNodes = [
               ...generateWithOverlayNoYield(
                 relatedChildNodes,
-                this.#inprogressChildChange.change,
+                this.#inprogressChildChange,
                 this.#child.getSchema(),
               ),
             ];
@@ -310,16 +320,16 @@ export class FlippedJoin implements Input {
   }
 
   *#pushChild(change: Change): Stream<'yield'> {
-    switch (change.type) {
-      case 'add':
-      case 'remove':
+    switch (change[ChangeIndex.TYPE]) {
+      case ChangeType.ADD:
+      case ChangeType.REMOVE:
         yield* this.#pushChildChange(change);
         break;
-      case 'edit': {
+      case ChangeType.EDIT: {
         assert(
           rowEqualsForCompoundKey(
-            change.oldNode.row,
-            change.node.row,
+            change[ChangeIndex.OLD_NODE].row,
+            change[ChangeIndex.NODE].row,
             this.#childKey,
           ),
           `Child edit must not change relationship.`,
@@ -327,20 +337,18 @@ export class FlippedJoin implements Input {
         yield* this.#pushChildChange(change, true);
         break;
       }
-      case 'child':
+      case ChangeType.CHILD:
         yield* this.#pushChildChange(change, true);
         break;
     }
   }
 
   *#pushChildChange(change: Change, exists?: boolean): Stream<'yield'> {
-    this.#inprogressChildChange = {
-      change,
-      position: undefined,
-    };
+    this.#inprogressChildChange = change;
+    this.#inprogressChildChangePosition = undefined;
     try {
       const constraint = buildJoinConstraint(
-        change.node.row,
+        change[ChangeIndex.NODE].row,
         this.#childKey,
         this.#parentKey,
       );
@@ -352,10 +360,8 @@ export class FlippedJoin implements Input {
           yield 'yield';
           continue;
         }
-        this.#inprogressChildChange = {
-          change,
-          position: parentNode.row,
-        };
+        this.#inprogressChildChange = change;
+        this.#inprogressChildChangePosition = parentNode.row;
         const childNodeStream = () => {
           const constraint = buildJoinConstraint(
             parentNode.row,
@@ -373,7 +379,7 @@ export class FlippedJoin implements Input {
             if (
               this.#child
                 .getSchema()
-                .compareRows(childNode.row, change.node.row) !== 0
+                .compareRows(childNode.row, change[ChangeIndex.NODE].row) !== 0
             ) {
               exists = true;
               break;
@@ -382,34 +388,33 @@ export class FlippedJoin implements Input {
         }
         if (exists) {
           yield* this.#output.push(
-            {
-              type: 'child',
-              node: {
+            makeChildChange(
+              {
                 ...parentNode,
                 relationships: {
                   ...parentNode.relationships,
                   [this.#relationshipName]: childNodeStream,
                 },
               },
-              child: {
+              {
                 relationshipName: this.#relationshipName,
                 change,
               },
-            },
+            ),
             this,
           );
         } else {
-          yield* this.#output.push(
-            {
-              ...change,
-              node: {
-                ...parentNode,
-                relationships: {
-                  ...parentNode.relationships,
-                  [this.#relationshipName]: () => [change.node],
-                },
-              },
+          const newNode = {
+            ...parentNode,
+            relationships: {
+              ...parentNode.relationships,
+              [this.#relationshipName]: () => [change[ChangeIndex.NODE]],
             },
+          };
+          yield* this.#output.push(
+            change[ChangeIndex.TYPE] === ChangeType.ADD
+              ? makeAddChange(newNode)
+              : makeRemoveChange(newNode),
             this,
           );
         }
@@ -439,7 +444,7 @@ export class FlippedJoin implements Input {
 
     // If no related child don't push as this is an inner join.
     let hasRelatedChild = false;
-    for (const node of childNodeStream(change.node)()) {
+    for (const node of childNodeStream(change[ChangeIndex.NODE])()) {
       if (node === 'yield') {
         yield 'yield';
         continue;
@@ -452,34 +457,43 @@ export class FlippedJoin implements Input {
       return;
     }
 
-    switch (change.type) {
-      case 'add':
-      case 'remove':
-      case 'child': {
+    switch (change[ChangeIndex.TYPE]) {
+      case ChangeType.ADD:
         yield* this.#output.push(
-          {
-            ...change,
-            node: flip(change.node),
-          },
+          makeAddChange(flip(change[ChangeIndex.NODE])),
+          this,
+        );
+        break;
+      case ChangeType.REMOVE:
+        yield* this.#output.push(
+          makeRemoveChange(flip(change[ChangeIndex.NODE])),
+          this,
+        );
+        break;
+      case ChangeType.CHILD: {
+        yield* this.#output.push(
+          makeChildChange(
+            flip(change[ChangeIndex.NODE]),
+            change[ChangeIndex.CHILD_DATA],
+          ),
           this,
         );
         break;
       }
-      case 'edit': {
+      case ChangeType.EDIT: {
         assert(
           rowEqualsForCompoundKey(
-            change.oldNode.row,
-            change.node.row,
+            change[ChangeIndex.OLD_NODE].row,
+            change[ChangeIndex.NODE].row,
             this.#parentKey,
           ),
           `Parent edit must not change relationship.`,
         );
         yield* this.#output.push(
-          {
-            type: 'edit',
-            oldNode: flip(change.oldNode),
-            node: flip(change.node),
-          },
+          makeEditChange(
+            flip(change[ChangeIndex.NODE]),
+            flip(change[ChangeIndex.OLD_NODE]),
+          ),
           this,
         );
         break;

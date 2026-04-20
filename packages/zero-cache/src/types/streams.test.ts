@@ -1,8 +1,8 @@
+import {getDefaultHighWaterMark} from 'stream';
 import websocket from '@fastify/websocket';
 import {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
 import Fastify, {type FastifyInstance} from 'fastify';
-import {getDefaultHighWaterMark} from 'stream';
 import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
 import WebSocket from 'ws';
 import {unreachable} from '../../../shared/src/asserts.ts';
@@ -57,7 +57,7 @@ describe('streams with flow control', () => {
         ws,
         messageSchema,
       );
-      void serverRequests.enqueue({serverIn: instream, serverOut: outstream});
+      serverRequests.enqueue({serverIn: instream, serverOut: outstream});
     });
     const url = await server.listen({port: 0});
     lc.info?.(`server running on ${url}`);

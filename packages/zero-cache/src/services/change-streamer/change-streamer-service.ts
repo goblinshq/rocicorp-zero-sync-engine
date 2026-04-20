@@ -1,6 +1,6 @@
+import {getDefaultHighWaterMark} from 'node:stream';
 import type {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
-import {getDefaultHighWaterMark} from 'node:stream';
 import {unreachable} from '../../../../shared/src/asserts.ts';
 import {promiseVoid} from '../../../../shared/src/resolved-promises.ts';
 import {publishCriticalEvent} from '../../observability/events.ts';
@@ -25,6 +25,7 @@ import {
 import {
   publishReplicationError,
   replicationStatusError,
+  type ReplicationStatusPublisher,
 } from '../replicator/replication-status.ts';
 import type {SubscriptionState} from '../replicator/schema/replication-state.ts';
 import {
@@ -35,6 +36,7 @@ import {
 import {
   type ChangeStreamerService,
   type Downstream,
+  type Status,
   type SubscriberContext,
 } from './change-streamer.ts';
 import * as ErrorType from './error-type-enum.ts';
@@ -45,8 +47,16 @@ import {
   ensureReplicationConfig,
   markResetRequired,
 } from './schema/tables.ts';
-import {Storer} from './storer.ts';
+import {
+  Storer,
+  type PurgeLock,
+  type TuningOptions as StorerOptions,
+} from './storer.ts';
 import {Subscriber} from './subscriber.ts';
+
+export type TuningOptions = StorerOptions & {
+  flowControlConsensusPaddingSeconds: number;
+};
 
 /**
  * Performs initialization and schema migrations to initialize a ChangeStreamerImpl.
@@ -59,10 +69,11 @@ export async function initializeStreamer(
   discoveryProtocol: string,
   changeDB: PostgresDB,
   changeSource: ChangeSource,
+  replicationStatusPublisher: ReplicationStatusPublisher,
   subscriptionState: SubscriptionState,
+  purgeLock: PurgeLock | null,
   autoReset: boolean,
-  backPressureLimitHeapProportion: number,
-  flowControlConsensusPaddingSeconds: number,
+  opts: TuningOptions,
   setTimeoutFn = setTimeout,
 ): Promise<ChangeStreamerService> {
   // Make sure the ChangeLog DB is set up.
@@ -73,6 +84,7 @@ export async function initializeStreamer(
     subscriptionState,
     shard,
     autoReset,
+    setTimeoutFn,
   );
 
   const {replicaVersion} = subscriptionState;
@@ -85,12 +97,15 @@ export async function initializeStreamer(
     changeDB,
     replicaVersion,
     changeSource,
+    replicationStatusPublisher,
+    purgeLock,
     autoReset,
-    backPressureLimitHeapProportion,
-    flowControlConsensusPaddingSeconds,
+    opts,
     setTimeoutFn,
   );
 }
+
+const REPLICATION_STATUS_ERROR_DELAY_THRESHOLD_MS = 5000;
 
 /**
  * Internally all Downstream messages (not just commits) are given a watermark.
@@ -251,6 +266,7 @@ class ChangeStreamerImpl implements ChangeStreamerService {
   readonly #source: ChangeSource;
   readonly #storer: Storer;
   readonly #forwarder: Forwarder;
+  readonly #replicationStatusPublisher: ReplicationStatusPublisher;
 
   readonly #autoReset: boolean;
   readonly #state: RunningState;
@@ -271,7 +287,14 @@ class ChangeStreamerImpl implements ChangeStreamerService {
     'transactions',
     'Count of replicated transactions',
   );
+  readonly #changeCounter = getOrCreateCounter(
+    'replication',
+    'changes',
+    'Count of replicated changes (DML or DDL statements)',
+  );
 
+  #latestStatus: Status;
+  #purgeLock: PurgeLock | null;
   #stream: ChangeStream | undefined;
 
   constructor(
@@ -283,9 +306,10 @@ class ChangeStreamerImpl implements ChangeStreamerService {
     changeDB: PostgresDB,
     replicaVersion: string,
     source: ChangeSource,
+    replicationStatusPublisher: ReplicationStatusPublisher,
+    initialPurgeLock: PurgeLock | null,
     autoReset: boolean,
-    backPressureLimitHeapProportion: number,
-    flowControlConsensusPaddingSeconds: number,
+    opts: TuningOptions,
     setTimeoutFn = setTimeout,
   ) {
     this.id = `change-streamer`;
@@ -304,13 +328,17 @@ class ChangeStreamerImpl implements ChangeStreamerService {
       replicaVersion,
       consumed => this.#stream?.acks.push(['status', consumed[1], consumed[2]]),
       err => this.stop(err),
-      backPressureLimitHeapProportion,
+      opts,
     );
     this.#forwarder = new Forwarder(lc, {
-      flowControlConsensusPaddingSeconds,
+      flowControlConsensusPaddingSeconds:
+        opts.flowControlConsensusPaddingSeconds,
     });
+    this.#replicationStatusPublisher = replicationStatusPublisher;
+    this.#purgeLock = initialPurgeLock;
     this.#autoReset = autoReset;
     this.#state = new RunningState(this.id, undefined, setTimeoutFn);
+    this.#latestStatus = {tag: 'status'};
   }
 
   async run() {
@@ -318,9 +346,15 @@ class ChangeStreamerImpl implements ChangeStreamerService {
 
     this.#forwarder.startProgressMonitor();
 
+    const lagReport = await this.#source.startLagReporter();
+    if (lagReport) {
+      this.#latestStatus.lagReport = lagReport;
+    }
+
     // Once this change-streamer acquires "ownership" of the change DB,
     // it is safe to start the storer.
-    await this.#storer.assumeOwnership();
+    await this.#storer.assumeOwnership(this.#purgeLock);
+    this.#purgeLock = null;
 
     // The threshold in (estimated number of) bytes to send() on subscriber
     // websockets before `await`-ing the I/O buffers to be ready for more.
@@ -340,7 +374,18 @@ class ChangeStreamerImpl implements ChangeStreamerService {
         this.#storer.run().catch(e => stream.changes.cancel(e));
 
         this.#stream = stream;
-        this.#state.resetBackoff();
+        if (
+          this.#state.resetBackoff() >
+          REPLICATION_STATUS_ERROR_DELAY_THRESHOLD_MS
+        ) {
+          // After recovering from a backoff for which a replication status
+          // error was published, publish an OK status
+          this.#replicationStatusPublisher.publish(
+            this.#lc,
+            'Replicating',
+            `Replicating from ${lastWatermark}`,
+          );
+        }
         watermark = null;
 
         for await (const change of stream.changes) {
@@ -349,6 +394,14 @@ class ChangeStreamerImpl implements ChangeStreamerService {
             case 'status':
               if (msg.ack) {
                 this.#storer.status(change); // storer acks once it gets through its queue
+              }
+              if (msg.lagReport) {
+                // Lag reports are not stored in the cdc change log, but rather
+                // only forwarded on "live" connections. When a new subscriber
+                // is catching up, it is initialized with the #latestStatus
+                // from which it can measure lag while catching up.
+                this.#latestStatus.lagReport = msg.lagReport;
+                this.#forwarder.sendStatus(this.#latestStatus);
               }
               continue;
             case 'control':
@@ -366,6 +419,9 @@ class ChangeStreamerImpl implements ChangeStreamerService {
               this.#txCounter.add(1);
               break;
             default:
+              if (type === 'data') {
+                this.#changeCounter.add(1);
+              }
               if (watermark === null) {
                 throw new UnrecoverableError(
                   `${type} change (${msg.tag}) received before 'begin' message`,
@@ -412,17 +468,14 @@ class ChangeStreamerImpl implements ChangeStreamerService {
       if (watermark) {
         this.#lc.warn?.(`aborting interrupted transaction ${watermark}`);
         this.#storer.abort();
-        await this.#forwarder.forward([
-          watermark,
-          ['rollback', {tag: 'rollback'}],
-        ]);
+        this.#forwarder.forward([watermark, ['rollback', {tag: 'rollback'}]]);
       }
 
       // Backoff and drain any pending entries in the storer before reconnecting.
       await Promise.all([
         this.#storer.stop(),
         this.#state.backoff(this.#lc, err),
-        this.#state.retryDelay > 5000
+        this.#state.retryDelay > REPLICATION_STATUS_ERROR_DELAY_THRESHOLD_MS
           ? publishCriticalEvent(
               this.#lc,
               replicationStatusError(this.#lc, 'Replicating', err),
@@ -459,7 +512,7 @@ class ChangeStreamerImpl implements ChangeStreamerService {
   }
 
   subscribe(ctx: SubscriberContext): Promise<Source<Downstream>> {
-    const {protocolVersion, id, mode, replicaVersion, watermark, initial} = ctx;
+    const {protocolVersion, id, mode, replicaVersion, watermark} = ctx;
     if (mode === 'serving') {
       this.#serving.resolve();
     }
@@ -471,6 +524,7 @@ class ChangeStreamerImpl implements ChangeStreamerService {
       id,
       watermark,
       downstream,
+      () => this.#latestStatus,
     );
     if (replicaVersion !== this.#replicaVersion) {
       this.#lc.warn?.(
@@ -487,10 +541,6 @@ class ChangeStreamerImpl implements ChangeStreamerService {
 
       this.#forwarder.add(subscriber);
       this.#storer.catchup(subscriber, mode);
-
-      if (initial) {
-        this.scheduleCleanup(watermark);
-      }
     }
     return Promise.resolve(downstream);
   }
@@ -569,6 +619,7 @@ class ChangeStreamerImpl implements ChangeStreamerService {
     this.#state.stop(this.#lc, err);
     this.#stream?.changes.cancel();
     await this.#storer.stop();
+    await this.#source.stop();
   }
 }
 

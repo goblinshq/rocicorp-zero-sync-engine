@@ -1,6 +1,7 @@
 import type {LogContext} from '@rocicorp/logger';
 import {type Resolver, resolver} from '@rocicorp/resolver';
 import type {PendingQuery, Row} from 'postgres';
+import {startAsyncSpan} from '../../../../otel/src/span.ts';
 import {CustomKeyMap} from '../../../../shared/src/custom-key-map.ts';
 import {must} from '../../../../shared/src/must.ts';
 import {promiseVoid} from '../../../../shared/src/resolved-promises.ts';
@@ -30,6 +31,7 @@ import {
   versionString,
   versionToNullableCookie,
 } from './schema/types.ts';
+import {tracer} from './tracer.ts';
 
 const FLUSH_TYPE_ATTRIBUTE = 'flush.type';
 
@@ -163,19 +165,27 @@ export class RowRecordCache {
     // query is made even if there are multiple callers.
     this.#cache = r.promise;
     try {
-      const cache: CustomKeyMap<RowID, RowRecord> = new CustomKeyMap(
-        rowIDString,
+      const cache = await startAsyncSpan(
+        tracer,
+        'RowRecordCache.load',
+        async span => {
+          const cache: CustomKeyMap<RowID, RowRecord> = new CustomKeyMap(
+            rowIDString,
+          );
+          for await (const rows of this.#db<RowsRow[]>`
+            SELECT * FROM ${this.#cvr(`rows`)}
+              WHERE "clientGroupID" = ${this.#cvrID} AND "refCounts" IS NOT NULL`
+            // TODO(arv): Arbitrary page size
+            .cursor(5000)) {
+            for (const row of rows) {
+              const rowRecord = rowsRowToRowRecord(row);
+              cache.set(rowRecord.id, rowRecord);
+            }
+          }
+          span.setAttribute('rows', cache.size);
+          return cache;
+        },
       );
-      for await (const rows of this.#db<RowsRow[]>`
-        SELECT * FROM ${this.#cvr(`rows`)}
-          WHERE "clientGroupID" = ${this.#cvrID} AND "refCounts" IS NOT NULL`
-        // TODO(arv): Arbitrary page size
-        .cursor(5000)) {
-        for (const row of rows) {
-          const rowRecord = rowsRowToRowRecord(row);
-          cache.set(rowRecord.id, rowRecord);
-        }
-      }
       this.#lc.info?.(
         `Loaded ${cache.size} row records in ${Date.now() - start} ms`,
       );
@@ -327,7 +337,7 @@ export class RowRecordCache {
     await this.flushed(lc);
     const flushMs = Date.now() - startMs;
 
-    const reader = new TransactionPool(lc, Mode.READONLY).run(this.#db);
+    const reader = new TransactionPool(lc, {mode: Mode.READONLY}).run(this.#db);
     try {
       // Verify that we are reading the right version of the CVR.
       await reader.processReadTask(tx =>

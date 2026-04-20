@@ -6,6 +6,7 @@ import {getNormalizedZeroConfig} from '../config/zero-config.ts';
 import {deleteLiteDB} from '../db/delete-lite-db.ts';
 import {warmupConnections} from '../db/warmup.ts';
 import {initEventSink, publishCriticalEvent} from '../observability/events.ts';
+import {upgradeReplica} from '../services/change-source/common/replica-schema.ts';
 import {initializeCustomChangeSource} from '../services/change-source/custom/change-source.ts';
 import {initializePostgresChangeSource} from '../services/change-source/pg/change-source.ts';
 import {BackupMonitor} from '../services/change-streamer/backup-monitor.ts';
@@ -13,9 +14,21 @@ import {ChangeStreamerHttpServer} from '../services/change-streamer/change-strea
 import {initializeStreamer} from '../services/change-streamer/change-streamer-service.ts';
 import type {ChangeStreamerService} from '../services/change-streamer/change-streamer.ts';
 import {ReplicaMonitor} from '../services/change-streamer/replica-monitor.ts';
-import {AutoResetSignal} from '../services/change-streamer/schema/tables.ts';
+import {initChangeStreamerSchema} from '../services/change-streamer/schema/init.ts';
+import {
+  AutoResetSignal,
+  CHANGE_STREAMER_APP_NAME,
+} from '../services/change-streamer/schema/tables.ts';
+import {PurgeLocker} from '../services/change-streamer/storer.ts';
 import {exitAfter, runUntilKilled} from '../services/life-cycle.ts';
-import {replicationStatusError} from '../services/replicator/replication-status.ts';
+import {
+  BackupNotFoundException,
+  restoreReplica,
+} from '../services/litestream/commands.ts';
+import {
+  replicationStatusError,
+  ReplicationStatusPublisher,
+} from '../services/replicator/replication-status.ts';
 import {pgClient} from '../types/pg.ts';
 import {
   parentWorker,
@@ -29,12 +42,10 @@ import {startOtelAuto} from './otel-start.ts';
 export default async function runWorker(
   parent: Worker,
   env: NodeJS.ProcessEnv,
-  ...args: string[]
+  ...argv: string[]
 ): Promise<void> {
-  assert(args.length > 0, `parent startMs not specified`);
-  const parentStartMs = parseInt(args[0]);
-
-  const config = getNormalizedZeroConfig({env, argv: args.slice(1)});
+  const workerStartTime = Date.now();
+  const config = getNormalizedZeroConfig({env, argv});
   const {
     taskID,
     changeStreamer: {
@@ -52,8 +63,12 @@ export default async function runWorker(
     litestream,
   } = config;
 
-  startOtelAuto(createLogContext(config, {worker: 'change-streamer'}, false));
-  const lc = createLogContext(config, {worker: 'change-streamer'}, true);
+  startOtelAuto(
+    createLogContext(config, 'change-streamer', 0, false),
+    'change-streamer',
+    0,
+  );
+  const lc = createLogContext(config, 'change-streamer');
   initEventSink(lc, config);
 
   // Kick off DB connection warmup in the background.
@@ -62,14 +77,41 @@ export default async function runWorker(
     change.db,
     {
       max: change.maxConns,
-      connection: {['application_name']: 'zero-change-streamer'},
+      connection: {['application_name']: CHANGE_STREAMER_APP_NAME},
     },
     {sendStringAsJson: true},
   );
-  void warmupConnections(lc, changeDB, 'change');
+  void warmupConnections(lc, changeDB, 'change').catch(() => {});
 
-  const {autoReset} = config;
+  const {autoReset, replicationLag} = config;
   const shard = getShardConfig(config);
+
+  // Ensure the change DB schema is initialized/up-to-date, then acquire
+  // a lock to prevent change-lock purges. This ensures that (this)
+  // change-streamer will be able to resume from the backup.
+  await initChangeStreamerSchema(lc, changeDB, shard);
+  let purgeLock = await new PurgeLocker(lc, shard, changeDB).acquire();
+
+  // Restore from litestream if the change-log has entries.
+  if (purgeLock) {
+    try {
+      await restoreReplica(lc, config, purgeLock);
+    } catch (e) {
+      // If the restore failed, e.g. due to a corrupt or missing backup, the
+      // replication-manager recovers by re-syncing.
+      const log = e instanceof BackupNotFoundException ? 'warn' : 'error';
+      lc[log]?.(
+        `error restoring backup. resyncing the replica: ${String(e)}`,
+        e,
+      );
+
+      // The purgeLock must be released if the backup could not be restored,
+      // or it will otherwise prevent the change-db update after the resync
+      // completes.
+      await purgeLock.release();
+      purgeLock = null;
+    }
+  }
 
   let changeStreamer: ChangeStreamerService | undefined;
 
@@ -85,8 +127,12 @@ export default async function runWorker(
               upstream.db,
               shard,
               replica.file,
-              initialSync,
+              {
+                ...initialSync,
+                replicationSlotFailover: upstream.pgReplicationSlotFailover,
+              },
               context,
+              replicationLag.reportIntervalMs,
             )
           : await initializeCustomChangeSource(
               lc,
@@ -96,6 +142,9 @@ export default async function runWorker(
               context,
             );
 
+      const replicationStatusPublisher =
+        ReplicationStatusPublisher.forReplicaFile(replica.file);
+
       changeStreamer = await initializeStreamer(
         lc,
         shard,
@@ -104,10 +153,15 @@ export default async function runWorker(
         protocol,
         changeDB,
         changeSource,
+        replicationStatusPublisher,
         subscriptionState,
+        purgeLock,
         autoReset ?? false,
-        backPressureLimitHeapProportion,
-        flowControlConsensusPaddingSeconds,
+        {
+          backPressureLimitHeapProportion,
+          flowControlConsensusPaddingSeconds,
+          statementTimeoutMs: change.statementTimeoutMs,
+        },
         setTimeout,
       );
       break;
@@ -135,10 +189,18 @@ export default async function runWorker(
   // impossible: upstream must have advanced in order for replication to be stuck.
   assert(changeStreamer, `resetting replica did not advance replicaVersion`);
 
+  // Perform any upgrades to the replica in case it was restored from an
+  // earlier version. Note that this upgrade is done by the replicator worker
+  // as well (in both the replication-manager and the view-syncer), but the
+  // change-streamer independently reads the replica, and it is fine run the
+  // upgrade logic redundantly since it is idempotent.
+  await upgradeReplica(lc, 'change-streamer-init', replica.file);
+
   const {backupURL, port: metricsPort} = litestream;
   const monitor = backupURL
     ? new BackupMonitor(
         lc,
+        replica.file,
         backupURL,
         `http://localhost:${metricsPort}/metrics`,
         changeStreamer,
@@ -149,7 +211,7 @@ export default async function runWorker(
         // generally takes longer).
         //
         // Consider: Also account for permanent volumes?
-        Date.now() - parentStartMs,
+        Date.now() - workerStartTime,
       )
     : new ReplicaMonitor(lc, replica.file, changeStreamer);
 

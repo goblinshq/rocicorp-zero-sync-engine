@@ -52,28 +52,23 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
-          cache: 'npm'
+          node-version: 24.x
       - uses: bencherdev/bencher@main
 
       - run: npm ci
 
-      - name: Install Playwright
-        run: npx playwright install --with-deps
-
       - name: Run benchmarks
         working-directory: ${{ inputs.working_directory }}
-        run: npm run bench -- --browser.name=chromium --outputJson output.json
+        run: npm run --silent bench:bmf:silent > output.json
 
-      - name: Upload benchmarks results to bencher.dev (main)
+      - name: Upload benchmark results (main)
         if: ${{ !inputs.is_pr }}
         working-directory: ${{ inputs.working_directory }}
         run: |
           cat output.json |\
-          npx tsx ../shared/src/tool/vitest-perf-json-to-bmf.ts |\
           bencher run \
           --project zero \
-          --testbed self-hosted \
+          --testbed self-hosted-metal \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --adapter json \
           --github-actions '${{ github.token }}' \
@@ -81,19 +76,18 @@ jobs:
           --threshold-measure throughput \
           --threshold-test t_test \
           --threshold-lower-boundary 0.99 \
-          --threshold-min-sample-size 20 \
-          --threshold-max-sample-size 60 \
+          --threshold-min-sample-size 3 \
+          --threshold-max-sample-size 12 \
           --err
 
-      - name: Upload PR benchmarks results to bencher.dev
+      - name: Upload benchmark results (PR)
         if: ${{ inputs.is_pr }}
         working-directory: ${{ inputs.working_directory }}
         run: |
           cat output.json |\
-          npx tsx ../shared/src/tool/vitest-perf-json-to-bmf.ts |\
           bencher run \
           --project zero \
-          --testbed self-hosted \
+          --testbed self-hosted-metal \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --adapter json \
           --github-actions '${{ github.token }}' \
@@ -106,6 +100,6 @@ jobs:
           --threshold-measure throughput \
           --threshold-test t_test \
           --threshold-lower-boundary 0.99 \
-          --threshold-min-sample-size 20 \
-          --threshold-max-sample-size 60 \
+          --threshold-min-sample-size 3 \
+          --threshold-max-sample-size 12 \
           --err

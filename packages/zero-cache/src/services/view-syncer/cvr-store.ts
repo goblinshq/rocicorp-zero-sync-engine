@@ -111,6 +111,12 @@ function asQuery(row: QueriesRow): QueryRecord {
   const maybeVersion = (s: string | null) =>
     s === null ? undefined : versionFromString(s);
 
+  // Only attach rowSetSignature when the column is non-null, so existing
+  // snapshots that don't include the field don't break.
+  const sigField = row.rowSetSignature
+    ? {rowSetSignature: row.rowSetSignature}
+    : {};
+
   if (row.clientAST === null) {
     // custom query
     assert(
@@ -126,6 +132,7 @@ function asQuery(row: QueriesRow): QueryRecord {
       clientState: {},
       transformationHash: row.transformationHash ?? undefined,
       transformationVersion: maybeVersion(row.transformationVersion),
+      ...sigField,
     } satisfies CustomQueryRecord;
   }
 
@@ -137,6 +144,7 @@ function asQuery(row: QueriesRow): QueryRecord {
         ast,
         transformationHash: row.transformationHash ?? undefined,
         transformationVersion: maybeVersion(row.transformationVersion),
+        ...sigField,
       } satisfies InternalQueryRecord)
     : ({
         type: 'client',
@@ -146,6 +154,7 @@ function asQuery(row: QueriesRow): QueryRecord {
         clientState: {},
         transformationHash: row.transformationHash ?? undefined,
         transformationVersion: maybeVersion(row.transformationVersion),
+        ...sigField,
       } satisfies ClientQueryRecord);
 }
 
@@ -228,8 +237,14 @@ export class CVRStore {
   }
 
   #updateQueryFields(queryHash: string, fields: Partial<QueriesRow>): void {
-    // Track as partial-only update for batched flush
-    this.#pendingQueryPartialUpdates.set(queryHash, fields);
+    // Track as partial-only update for batched flush. Merge into any
+    // pre-existing partial update for the same hash so independent callers
+    // (e.g. updateQuery + updateRowSetSignature) don't clobber each other.
+    const existing = this.#pendingQueryPartialUpdates.get(queryHash);
+    this.#pendingQueryPartialUpdates.set(
+      queryHash,
+      existing ? {...existing, ...fields} : fields,
+    );
   }
 
   load(lc: LogContext, lastConnectTime: number): Promise<CVR> {
@@ -587,6 +602,10 @@ export class CVRStore {
     });
   }
 
+  updateRowSetSignature(queryHash: string, signature: string): void {
+    this.#updateQueryFields(queryHash, {rowSetSignature: signature});
+  }
+
   insertClient(client: ClientRecord): void {
     const change: ClientsRow = {
       clientGroupID: this.#id,
@@ -665,7 +684,7 @@ export class CVRStore {
     const end = versionString(upToCVR.version);
     lc.debug?.(`scanning config patches for clients from ${start}`);
 
-    const reader = new TransactionPool(lc, Mode.READONLY).run(this.#db);
+    const reader = new TransactionPool(lc, {mode: Mode.READONLY}).run(this.#db);
     try {
       // Verify that we are reading the right version of the CVR.
       await reader.processReadTask(tx =>
@@ -749,7 +768,8 @@ export class CVRStore {
           "transformationHash",
           "transformationVersion",
           "internal",
-          "deleted"
+          "deleted",
+          "rowSetSignature"
         )
         SELECT
           "clientGroupID",
@@ -764,7 +784,8 @@ export class CVRStore {
           "transformationHash",
           "transformationVersion",
           "internal",
-          "deleted"
+          "deleted",
+          "rowSetSignature"
         FROM json_to_recordset(${rows}) AS x(
           "clientGroupID" TEXT,
           "queryHash" TEXT,
@@ -775,12 +796,13 @@ export class CVRStore {
           "transformationHash" TEXT,
           "transformationVersion" TEXT,
           "internal" BOOLEAN,
-          "deleted" BOOLEAN
+          "deleted" BOOLEAN,
+          "rowSetSignature" TEXT
         )
         ON CONFLICT ("clientGroupID", "queryHash") DO UPDATE SET
           "clientAST" = excluded."clientAST",
           "queryName" = excluded."queryName",
-          "queryArgs" = CASE 
+          "queryArgs" = CASE
             WHEN excluded."queryArgs" IS NULL THEN NULL
             ELSE excluded."queryArgs"::json
           END,
@@ -788,7 +810,8 @@ export class CVRStore {
           "transformationHash" = excluded."transformationHash",
           "transformationVersion" = excluded."transformationVersion",
           "internal" = excluded."internal",
-          "deleted" = excluded."deleted"
+          "deleted" = excluded."deleted",
+          "rowSetSignature" = excluded."rowSetSignature"
       `);
     }
 
@@ -808,6 +831,8 @@ export class CVRStore {
           transformationHash: partial.transformationHash ?? null,
           transformationVersionSet: partial.transformationVersion !== undefined,
           transformationVersion: partial.transformationVersion ?? null,
+          rowSetSignatureSet: partial.rowSetSignature !== undefined,
+          rowSetSignature: partial.rowSetSignature ?? null,
         }),
       );
       queries.push(tx`
@@ -828,6 +853,10 @@ export class CVRStore {
           "transformationVersion" = CASE
             WHEN u."transformationVersionSet" THEN u."transformationVersion"
             ELSE q."transformationVersion"
+          END,
+          "rowSetSignature" = CASE
+            WHEN u."rowSetSignatureSet" THEN u."rowSetSignature"
+            ELSE q."rowSetSignature"
           END
         FROM json_to_recordset(${rows}) AS u(
           "clientGroupID" TEXT,
@@ -839,7 +868,9 @@ export class CVRStore {
           "transformationHashSet" BOOLEAN,
           "transformationHash" TEXT,
           "transformationVersionSet" BOOLEAN,
-          "transformationVersion" TEXT
+          "transformationVersion" TEXT,
+          "rowSetSignatureSet" BOOLEAN,
+          "rowSetSignature" TEXT
         )
         WHERE q."clientGroupID" = u."clientGroupID"
           AND q."queryHash" = u."queryHash"
@@ -1053,9 +1084,9 @@ export class CVRStore {
           queryFlushes = this.#flushQueries(tx, lc);
 
           // Count both full updates and partial-only updates
-          const partialOnlyCount = Array.from(
-            this.#pendingQueryPartialUpdates.keys(),
-          ).filter(key => !this.#pendingQueryUpdates.has(key)).length;
+          const partialOnlyCount = [
+            ...this.#pendingQueryPartialUpdates.keys(),
+          ].filter(key => !this.#pendingQueryUpdates.has(key)).length;
 
           stats.queries = this.#pendingQueryUpdates.size + partialOnlyCount;
           stats.statements +=
@@ -1106,7 +1137,7 @@ export class CVRStore {
       (this.#pendingInstanceWrite ? 1 : 0) +
       this.#writes.size +
       (this.#pendingQueryUpdates.size > 0 ? 1 : 0) +
-      (Array.from(this.#pendingQueryPartialUpdates.keys()).filter(
+      ([...this.#pendingQueryPartialUpdates.keys()].filter(
         key => !this.#pendingQueryUpdates.has(key),
       ).length > 0
         ? 1
@@ -1191,7 +1222,7 @@ export class CVRStore {
     const db = this.#db;
     const clientGroupID = this.#id;
 
-    const reader = new TransactionPool(lc, Mode.READONLY).run(db);
+    const reader = new TransactionPool(lc, {mode: Mode.READONLY}).run(db);
     try {
       return await reader.processReadTask(
         tx => tx<InspectQueryRow[]>`

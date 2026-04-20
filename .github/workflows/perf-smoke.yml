@@ -18,11 +18,10 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
       - run: npm ci
-      - name: Install Playwright
-        run: npx playwright install --with-deps
+      - uses: ./.github/actions/playwright-install
       - name: Run benchmark
         shell: bash
         working-directory: packages/replicache-perf

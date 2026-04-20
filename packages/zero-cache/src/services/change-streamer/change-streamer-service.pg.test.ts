@@ -1,5 +1,7 @@
+import {PG_LOCK_NOT_AVAILABLE} from '@drdgvhbh/postgres-error-codes';
 import type {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
+import postgres from 'postgres';
 import {beforeEach, describe, expect, vi, type Mock} from 'vitest';
 import {AbortError} from '../../../../shared/src/abort-error.ts';
 import {assert} from '../../../../shared/src/asserts.ts';
@@ -13,15 +15,20 @@ import {expectTables, test, type PgTest} from '../../test/db.ts';
 import type {PostgresDB} from '../../types/pg.ts';
 import type {Source} from '../../types/streams.ts';
 import {Subscription, type Result} from '../../types/subscription.ts';
+import type {ChangeSource} from '../change-source/change-source.ts';
 import {type ChangeStreamMessage} from '../change-source/protocol/current/downstream.ts';
 import type {UpstreamStatusMessage} from '../change-source/protocol/current/status.ts';
+import {ReplicationStatusPublisher} from '../replicator/replication-status.ts';
 import {
   getSubscriptionState,
   initReplicationState,
   type SubscriptionState,
 } from '../replicator/schema/replication-state.ts';
 import {ReplicationMessages} from '../replicator/test-utils.ts';
-import {initializeStreamer} from './change-streamer-service.ts';
+import {
+  initializeStreamer,
+  type TuningOptions,
+} from './change-streamer-service.ts';
 import {
   PROTOCOL_VERSION,
   type ChangeStreamerService,
@@ -29,6 +36,13 @@ import {
 } from './change-streamer.ts';
 import * as ErrorType from './error-type-enum.ts';
 import {AutoResetSignal, ensureReplicationConfig} from './schema/tables.ts';
+import {PurgeLocker} from './storer.ts';
+
+const opts: TuningOptions = {
+  backPressureLimitHeapProportion: 0.04,
+  flowControlConsensusPaddingSeconds: 1,
+  statementTimeoutMs: 20_000,
+};
 
 describe('change-streamer/service', () => {
   let lc: LogContext;
@@ -75,11 +89,14 @@ describe('change-streamer/service', () => {
             changes,
             acks: {push: status => acks.enqueue(status)},
           }),
+        startLagReporter: () => Promise.resolve({nextSendTimeMs: 123}),
+        stop: () => Promise.resolve(),
       },
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
       setTimeoutFn as unknown as typeof setTimeout,
     );
     streamerDone = streamer.run();
@@ -150,10 +167,10 @@ describe('change-streamer/service', () => {
       {watermark: '09'},
     ]);
 
-    changes.push(['status', {ack: false}, {watermark: '0a'}]);
-    changes.push(['status', {ack: true}, {watermark: '0b'}]);
-
-    expect(await nextChange(downstream)).toMatchObject({tag: 'status'});
+    expect(await nextChange(downstream)).toMatchObject({
+      tag: 'status',
+      lagReport: {nextSendTimeMs: 123},
+    });
     expect(await nextChange(downstream)).toMatchObject({tag: 'begin'});
     expect(await nextChange(downstream)).toMatchObject({
       tag: 'insert',
@@ -168,8 +185,40 @@ describe('change-streamer/service', () => {
       extra: 'fields',
     });
 
-    // Await the ACK for the single commit, then the status message.
-    await expectAcks('09', '0b');
+    changes.push(['status', {ack: false}, {watermark: '0a'}]);
+
+    changes.push([
+      'status',
+      {
+        ack: false,
+        lagReport: {
+          lastTimings: {
+            sendTimeMs: 150,
+            commitTimeMs: 151,
+            receiveTimeMs: 152,
+          },
+          nextSendTimeMs: 234,
+        },
+      },
+      {watermark: '0b'},
+    ]);
+
+    changes.push(['status', {ack: true}, {watermark: '0c'}]);
+
+    expect(await nextChange(downstream)).toMatchObject({
+      tag: 'status',
+      lagReport: {
+        lastTimings: {
+          sendTimeMs: 150,
+          commitTimeMs: 151,
+          receiveTimeMs: 152,
+        },
+        nextSendTimeMs: 234,
+      },
+    });
+
+    // Await the ACK for the single commit, then the status message with an ack.
+    await expectAcks('09', '0c');
 
     expect(
       await sql`SELECT watermark, change->'tag' FROM "zoro_3/cdc"."changeLog"`.values(),
@@ -794,6 +843,10 @@ describe('change-streamer/service', () => {
       await sql`SELECT watermark FROM "zoro_3/cdc"."changeLog"`.values(),
     ).toEqual([['01'], ['01'], ['03'], ['04'], ['05'], ['06'], ['07'], ['08']]);
 
+    // schedule a cleanups at 04 and 06
+    streamer.scheduleCleanup('06');
+    streamer.scheduleCleanup('04');
+
     expect(setTimeoutFn).toHaveBeenCalledTimes(1);
     expect(setTimeoutFn.mock.calls[0][1]).toBe(30000);
 
@@ -899,7 +952,9 @@ describe('change-streamer/service', () => {
           retried(true);
           return resolver().promise;
         }),
-    };
+      startLagReporter: () => null,
+      stop: () => Promise.resolve(),
+    } satisfies ChangeSource;
     const streamer = await initializeStreamer(
       lc,
       shard,
@@ -908,10 +963,11 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 
@@ -925,7 +981,9 @@ describe('change-streamer/service', () => {
         requests.enqueue(req);
         return resolver().promise;
       }),
-    };
+      startLagReporter: () => null,
+      stop: () => Promise.resolve(),
+    } satisfies ChangeSource;
     let streamer = await initializeStreamer(
       lc,
       shard,
@@ -934,10 +992,11 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 
@@ -957,14 +1016,56 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 
     expect(await requests.dequeue()).toBe('04');
+  });
+
+  test('initial purge lock released', async () => {
+    const purgeLocker = new PurgeLocker(lc, shard, sql);
+    const lock = await purgeLocker.acquire();
+    expect(lock?.minWatermark).toBe('01');
+
+    let locked: unknown;
+    try {
+      // Verify that the row is locked.
+      await sql`SELECT FROM "zoro_3/cdc"."changeLog" FOR UPDATE NOWAIT`;
+    } catch (e) {
+      locked = e;
+    }
+    expect(locked).toBeInstanceOf(postgres.PostgresError);
+    expect((locked as postgres.PostgresError).code).toBe(PG_LOCK_NOT_AVAILABLE);
+
+    const streamer = await initializeStreamer(
+      lc,
+      shard,
+      'task-id',
+      'change.streamer:12345',
+      'ws',
+      sql,
+      {
+        startStream: vi.fn(),
+        startLagReporter: () => null,
+        stop: () => Promise.resolve(),
+      },
+      ReplicationStatusPublisher.forTesting(),
+      replicaConfig,
+      lock,
+      true,
+      opts,
+    );
+    void streamer.run();
+
+    // This should succeed once the purge lock is released.
+    await sql`SELECT FROM "zoro_3/cdc"."changeLog" FOR UPDATE`;
+
+    void streamer.stop();
   });
 
   test('retry on change stream error', async () => {
@@ -984,7 +1085,10 @@ describe('change-streamer/service', () => {
           retried(true);
           return resolver().promise;
         }),
-    };
+      startLagReporter: () => null,
+      stop: () => Promise.resolve(),
+    } satisfies ChangeSource;
+
     const streamer = await initializeStreamer(
       lc,
       shard,
@@ -993,10 +1097,11 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 
@@ -1022,7 +1127,10 @@ describe('change-streamer/service', () => {
           retried(true);
           return resolver().promise;
         }),
-    };
+      startLagReporter: () => null,
+      stop: () => Promise.resolve(),
+    } satisfies ChangeSource;
+
     const streamer = await initializeStreamer(
       lc,
       shard,
@@ -1031,10 +1139,11 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 
@@ -1077,7 +1186,10 @@ describe('change-streamer/service', () => {
           retried(true);
           return resolver().promise;
         }),
-    };
+      startLagReporter: () => null,
+      stop: () => Promise.resolve(),
+    } satisfies ChangeSource;
+
     const streamer = await initializeStreamer(
       lc,
       shard,
@@ -1086,10 +1198,11 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 
@@ -1149,7 +1262,10 @@ describe('change-streamer/service', () => {
             acks: () => {},
           }),
         ),
-    };
+      startLagReporter: () => null,
+      stop: () => Promise.resolve(),
+    } satisfies ChangeSource;
+
     const streamer = await initializeStreamer(
       lc,
       shard,
@@ -1158,10 +1274,11 @@ describe('change-streamer/service', () => {
       'ws',
       sql,
       source,
+      ReplicationStatusPublisher.forTesting(),
       replicaConfig,
+      null,
       true,
-      0.04,
-      1,
+      opts,
     );
     void streamer.run();
 

@@ -1,5 +1,5 @@
-import type {LogContext, LogLevel} from '@rocicorp/logger';
 import {pipeline, Readable, Writable} from 'node:stream';
+import type {LogContext, LogLevel} from '@rocicorp/logger';
 import type {CloseEvent, Data, ErrorEvent} from 'ws';
 import WebSocket, {createWebSocketStream} from 'ws';
 import {assert} from '../../../shared/src/asserts.ts';
@@ -7,7 +7,12 @@ import * as valita from '../../../shared/src/valita.ts';
 import type {ConnectedMessage} from '../../../zero-protocol/src/connect.ts';
 import type {Downstream} from '../../../zero-protocol/src/down.ts';
 import {ErrorKind} from '../../../zero-protocol/src/error-kind.ts';
+import {ErrorOrigin} from '../../../zero-protocol/src/error-origin.ts';
 import type {ErrorBody} from '../../../zero-protocol/src/error.ts';
+import {
+  isProtocolError,
+  type ProtocolError,
+} from '../../../zero-protocol/src/error.ts';
 import {
   MIN_SERVER_SUPPORTED_SYNC_PROTOCOL,
   PROTOCOL_VERSION,
@@ -20,11 +25,6 @@ import {
 } from '../types/error-with-level.ts';
 import type {Source} from '../types/streams.ts';
 import type {ConnectParams} from './connect-params.ts';
-import {
-  isProtocolError,
-  type ProtocolError,
-} from '../../../zero-protocol/src/error.ts';
-import {ErrorOrigin} from '../../../zero-protocol/src/error-origin.ts';
 
 export type HandlerResult =
   | {
@@ -186,14 +186,14 @@ export class Connection {
       const value = JSON.parse(data);
       msg = valita.parse(value, upstreamSchema);
     } catch (e) {
-      this.#lc.warn?.(`failed to parse message "${data}": ${String(e)}`);
+      const errorBody = {
+        kind: ErrorKind.InvalidMessage,
+        message: String(e),
+        origin: ErrorOrigin.ZeroCache,
+      } as const;
       this.#closeWithError(
-        {
-          kind: ErrorKind.InvalidMessage,
-          message: String(e),
-          origin: ErrorOrigin.ZeroCache,
-        },
-        e,
+        errorBody,
+        new ProtocolErrorWithLevel(errorBody, 'warn'),
       );
       return;
     }
@@ -243,7 +243,7 @@ export class Connection {
       }
       case 'transient': {
         for (const error of result.errors) {
-          void this.sendError(error);
+          this.sendError(error);
         }
       }
     }

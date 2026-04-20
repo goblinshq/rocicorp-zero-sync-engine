@@ -1,3 +1,8 @@
+import {execSync} from 'child_process';
+import {randomUUID} from 'crypto';
+import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'fs';
+import {homedir, platform} from 'os';
+import {dirname, join} from 'path';
 import type {ObservableResult} from '@opentelemetry/api';
 import {type Meter} from '@opentelemetry/api';
 import {OTLPMetricExporter} from '@opentelemetry/exporter-metrics-otlp-http';
@@ -7,18 +12,13 @@ import {
   PeriodicExportingMetricReader,
 } from '@opentelemetry/sdk-metrics';
 import type {LogContext} from '@rocicorp/logger';
-import {execSync} from 'child_process';
-import {randomUUID} from 'crypto';
-import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'fs';
-import {homedir, platform} from 'os';
-import {dirname, join} from 'path';
 import {h64} from '../../../shared/src/hash.js';
 import {
   getServerVersion,
   getZeroConfig,
   type ZeroConfig,
 } from '../config/zero-config.js';
-import {setupOtelDiagnosticLogger} from './otel-diag-logger.js';
+import {setupOtelDiagnosticLogger} from './otel-diag-logger.ts';
 
 export type ActiveUsers = {
   active_users_last_day: number;
@@ -29,6 +29,8 @@ export type ActiveUsers = {
   users_7da_legacy: number;
   users_30da_legacy: number;
 };
+
+const hostNameRe = /^[a-f0-9]{12}$/;
 
 class AnonymousTelemetryManager {
   static #instance: AnonymousTelemetryManager;
@@ -114,18 +116,26 @@ class AnonymousTelemetryManager {
     // Add a random jitter to the export interval to avoid all view-syncers exporting at the same time
     const exportIntervalMillis =
       60000 * this.#viewSyncerCount + Math.floor(Math.random() * 10000);
-    const metricReader = new PeriodicExportingMetricReader({
-      exportIntervalMillis,
-      exporter: new OTLPMetricExporter({
-        url: 'https://metrics.rocicorp.dev',
-        timeoutMillis: 30000,
+    const readers = [
+      new PeriodicExportingMetricReader({
+        exportIntervalMillis,
+        exporter: new OTLPMetricExporter({
+          url: 'https://metrics.rocicorp.dev',
+          timeoutMillis: 30000,
+        }),
       }),
-    });
+    ];
 
-    this.#meterProvider = new MeterProvider({
-      resource,
-      readers: [metricReader],
-    });
+    // Uncomment this to debug metrics exports.
+
+    // readers.push(
+    //   new PeriodicExportingMetricReader({
+    //     exportIntervalMillis,
+    //     exporter: new ConsoleMetricExporter(),
+    //   }),
+    // );
+
+    this.#meterProvider = new MeterProvider({resource, readers});
     this.#meter = this.#meterProvider.getMeter('zero-anonymous-telemetry');
 
     this.#setupMetrics();
@@ -221,11 +231,6 @@ class AnonymousTelemetryManager {
         if (actives) {
           const value = actives[metric];
           result.observe(value, attrs);
-          this.#lc?.debug?.(`telemetry: ${metric}=${value}`);
-        } else {
-          this.#lc?.debug?.(
-            `telemetry: no actives available, skipping observation of ${metric}`,
-          );
         }
       };
     this.#meter
@@ -268,68 +273,44 @@ class AnonymousTelemetryManager {
     uptimeGauge.addCallback((result: ObservableResult) => {
       const uptimeSeconds = Math.floor(process.uptime());
       result.observe(uptimeSeconds, attrs);
-      this.#lc?.debug?.(`telemetry: uptime=${uptimeSeconds}s`);
     });
     uptimeCounter.addCallback((result: ObservableResult) => {
       const uptimeSeconds = Math.floor(process.uptime());
       result.observe(uptimeSeconds, attrs);
-      this.#lc?.debug?.(`telemetry: uptime_counter=${uptimeSeconds}s`);
     });
     crudMutationsCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalCrudMutations, attrs);
-      this.#lc?.debug?.(
-        `telemetry: crud_mutations=${this.#totalCrudMutations}`,
-      );
     });
     customMutationsCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalCustomMutations, attrs);
-      this.#lc?.debug?.(
-        `telemetry: custom_mutations=${this.#totalCustomMutations}`,
-      );
     });
     totalMutationsCounter.addCallback((result: ObservableResult) => {
       const totalMutations =
         this.#totalCrudMutations + this.#totalCustomMutations;
       result.observe(totalMutations, attrs);
-      this.#lc?.debug?.(`telemetry: total_mutations=${totalMutations}`);
     });
     crudQueriesCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalCrudQueries, attrs);
-      this.#lc?.debug?.(`telemetry: crud_queries=${this.#totalCrudQueries}`);
     });
     customQueriesCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalCustomQueries, attrs);
-      this.#lc?.debug?.(
-        `telemetry: custom_queries=${this.#totalCustomQueries}`,
-      );
     });
     totalQueriesCounter.addCallback((result: ObservableResult) => {
       const totalQueries = this.#totalCrudQueries + this.#totalCustomQueries;
       result.observe(totalQueries, attrs);
-      this.#lc?.debug?.(`telemetry: total_queries=${totalQueries}`);
     });
     rowsSyncedCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalRowsSynced, attrs);
-      this.#lc?.debug?.(`telemetry: rows_synced=${this.#totalRowsSynced}`);
     });
     connectionsSuccessCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalConnectionsSuccess, attrs);
-      this.#lc?.debug?.(
-        `telemetry: connections_success=${this.#totalConnectionsSuccess}`,
-      );
     });
     connectionsAttemptedCounter.addCallback((result: ObservableResult) => {
       result.observe(this.#totalConnectionsAttempted, attrs);
-      this.#lc?.debug?.(
-        `telemetry: connections_attempted=${this.#totalConnectionsAttempted}`,
-      );
     });
     activeClientGroupsGauge.addCallback((result: ObservableResult) => {
       const activeClientGroups = this.#activeClientGroupsGetter?.() ?? 0;
       result.observe(activeClientGroups, attrs);
-      this.#lc?.debug?.(
-        `telemetry: gauge_active_client_groups=${activeClientGroups}`,
-      );
     });
   }
 
@@ -404,19 +385,23 @@ class AnonymousTelemetryManager {
       process.env.ECS_CONTAINER_METADATA_URI_V4 ||
       process.env.ECS_CONTAINER_METADATA_URI ||
       process.env.AWS_EXECUTION_ENV
-    )
+    ) {
       return 'aws';
-    if (process.env.RAILWAY_ENV || process.env.RAILWAY_STATIC_URL)
+    }
+    if (process.env.RAILWAY_ENV || process.env.RAILWAY_STATIC_URL) {
       return 'railway';
+    }
     if (process.env.RENDER || process.env.RENDER_SERVICE_ID) return 'render';
     if (
       process.env.GCP_PROJECT ||
       process.env.GCLOUD_PROJECT ||
       process.env.GOOGLE_CLOUD_PROJECT
-    )
+    ) {
       return 'gcp';
-    if (process.env.COOLIFY_URL || process.env.COOLIFY_CONTAINER_NAME)
+    }
+    if (process.env.COOLIFY_URL || process.env.COOLIFY_CONTAINER_NAME) {
       return 'coolify';
+    }
     if (process.env.CONTAINER_APP_REVISION) return 'azure';
     if (process.env.FLIGHTCONTROL || process.env.FC_URL) return 'flightcontrol';
     return 'unknown';
@@ -448,7 +433,15 @@ class AnonymousTelemetryManager {
 
       return rootCommitHash.length === 40 ? rootCommitHash : 'unknown';
     } catch (error) {
-      this.#lc?.debug?.('telemetry: unable to get Git root commit:', error);
+      // execSync throws a child_process.SpawnSyncReturns-shaped error with an
+      // output property (an array with stdio buffers) and sometimes a killed
+      // property that references back to the error itself — making it
+      // circular and causing stringify() in the Logger logic to throw.
+      const details =
+        error instanceof Error
+          ? {message: error.message, name: error.name, stack: error.stack}
+          : String(error);
+      this.#lc?.debug?.('telemetry: unable to get Git root commit:', details);
       return 'unknown';
     }
   }
@@ -504,7 +497,7 @@ class AnonymousTelemetryManager {
 
       if (
         process.env.DOCKER_CONTAINER_ID ||
-        process.env.HOSTNAME?.match(/^[a-f0-9]{12}$/)
+        process.env.HOSTNAME?.match(hostNameRe)
       ) {
         return true;
       }

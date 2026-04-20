@@ -1,7 +1,7 @@
 // https://vercel.com/templates/other/fastify-serverless-function
 
 import '../../../packages/shared/src/dotenv.ts';
-
+import type {IncomingHttpHeaders} from 'http';
 import cookie from '@fastify/cookie';
 import oauthPlugin, {type OAuth2Namespace} from '@fastify/oauth2';
 import {Octokit} from '@octokit/core';
@@ -12,7 +12,6 @@ import {
 } from '@rocicorp/zero';
 import {handleMutateRequest, handleQueryRequest} from '@rocicorp/zero/server';
 import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
-import type {IncomingHttpHeaders} from 'http';
 import {jwtVerify, SignJWT, type JWK} from 'jose';
 import {nanoid} from 'nanoid';
 import {assert} from '../../../packages/shared/src/asserts.ts';
@@ -164,37 +163,28 @@ async function mutateHandler(
   }>,
   reply: FastifyReply,
 ) {
-  let jwtData: JWTData | undefined;
-  try {
-    jwtData = await maybeVerifyAuth(request.headers);
-  } catch (e) {
-    if (e instanceof Error) {
-      reply.status(401).send(e.message);
-      return;
-    }
-    throw e;
-  }
+  await withAuth(request, reply, async jwtData => {
+    const postCommitTasks: (() => Promise<void>)[] = [];
+    const mutators = createServerMutators(postCommitTasks);
 
-  const postCommitTasks: (() => Promise<void>)[] = [];
-  const mutators = createServerMutators(postCommitTasks);
+    const response = await handleMutateRequest(
+      dbProvider,
+      (transact, _mutation) =>
+        transact((tx, name, args) => {
+          const mutator = mustGetMutator(mutators, name);
+          return mutator.fn({tx, args, ctx: jwtData});
+        }),
+      request.query,
+      request.body,
+      'info',
+    );
 
-  const response = await handleMutateRequest(
-    dbProvider,
-    (transact, _mutation) =>
-      transact((tx, name, args) => {
-        const mutator = mustGetMutator(mutators, name);
-        return mutator.fn({tx, args, ctx: jwtData});
-      }),
-    request.query,
-    request.body,
-    'info',
-  );
+    // we don't yet handle errors here, since Loops emails return 429 very often
+    // and we don't want to block the mutation
+    await Promise.allSettled(postCommitTasks.map(task => task()));
 
-  // we don't yet handle errors here, since Loops emails return 429 very often
-  // and we don't want to block the mutation
-  await Promise.allSettled(postCommitTasks.map(task => task()));
-
-  reply.send(response);
+    reply.send(response);
+  });
 }
 
 // this endpoint was kept for backwards compatibility
@@ -318,9 +308,11 @@ async function maybeVerifyAuth(
     throw new Error('VITE_PUBLIC_JWK is not set');
   }
 
-  return jwtDataSchema.parse(
+  const jwtData = jwtDataSchema.parse(
     (await jwtVerify(authorization, JSON.parse(jwk))).payload,
   );
+
+  return jwtData;
 }
 
 export default async function handler(

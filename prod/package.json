@@ -1,32 +1,15 @@
 {
   "name": "prod",
-  "private": true,
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "format": "prettier --write .",
-    "check-format": "prettier --check ."
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
-  "prettier": {
-    "singleQuote": true,
-    "trailingComma": "all",
-    "arrowParens": "avoid",
-    "bracketSpacing": false,
-    "quoteProps": "consistent",
-    "overrides": [
-      {
-        "files": [
-          "*.yml",
-          "*.yaml"
-        ],
-        "options": {
-          "trailingComma": "es5",
-          "tabWidth": 2,
-          "bracketSpacing": false,
-          "semi": false,
-          "singleQuote": false
-        }
-      }
-    ]
+  "devDependencies": {
+    "oxfmt": "^0.45.0"
   }
 }

@@ -1,3 +1,5 @@
+import {PG_LOCK_NOT_AVAILABLE} from '@drdgvhbh/postgres-error-codes';
+import postgres from 'postgres';
 import {beforeEach, describe, expect} from 'vitest';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import {Queue} from '../../../../shared/src/queue.ts';
@@ -11,8 +13,13 @@ import {ReplicationMessages} from '../replicator/test-utils.ts';
 import {type Downstream} from './change-streamer.ts';
 import * as ErrorType from './error-type-enum.ts';
 import {ensureReplicationConfig, setupCDCTables} from './schema/tables.ts';
-import {Storer} from './storer.ts';
+import {PurgeLocker, Storer, type TuningOptions} from './storer.ts';
 import {createSubscriber} from './test-utils.ts';
+
+const opts: TuningOptions = {
+  backPressureLimitHeapProportion: 0.04,
+  statementTimeoutMs: 20_000,
+};
 
 describe('change-streamer/storer', () => {
   const lc = createSilentLogContext();
@@ -62,7 +69,7 @@ describe('change-streamer/storer', () => {
 
     return async () => {
       await testDBs.drop(db);
-      void storer.stop();
+      void storer?.stop();
       await done;
     };
   });
@@ -98,7 +105,7 @@ describe('change-streamer/storer', () => {
         REPLICA_VERSION,
         msg => consumed.enqueue(msg),
         err => fatalErrors.enqueue(err),
-        0.04,
+        opts,
       );
       await storer.assumeOwnership();
       done = storer.run();
@@ -862,7 +869,56 @@ describe('change-streamer/storer', () => {
       ]);
     });
 
+    test('purge prevented by purge lock', async () => {
+      // Move the changeLog forward slightly to test non-initial numbers.
+      const result1 = await storer.purgeRecordsBefore('03');
+      expect(result1).toBe(2);
+
+      const lock = await new PurgeLocker(lc, shard, db).acquire();
+      expect(lock?.minWatermark).toBe('03');
+      expect(lock?.replicaVersion).toBe('00');
+
+      let err: unknown;
+      try {
+        await storer.purgeRecordsBefore('06');
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(postgres.PostgresError);
+      expect((err as postgres.PostgresError).code).toBe(PG_LOCK_NOT_AVAILABLE);
+
+      expect(
+        await db`SELECT watermark, pos FROM "xero_5/cdc"."changeLog"`,
+      ).toEqual([
+        {watermark: '03', pos: 0n},
+        {watermark: '03', pos: 1n},
+        {watermark: '03', pos: 2n},
+        {watermark: '06', pos: 0n},
+        {watermark: '06', pos: 1n},
+        {watermark: '06', pos: 2n},
+      ]);
+
+      await lock?.release();
+
+      const result3 = await storer.purgeRecordsBefore('06');
+      expect(result3).toBe(3);
+
+      expect(
+        await db`SELECT watermark, pos FROM "xero_5/cdc"."changeLog"`,
+      ).toEqual([
+        {watermark: '06', pos: 0n},
+        {watermark: '06', pos: 1n},
+        {watermark: '06', pos: 2n},
+      ]);
+
+      // Redundant calls to release should be ignored (and not assert, e.g.)
+      await lock?.release();
+    });
+
     test('ownership change detected at begin aborts transaction', async () => {
+      const [sub1, _1, stream1] = createSubscriber('00');
+      const [sub2, _2, stream2] = createSubscriber('00');
+
       // Change ownership before storing begin — the storer's pipelined
       // SELECT will read the new owner immediately.
       await db`UPDATE "xero_5/cdc"."replicationState" SET owner = 'other-task'`;
@@ -871,14 +927,20 @@ describe('change-streamer/storer', () => {
         '07',
         ['begin', messages.begin(), {commitWatermark: '08'}],
       ]);
+      storer.catchup(sub1, 'serving');
       storer.store(['07', ['data', messages.insert('issues', {id: 'foo'})]]);
       storer.store(['08', ['commit', messages.commit(), {watermark: '08'}]]);
+      storer.catchup(sub2, 'serving');
 
       await expect(done).rejects.toThrow(
         'changeLog ownership has been assumed by other-task',
       );
       // Prevent the beforeEach cleanup from re-throwing the rejected done.
       done = Promise.resolve();
+
+      // subscribers that were waiting to be caught up should be canceled
+      expect(stream1.active).toBe(false);
+      expect(stream2.active).toBe(false);
     });
 
     test('ownership change not possible during transaction', async () => {
@@ -1697,7 +1759,7 @@ describe('change-streamer/storer', () => {
         REPLICA_VERSION,
         msg => consumed.enqueue(msg),
         err => fatalErrors.enqueue(err),
-        0.04,
+        opts,
       );
       await storer.assumeOwnership();
       done = storer.run();
@@ -1708,5 +1770,11 @@ describe('change-streamer/storer', () => {
         await db`SELECT "ownerAddress" FROM "xero_5/cdc"."replicationState" WHERE owner = 'task-id'`,
       ).toEqual([{ownerAddress: 'wss://change-streamer:12345'}]);
     });
+  });
+
+  test('purge lock on empty change-log (e.g. before initial sync)', async () => {
+    await db`TRUNCATE "xero_5/cdc"."changeLog"`;
+    const purgeLocker = new PurgeLocker(lc, shard, db);
+    expect(await purgeLocker.acquire()).toBeNull();
   });
 });

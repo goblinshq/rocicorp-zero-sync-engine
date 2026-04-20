@@ -3,6 +3,7 @@ import {startAsyncSpan, startSpan} from '../../../../otel/src/span.ts';
 import {assert} from '../../../../shared/src/asserts.ts';
 import {type JSONObject} from '../../../../shared/src/bigint-json.ts';
 import {CustomKeyMap} from '../../../../shared/src/custom-key-map.ts';
+import {toSorted} from '../../../../shared/src/iterables.ts';
 import {
   deepEqual,
   type ReadonlyJSONValue,
@@ -33,6 +34,7 @@ import {
   cmpVersions,
   maxVersion,
   oneAfter,
+  versionString,
   type ClientQueryRecord,
   type ClientRecord,
   type CustomQueryRecord,
@@ -370,7 +372,7 @@ export class CVRConfigDrivenUpdater extends CVRUpdater {
         return patches;
       }
       const newVersion = this._ensureNewVersion();
-      client.desiredQueryIDs = [...union(current, needed)].sort(stringCompare);
+      client.desiredQueryIDs = toSorted(union(current, needed), stringCompare);
 
       for (const id of needed) {
         const q = must(queries.find(({hash}) => hash === id));
@@ -439,7 +441,8 @@ export class CVRConfigDrivenUpdater extends CVRUpdater {
       }
 
       const newVersion = this._ensureNewVersion();
-      client.desiredQueryIDs = [...difference(current, remove)].sort(
+      client.desiredQueryIDs = toSorted(
+        difference(current, remove),
         stringCompare,
       );
 
@@ -613,6 +616,13 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
       // The error will surface when this.#existingRows is awaited.
       void this.#existingRows.then(() => {});
 
+      const versionBumped =
+        cmpVersions(this._orig.version, this._cvr.version) < 0;
+      lc.info?.(
+        `trackQueries: ${executed.length} executed, ${removed.length} removed, ` +
+          `version ${versionBumped ? 'bumped' : 'unchanged'}`,
+      );
+
       return {
         newVersion: this._cvr.version,
         queryPatches: queryPatches.map(patch => ({
@@ -740,10 +750,22 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
    * final cookie (i.e. version), and that must be sent before any poke parts
    * generated from {@link received} are sent.
    */
-  #assertNewVersion(): CVRVersion {
+  #assertNewVersion(
+    rowID: RowID,
+    existingVersion: string | undefined,
+    newVersion: string | undefined,
+    refCounts: RefCounts,
+  ): CVRVersion {
     assert(
       cmpVersions(this._orig.version, this._cvr.version) < 0,
-      'Expected CVR version to have been bumped above original',
+      () =>
+        `Expected CVR version to have been bumped above original` +
+        ` (orig=${versionString(this._orig.version)},` +
+        ` curr=${versionString(this._cvr.version)}).` +
+        ` Row ${JSON.stringify(rowID)}:` +
+        ` existing=${existingVersion},` +
+        ` new=${newVersion},` +
+        ` queries=[${Object.keys(refCounts).join(',')}]`,
     );
     return this._cvr.version;
   }
@@ -791,7 +813,12 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
           const patchVersion =
             existing && existing.rowVersion === newRowVersion
               ? existing.patchVersion // existing row is unchanged
-              : this.#assertNewVersion();
+              : this.#assertNewVersion(
+                  id,
+                  existing?.rowVersion,
+                  newRowVersion,
+                  refCounts,
+                );
 
           // Note: for determining what to commit to the CVR store, use the
           // `version` of the update even if `merged` is null (i.e. don't
@@ -935,7 +962,12 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
         // gets a new patchVersion (and corresponding poke).
         const patchVersion = newRefCounts
           ? existing.patchVersion
-          : this.#assertNewVersion();
+          : this.#assertNewVersion(
+              existing.id,
+              existing.rowVersion,
+              undefined,
+              existing.refCounts ?? {},
+            );
         const rowRecord: RowRecord = {
           ...existing,
           patchVersion,
@@ -1043,7 +1075,7 @@ export function getInactiveQueries(cvr: CVR): {
   }
 
   // First sort all the queries that have TTL. Oldest first.
-  return [...inactive.values()].sort((a, b) => {
+  return toSorted(inactive.values(), (a, b) => {
     if (a.ttl === b.ttl) {
       return (
         ttlClockAsNumber(a.inactivatedAt) - ttlClockAsNumber(b.inactivatedAt)

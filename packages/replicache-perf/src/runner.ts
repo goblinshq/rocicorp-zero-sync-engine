@@ -1,11 +1,11 @@
-import commandLineArgs from 'command-line-args';
-import commandLineUsage from 'command-line-usage';
-import getPort from 'get-port';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
+import commandLineArgs from 'command-line-args';
+import commandLineUsage from 'command-line-usage';
+import getPort from 'get-port';
 import * as playwright from 'playwright';
 import {createServer} from 'vite';
 import {assert} from '../../shared/src/asserts.ts';
@@ -241,7 +241,7 @@ async function main() {
       await Promise.race([context.close(), wait(1000)]);
     } else {
       await new Promise(resolve => {
-        setTimeout(() => resolve(undefined), 2 ** 31 - 1);
+        setTimeout(resolve, 2 ** 31 - 1, undefined);
       }); // Don't let the dev server stop!
     }
   }

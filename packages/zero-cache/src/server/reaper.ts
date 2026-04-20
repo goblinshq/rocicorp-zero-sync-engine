@@ -2,8 +2,8 @@ import {must} from '../../../shared/src/must.ts';
 import {getNormalizedZeroConfig} from '../config/zero-config.ts';
 import {initEventSink} from '../observability/events.ts';
 import {exitAfter, runUntilKilled} from '../services/life-cycle.ts';
-import {CVRPurger} from '../services/view-syncer/cvr-purger.ts';
 import {ActiveUsersGauge} from '../services/view-syncer/active-users-gauge.ts';
+import {CVRPurger} from '../services/view-syncer/cvr-purger.ts';
 import {initViewSyncerSchema} from '../services/view-syncer/schema/init.ts';
 import {pgClient} from '../types/pg.ts';
 import {
@@ -12,9 +12,9 @@ import {
   type Worker,
 } from '../types/processes.ts';
 import {getShardID} from '../types/shards.ts';
+import {startAnonymousTelemetry} from './anonymous-otel-start.ts';
 import {createLogContext} from './logging.ts';
 import {startOtelAuto} from './otel-start.ts';
-import {startAnonymousTelemetry} from './anonymous-otel-start.ts';
 
 const MS_PER_HOUR = 1000 * 60 * 60;
 
@@ -25,14 +25,15 @@ export default async function runWorker(
 ): Promise<void> {
   const config = getNormalizedZeroConfig({env, argv});
 
-  startOtelAuto(createLogContext(config, {worker: 'reaper'}, false));
-  const lc = createLogContext(config, {worker: 'reaper'}, true);
+  startOtelAuto(createLogContext(config, 'reaper', 0, false), 'reaper', 0);
+  const lc = createLogContext(config, 'reaper');
   initEventSink(lc, config);
   startAnonymousTelemetry(lc, config);
 
   const {cvr} = config;
   const shard = getShardID(config);
   const cvrDB = pgClient(lc, cvr.db, {
+    max: 1,
     connection: {['application_name']: `zero-sync-cvr-purger`},
   });
   await initViewSyncerSchema(lc, cvrDB, shard);

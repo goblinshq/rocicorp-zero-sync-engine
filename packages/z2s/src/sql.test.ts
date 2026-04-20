@@ -162,13 +162,13 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "str" = $1::text COLLATE "ucs_basic"",
-        "values": [
-          "str",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "str" = $1::text",
+          "values": [
+            "str",
+          ],
+        }
+      `);
     });
 
     test('boolean type', () => {
@@ -210,13 +210,13 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "uuid"::text = $1::text COLLATE "ucs_basic"",
-        "values": [
-          "8f1dceb2-b3dd-46cf-9deb-460e9d87541c",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "uuid"::text = $1::text::uuid",
+          "values": [
+            "8f1dceb2-b3dd-46cf-9deb-460e9d87541c",
+          ],
+        }
+      `);
     });
 
     test('enum type', () => {
@@ -234,13 +234,13 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "enum"::text = $1::text COLLATE "ucs_basic"",
-        "values": [
-          "ENUM_KEY",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "enum"::text = $1::text::"some_enum"",
+          "values": [
+            "ENUM_KEY",
+          ],
+        }
+      `);
     });
 
     test('timestamp type', () => {
@@ -258,13 +258,13 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "timestamp" = to_timestamp($1::text::bigint / 1000.0) AT TIME ZONE 'UTC'",
-        "values": [
-          "1712345678901",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "timestamp" = to_timestamp($1::text::numeric / 1000.0) AT TIME ZONE 'UTC'",
+          "values": [
+            "1712345678901",
+          ],
+        }
+      `);
     });
 
     test('timestamptz type', () => {
@@ -282,13 +282,13 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "timestampz" = to_timestamp($1::text::bigint / 1000.0)",
-        "values": [
-          "1712345678901",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "timestampz" = to_timestamp($1::text::numeric / 1000.0)",
+          "values": [
+            "1712345678901",
+          ],
+        }
+      `);
     });
 
     test('jsonb[] type', () => {
@@ -358,15 +358,15 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "str" = ARRAY(
-                SELECT value::text COLLATE "ucs_basic" FROM jsonb_array_elements_text($1::text::jsonb)
-              )",
-        "values": [
-          "["a","b","c"]",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "str" = ARRAY(
+                  SELECT value::text FROM jsonb_array_elements_text($1::text::jsonb)
+                )",
+          "values": [
+            "["a","b","c"]",
+          ],
+        }
+      `);
     });
 
     test('boolean[] type', () => {
@@ -413,15 +413,15 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "uuid"::text = ARRAY(
-                SELECT value::text COLLATE "ucs_basic" FROM jsonb_array_elements_text($1::text::jsonb)
-              )",
-        "values": [
-          "["8f1dceb2-b3dd-46cf-9deb-460e9d87541c","11111111-1111-1111-1111-111111111111"]",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "uuid"::text = ARRAY(
+                  SELECT value::text::uuid FROM jsonb_array_elements_text($1::text::jsonb)
+                )",
+          "values": [
+            "["8f1dceb2-b3dd-46cf-9deb-460e9d87541c","11111111-1111-1111-1111-111111111111"]",
+          ],
+        }
+      `);
     });
 
     test('enum[] type', () => {
@@ -439,15 +439,15 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "enum"::text = ARRAY(
-                SELECT value::text COLLATE "ucs_basic" FROM jsonb_array_elements_text($1::text::jsonb)
-              )",
-        "values": [
-          "["ENUM_KEY","OTHER_KEY"]",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "enum"::text = ARRAY(
+                  SELECT value::text::"some_enum" FROM jsonb_array_elements_text($1::text::jsonb)
+                )",
+          "values": [
+            "["ENUM_KEY","OTHER_KEY"]",
+          ],
+        }
+      `);
     });
 
     test('timestamp[] type', () => {
@@ -465,15 +465,15 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "timestamp" = ARRAY(
-                SELECT to_timestamp(value::text::bigint / 1000.0) AT TIME ZONE 'UTC' FROM jsonb_array_elements_text($1::text::jsonb)
-              )",
-        "values": [
-          "[1712345678901,1712345678902]",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "timestamp" = ARRAY(
+                  SELECT to_timestamp(value::text::numeric / 1000.0) AT TIME ZONE 'UTC' FROM jsonb_array_elements_text($1::text::jsonb)
+                )",
+          "values": [
+            "[1712345678901,1712345678902]",
+          ],
+        }
+      `);
     });
 
     test('timestamptz[] type', () => {
@@ -491,15 +491,15 @@ describe('string arg packing', () => {
           )}`,
         ),
       ).toMatchInlineSnapshot(`
-      {
-        "text": "SELECT * FROM "foo" WHERE "timestampz" = ARRAY(
-                SELECT to_timestamp(value::text::bigint / 1000.0) FROM jsonb_array_elements_text($1::text::jsonb)
-              )",
-        "values": [
-          "[1712345678901,1712345678902]",
-        ],
-      }
-    `);
+        {
+          "text": "SELECT * FROM "foo" WHERE "timestampz" = ARRAY(
+                  SELECT to_timestamp(value::text::numeric / 1000.0) FROM jsonb_array_elements_text($1::text::jsonb)
+                )",
+          "values": [
+            "[1712345678901,1712345678902]",
+          ],
+        }
+      `);
     });
   });
 
@@ -514,7 +514,7 @@ describe('string arg packing', () => {
       ),
     ).toMatchInlineSnapshot(`
       {
-        "text": "SELECT * FROM "foo" WHERE $1::text::double precision AND $2::text::double precision AND $3::text::text COLLATE "ucs_basic" AND $4::text::boolean AND $5",
+        "text": "SELECT * FROM "foo" WHERE $1::text::double precision AND $2::text::double precision AND $3::text::text AND $4::text::boolean AND $5",
         "values": [
           "1",
           "1.1",
@@ -587,6 +587,75 @@ describe('string arg packing', () => {
           ],
         }
       `);
+    });
+
+    test.each(['json', 'jsonb'] as const)(
+      'does not reuse placeholders across text and %s writes when the values are equal',
+      type => {
+        expect(
+          formatPgInternalConvert(
+            sql`INSERT INTO "foo" VALUES (${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type: 'text'},
+              '',
+              false,
+              false,
+            )}, ${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type},
+              '',
+              false,
+              false,
+            )})`,
+          ),
+        ).toEqual({
+          text: `INSERT INTO "foo" VALUES ($1::text::text, $2::text::${type})`,
+          values: ['', '""'],
+        });
+      },
+    );
+
+    test.each(['json', 'jsonb'] as const)(
+      'does not reuse placeholders across %s and text writes when the values are equal',
+      type => {
+        expect(
+          formatPgInternalConvert(
+            sql`INSERT INTO "foo" VALUES (${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type},
+              '',
+              false,
+              false,
+            )}, ${sqlConvertColumnArg(
+              {isArray: false, isEnum: false, type: 'text'},
+              '',
+              false,
+              false,
+            )})`,
+          ),
+        ).toEqual({
+          text: `INSERT INTO "foo" VALUES ($1::text::${type}, $2::text::text)`,
+          values: ['""', ''],
+        });
+      },
+    );
+
+    test('does not conflate different object values across jsonb columns', () => {
+      expect(
+        formatPgInternalConvert(
+          sql`INSERT INTO "foo" VALUES (${sqlConvertColumnArg(
+            {isArray: false, isEnum: false, type: 'jsonb'},
+            {a: 1},
+            false,
+            false,
+          )}, ${sqlConvertColumnArg(
+            {isArray: false, isEnum: false, type: 'jsonb'},
+            {b: 2},
+            false,
+            false,
+          )})`,
+        ),
+      ).toEqual({
+        text: `INSERT INTO "foo" VALUES ($1::text::jsonb, $2::text::jsonb)`,
+        values: ['{"a":1}', '{"b":2}'],
+      });
     });
 
     test('insert text[]', () => {
@@ -794,7 +863,7 @@ describe('string arg packing', () => {
         ),
       ).toMatchInlineSnapshot(`
         {
-          "text": "INSERT INTO "foo" VALUES (to_timestamp($1::text::bigint / 1000.0) AT TIME ZONE 'UTC')",
+          "text": "INSERT INTO "foo" VALUES (to_timestamp($1::text::numeric / 1000.0) AT TIME ZONE 'UTC')",
           "values": [
             "1712345678901",
           ],
@@ -815,7 +884,7 @@ describe('string arg packing', () => {
       ).toMatchInlineSnapshot(`
         {
           "text": "INSERT INTO "foo" VALUES (ARRAY(
-                  SELECT to_timestamp(value::text::bigint / 1000.0) AT TIME ZONE 'UTC' FROM jsonb_array_elements_text($1::text::jsonb)
+                  SELECT to_timestamp(value::text::numeric / 1000.0) AT TIME ZONE 'UTC' FROM jsonb_array_elements_text($1::text::jsonb)
                 ))",
           "values": [
             "[1712345678901,1712345678902]",
@@ -836,7 +905,7 @@ describe('string arg packing', () => {
         ),
       ).toMatchInlineSnapshot(`
         {
-          "text": "INSERT INTO "foo" VALUES (to_timestamp($1::text::bigint / 1000.0))",
+          "text": "INSERT INTO "foo" VALUES (to_timestamp($1::text::numeric / 1000.0))",
           "values": [
             "1712345678901",
           ],
@@ -857,7 +926,7 @@ describe('string arg packing', () => {
       ).toMatchInlineSnapshot(`
         {
           "text": "INSERT INTO "foo" VALUES (ARRAY(
-                  SELECT to_timestamp(value::text::bigint / 1000.0) FROM jsonb_array_elements_text($1::text::jsonb)
+                  SELECT to_timestamp(value::text::numeric / 1000.0) FROM jsonb_array_elements_text($1::text::jsonb)
                 ))",
           "values": [
             "[1712345678901,1712345678902]",

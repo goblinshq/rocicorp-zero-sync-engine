@@ -9,14 +9,17 @@
     "check-types:watch": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest watch",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
     "@rocicorp/resolver": "^1.0.2"
   },
   "devDependencies": {
+    "oxfmt": "^0.45.0",
     "replicache": "15.2.1",
     "shared": "0.0.0"
   }

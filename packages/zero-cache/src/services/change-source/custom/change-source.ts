@@ -59,7 +59,7 @@ export async function initializeCustomChangeSource(
 
   if (shard.publications.length) {
     // Verify that the publications match what has been synced.
-    const requested = [...shard.publications].sort();
+    const requested = shard.publications.toSorted();
     const replicated = subscriptionState.publications.sort();
     if (!deepEqual(requested, replicated)) {
       throw new Error(
@@ -98,6 +98,14 @@ class CustomChangeSource implements ChangeSource {
 
   initialSync(): ChangeStream {
     return this.#startStream();
+  }
+
+  startLagReporter() {
+    return null; // Not supported for custom sources
+  }
+
+  stop(): Promise<void> {
+    return Promise.resolve();
   }
 
   startStream(
@@ -177,7 +185,7 @@ export async function initialSync(
     },
   );
 
-  const statusPublisher = new ReplicationStatusPublisher(tx);
+  const statusPublisher = ReplicationStatusPublisher.forRunningTransaction(tx);
   try {
     let num = 0;
     for await (const change of changes) {
@@ -196,7 +204,7 @@ export async function initialSync(
           );
           initReplicationState(
             tx,
-            [...publications].sort(),
+            publications.toSorted(),
             commitWatermark,
             context,
             false,

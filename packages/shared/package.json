@@ -6,35 +6,48 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:chromium": "VITEST_BROWSER=chromium vitest run --config vitest.config.web.ts",
+    "test:chromium:watch": "VITEST_BROWSER=chromium vitest --config vitest.config.web.ts",
+    "test:firefox": "VITEST_BROWSER=firefox vitest run --config vitest.config.web.ts",
+    "test:firefox:watch": "VITEST_BROWSER=firefox vitest --config vitest.config.web.ts",
+    "test:webkit": "VITEST_BROWSER=webkit vitest run --config vitest.config.web.ts",
+    "test:webkit:watch": "VITEST_BROWSER=webkit vitest --config vitest.config.web.ts",
+    "bench": "vitest run --config vitest.config.bench.ts",
+    "bench:bmf": "BENCH_OUTPUT_FORMAT=json npm run bench 2>&1 | npx tsx ./src/tool/mitata-json-to-bmf.ts",
+    "bench:bmf:silent": "npm run bench:bmf --silent",
     "check-types": "tsc",
     "check-types:watch": "tsc --watch",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --type-aware src/",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
     "@badrap/valita": "0.3.11",
+    "@dotenvx/dotenvx": "^1.39.0",
     "@rocicorp/logger": "^5.4.0",
     "@rocicorp/resolver": "^1.0.2",
     "chalk-template": "^1.1.0",
     "command-line-args": "^6.0.1",
     "command-line-usage": "^7.0.3",
     "defu": "^6.1.4",
-    "@dotenvx/dotenvx": "^1.39.0",
     "js-xxhash": "^4.0.0",
     "kasi": "^1.1.0",
     "semver": "^7.5.4"
   },
   "devDependencies": {
+    "@mitata/counters": "^0.0.8",
     "@types/semver": "^7.5.1",
     "@types/strip-ansi": "^3.0.0",
-    "@vitest/runner": "4.0.15",
-    "compare-utf8": "^0.1.1",
+    "@vitest/runner": "4.1.3",
+    "compare-utf8": "^0.2.0",
     "fast-check": "^3.18.0",
+    "oxfmt": "^0.45.0",
     "package-up": "^5.0.0",
     "playwright": "^1.53.2",
     "type-fest": "^4.30.0",
-    "typescript": "~5.9.3",
-    "vitest": "4.0.15"
+    "typescript": "~6.0.2",
+    "vitest": "4.1.3"
   }
 }

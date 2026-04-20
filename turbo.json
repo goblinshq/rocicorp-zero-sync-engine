@@ -6,13 +6,6 @@
       "dependsOn": ["^build"],
       "outputs": ["out/**", "dist/**", ".next/**", "next-env.d.ts", "build/**"]
     },
-    "lint": {
-      "outputs": []
-    },
-    "format": {},
-    "check-format": {
-      "outputs": []
-    },
     "dev": {
       "cache": true
     },
@@ -25,6 +18,15 @@
     "check-types": {
       "dependsOn": ["^check-types", "build"],
       "outputs": []
+    },
+    "bench": {
+      "cache": false
+    },
+    "bench:bmf": {
+      "cache": false
+    },
+    "bench:bmf:silent": {
+      "cache": false
     }
   }
 }

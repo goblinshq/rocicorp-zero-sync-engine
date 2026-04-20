@@ -5,9 +5,11 @@ import {pid} from 'node:process';
 import {assert} from '../../../shared/src/asserts.ts';
 import {must} from '../../../shared/src/must.ts';
 import {randInt} from '../../../shared/src/rand.ts';
+import {promiseVoid} from '../../../shared/src/resolved-promises.ts';
 import * as v from '../../../shared/src/valita.ts';
 import {DatabaseStorage} from '../../../zqlite/src/database-storage.ts';
-import {AuthSessionImpl, type ValidateLegacyJWT} from '../auth/auth.ts';
+import type {ValidateLegacyJWT} from '../auth/auth.ts';
+import {tokenConfigOptions, verifyToken} from '../auth/jwt.ts';
 import type {NormalizedZeroConfig} from '../config/normalize.ts';
 import {getNormalizedZeroConfig} from '../config/zero-config.ts';
 import {CustomQueryTransformer} from '../custom-queries/transform-query.ts';
@@ -17,10 +19,15 @@ import {exitAfter, runUntilKilled} from '../services/life-cycle.ts';
 import {MutagenService} from '../services/mutagen/mutagen.ts';
 import {PusherService} from '../services/mutagen/pusher.ts';
 import type {ReplicaState} from '../services/replicator/replicator.ts';
+import {
+  type ConnectionContextManager,
+  ConnectionContextManagerImpl,
+} from '../services/view-syncer/connection-context-manager.ts';
 import type {DrainCoordinator} from '../services/view-syncer/drain-coordinator.ts';
 import {PipelineDriver} from '../services/view-syncer/pipeline-driver.ts';
 import {Snapshotter} from '../services/view-syncer/snapshotter.ts';
 import {ViewSyncerService} from '../services/view-syncer/view-syncer.ts';
+import {ProtocolErrorWithLevel} from '../types/error-with-level.ts';
 import {pgClient} from '../types/pg.ts';
 import {
   parentWorker,
@@ -52,6 +59,8 @@ function getCustomQueryConfig(
 
   return {
     url: queryConfig.url,
+    apiKey: queryConfig.apiKey,
+    allowedClientHeaders: queryConfig.allowedClientHeaders,
     forwardCookies: queryConfig.forwardCookies ?? false,
   };
 }
@@ -61,35 +70,42 @@ export default function runWorker(
   env: NodeJS.ProcessEnv,
   ...args: string[]
 ): Promise<void> {
-  const config = getNormalizedZeroConfig({env, argv: args.slice(1)});
+  assert(args.length >= 2, `expected [fileMode, workerIndex, ...flags]`);
+  const fileMode = v.parse(args[0], replicaFileModeSchema);
+  const workerIndex = Number(args[1]);
+  const config = getNormalizedZeroConfig({env, argv: args.slice(2)});
 
-  startOtelAuto(createLogContext(config, {worker: 'syncer'}, false));
-  const lc = createLogContext(config, {worker: 'syncer'}, true);
+  startOtelAuto(
+    createLogContext(config, 'syncer', workerIndex, false),
+    'syncer',
+    workerIndex,
+  );
+  const lc = createLogContext(config, 'syncer', workerIndex);
   initEventSink(lc, config);
 
-  assert(args.length > 0, `replicator mode not specified`);
-  const fileMode = v.parse(args[0], replicaFileModeSchema);
-
-  const {cvr, upstream} = config;
-  assert(cvr.maxConnsPerWorker, 'cvr.maxConnsPerWorker must be set');
-  assert(upstream.maxConnsPerWorker, 'upstream.maxConnsPerWorker must be set');
+  const {cvr, upstream, enableCrudMutations} = config;
 
   const replicaFile = replicaFileName(config.replica.file, fileMode);
   lc.debug?.(`running view-syncer on ${replicaFile}`);
 
   const cvrDB = pgClient(lc, cvr.db, {
-    max: cvr.maxConnsPerWorker,
+    max: must(cvr.maxConnsPerWorker, 'cvr.maxConnsPerWorker must be set'),
     connection: {['application_name']: `zero-sync-worker-${pid}-cvr`},
   });
 
-  const upstreamDB = pgClient(lc, upstream.db, {
-    max: upstream.maxConnsPerWorker,
-    connection: {['application_name']: `zero-sync-worker-${pid}-upstream`},
-  });
+  const upstreamDB = enableCrudMutations
+    ? pgClient(lc, upstream.db, {
+        max: must(
+          upstream.maxConnsPerWorker,
+          'upstream.maxConnsPerWorker must be set',
+        ),
+        connection: {['application_name']: `zero-sync-worker-${pid}-upstream`},
+      })
+    : undefined;
 
   const dbWarmup = Promise.allSettled([
     warmupConnections(lc, cvrDB, 'cvr'),
-    warmupConnections(lc, upstreamDB, 'upstream'),
+    upstreamDB ? warmupConnections(lc, upstreamDB, 'upstream') : promiseVoid,
   ]);
 
   const tmpDir = config.storageDBTmpDir ?? tmpdir();
@@ -103,26 +119,75 @@ export default function runWorker(
   );
 
   const shard = getShardID(config);
+  const customQueryConfig = getCustomQueryConfig(config);
+  const pushConfig =
+    config.push.url === undefined && config.mutate.url === undefined
+      ? undefined
+      : {
+          ...config.push,
+          ...config.mutate,
+          url: must(
+            config.push.url ?? config.mutate.url,
+            'No push or mutate URL configured',
+          ),
+        };
+
+  /** @deprecated used in JWT validation */
+  let validateLegacyJWT: ValidateLegacyJWT | undefined = undefined;
+
+  const tokenOptions = tokenConfigOptions(config.auth ?? {});
+  if (tokenOptions.length === 1) {
+    validateLegacyJWT = async (token, {userID}) => {
+      if (!userID) {
+        throw new ProtocolErrorWithLevel(
+          {
+            kind: 'Unauthorized',
+            message: 'UserID is required for JWT validation.',
+            origin: 'zeroCache',
+          },
+          'warn',
+        );
+      }
+
+      const decoded = await verifyToken(config.auth, token, {
+        subject: userID,
+        ...(config.auth?.issuer && {issuer: config.auth.issuer}),
+        ...(config.auth?.audience && {
+          audience: config.auth.audience,
+        }),
+      });
+      return {
+        type: 'jwt',
+        raw: token,
+        decoded,
+      };
+    };
+  }
 
   const viewSyncerFactory = (
     id: string,
     sub: Subscription<ReplicaState>,
     drainCoordinator: DrainCoordinator,
-    validateLegacyJWT: ValidateLegacyJWT | undefined,
   ) => {
     const logger = lc
       .withContext('component', 'view-syncer')
       .withContext('clientGroupID', id)
       .withContext('instance', randomID());
+
+    const customQueryTransformer =
+      customQueryConfig && new CustomQueryTransformer(logger, shard);
+    const contextManager = new ConnectionContextManagerImpl(
+      logger,
+      config.auth.revalidateIntervalSeconds,
+      config.auth.retransformIntervalSeconds,
+      customQueryConfig,
+      pushConfig,
+      validateLegacyJWT,
+    );
+
     lc.debug?.(
       `creating view syncer. Query Planner Enabled: ${config.enableQueryPlanner}`,
     );
-
-    // Create the custom query transformer if configured
-    const customQueryConfig = getCustomQueryConfig(config);
-    const customQueryTransformer =
-      customQueryConfig &&
-      new CustomQueryTransformer(logger, customQueryConfig, shard);
 
     const inspectorDelegate = new InspectorDelegate(customQueryTransformer);
 
@@ -131,12 +196,6 @@ export default function runWorker(
       2,
     );
     const normalYieldThresholdMs = Math.max(config.yieldThresholdMs, 2);
-
-    const authSession = new AuthSessionImpl(
-      logger.withContext('component', 'auth-session'),
-      id,
-      validateLegacyJWT,
-    );
 
     return new ViewSyncerService(
       config,
@@ -164,38 +223,35 @@ export default function runWorker(
       drainCoordinator,
       config.log.slowHydrateThreshold,
       inspectorDelegate,
+      contextManager,
       customQueryTransformer,
       runPriorityOp,
-      authSession,
     );
   };
 
-  const mutagenFactory = (id: string) =>
-    new MutagenService(
-      lc.withContext('component', 'mutagen').withContext('clientGroupID', id),
-      shard,
-      id,
-      upstreamDB,
-      config,
-      writeAuthzStorage,
-    );
+  const mutagenFactory = upstreamDB
+    ? (id: string) =>
+        new MutagenService(
+          lc
+            .withContext('component', 'mutagen')
+            .withContext('clientGroupID', id),
+          shard,
+          id,
+          upstreamDB,
+          config,
+          writeAuthzStorage,
+        )
+    : undefined;
 
   const pusherFactory =
-    config.push.url === undefined && config.mutate.url === undefined
+    pushConfig === undefined
       ? undefined
-      : (id: string) =>
+      : (id: string, contextManager: ConnectionContextManager) =>
           new PusherService(
             config,
-            {
-              ...config.push,
-              ...config.mutate,
-              url: must(
-                config.push.url ?? config.mutate.url,
-                'No push or mutate URL configured',
-              ),
-            },
             lc.withContext('clientGroupID', id),
             id,
+            contextManager,
           );
 
   const syncer = new Syncer(
@@ -205,6 +261,7 @@ export default function runWorker(
     mutagenFactory,
     pusherFactory,
     parent,
+    validateLegacyJWT,
   );
 
   startAnonymousTelemetry(lc, config);

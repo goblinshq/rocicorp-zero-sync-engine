@@ -1,6 +1,6 @@
+import {open} from 'node:fs/promises';
 import {consoleLogSink, LogContext} from '@rocicorp/logger';
 import find from 'find-process';
-import {open} from 'node:fs/promises';
 import pidusage from 'pidusage';
 import {parseOptions} from '../../../packages/shared/src/options.ts';
 import * as v from '../../../packages/shared/src/valita.ts';
@@ -92,9 +92,11 @@ async function run() {
   });
 }
 
+const wsRe = /\s+/;
+
 function getName({name, cmd}: {name: string; cmd: string}) {
   if (name === 'node') {
-    const parts = cmd.split(/\s+/);
+    const parts = cmd.split(wsRe);
     for (let i = parts.length - 1; i >= 0; i--) {
       const part = parts[i];
       const lastSlash = part.lastIndexOf('/');

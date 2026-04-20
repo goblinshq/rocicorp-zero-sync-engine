@@ -163,7 +163,7 @@ export function shardSetup(
   const app = id(appSchema(shardConfig));
   const shard = id(upstreamSchema(shardConfig));
 
-  const pubs = [...shardConfig.publications].sort();
+  const pubs = shardConfig.publications.toSorted();
   assert(
     pubs.includes(metadataPublication),
     () => `Publications must include ${metadataPublication}`,
@@ -406,7 +406,7 @@ export function validatePublications(
   published.publications.forEach(pub => {
     if (
       !pub.pubinsert ||
-      !pub.pubtruncate ||
+      !pub.pubupdate ||
       !pub.pubdelete ||
       !pub.pubtruncate
     ) {

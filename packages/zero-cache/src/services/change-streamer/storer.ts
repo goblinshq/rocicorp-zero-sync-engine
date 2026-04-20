@@ -1,6 +1,6 @@
+import {getHeapStatistics} from 'node:v8';
 import type {LogContext} from '@rocicorp/logger';
 import {resolver, type Resolver} from '@rocicorp/resolver';
-import {getHeapStatistics} from 'node:v8';
 import {type PendingQuery, type Row} from 'postgres';
 import {AbortError} from '../../../../shared/src/abort-error.ts';
 import {assert} from '../../../../shared/src/asserts.ts';
@@ -72,6 +72,11 @@ type PendingTransaction = {
 
 const backfillRequestsSchema = v.array(backfillRequestSchema);
 
+export type TuningOptions = {
+  backPressureLimitHeapProportion: number;
+  statementTimeoutMs: number;
+};
+
 /**
  * Handles the storage of changes and the catchup of subscribers
  * that are behind.
@@ -115,6 +120,7 @@ export class Storer implements Service {
   readonly #onFatal: (err: Error) => void;
   readonly #queue = new Queue<QueueEntry>();
   readonly #backPressureThresholdBytes: number;
+  readonly #statementTimeoutMs: number;
 
   #approximateQueuedBytes = 0;
   #running = false;
@@ -129,7 +135,7 @@ export class Storer implements Service {
     replicaVersion: string,
     onConsumed: (c: Commit | UpstreamStatusMessage) => void,
     onFatal: (err: Error) => void,
-    backPressureLimitHeapProportion: number,
+    {backPressureLimitHeapProportion, statementTimeoutMs}: TuningOptions,
   ) {
     this.#lc = lc.withContext('component', 'change-log');
     this.#shard = shard;
@@ -140,6 +146,7 @@ export class Storer implements Service {
     this.#replicaVersion = replicaVersion;
     this.#onConsumed = onConsumed;
     this.#onFatal = onFatal;
+    this.#statementTimeoutMs = statementTimeoutMs;
 
     const heapStats = getHeapStatistics();
     this.#backPressureThresholdBytes =
@@ -159,7 +166,7 @@ export class Storer implements Service {
     return this.#db(`${cdcSchema(this.#shard)}.${table}`);
   }
 
-  async assumeOwnership() {
+  async assumeOwnership(purgeLock?: PurgeLock | null) {
     const db = this.#db;
     const owner = this.#taskID;
     const ownerAddress = this.#discoveryAddress;
@@ -176,6 +183,14 @@ export class Storer implements Service {
     this.#lc.info?.(
       `assumed ownership at ${addressWithProtocol} (${elapsed} ms)`,
     );
+
+    if (purgeLock) {
+      // Once ownership has been assumed, any initial purge-lock preventing the
+      // purging of change-log records can be released, as a change-streamer
+      // that was attempting to purge records will correspondingly abort on the
+      // ownership check.
+      void purgeLock.release();
+    }
   }
 
   async getStartStreamInitializationParameters(): Promise<{
@@ -216,24 +231,32 @@ export class Storer implements Service {
   }
 
   async getMinWatermarkForCatchup(): Promise<string | null> {
-    const [{minWatermark}] = await this.#db<
-      {minWatermark: string | null}[]
-    > /*sql*/ `
+    const [{minWatermark}] = await this.#db<{minWatermark: string | null}[]>
+    /*sql*/ `
       SELECT min(watermark) as "minWatermark" FROM ${this.#cdc('changeLog')}`;
     return minWatermark;
   }
 
   purgeRecordsBefore(watermark: string): Promise<number> {
     return runTx(this.#db, async sql => {
+      // This NOWAIT pre-check is an optimization to abort the transaction
+      // (and release associated resources) early.
+      await sql<{watermark: string}[]>`
+          SELECT watermark FROM ${this.#cdc('changeLog')}
+            ORDER BY watermark, pos LIMIT 1
+            FOR UPDATE NOWAIT
+        `;
+      // If the row is purge-locked by an incoming replication-manager, it
+      // will assume ownership of the change-log before releasing the lock.
+      // This DELETE blocks until the lock is released, allowing the change
+      // in ownership to be reliably detected (and the transaction aborted)
+      // in the subsequent check.
       const [{deleted}] = await sql<{deleted: bigint}[]>`
         WITH purged AS (
           DELETE FROM ${this.#cdc('changeLog')} WHERE watermark < ${watermark} 
             RETURNING watermark, pos
         ) SELECT COUNT(*) as deleted FROM purged;`;
 
-      // Before committing the purge, check that this process is still the
-      // owner. This is done after the DELETE to minimize the amount of time
-      // that writes to the changeLog are delayed.
       const [{owner}] = await sql<ReplicationState[]>`
         SELECT * FROM ${this.#cdc('replicationState')} FOR SHARE`;
       if (owner !== this.#taskID) {
@@ -338,23 +361,51 @@ export class Storer implements Service {
     this.#stopped = stopped;
 
     this.#lc.info?.('starting storer');
+    let err: unknown;
     try {
       await this.#processQueue();
+    } catch (e) {
+      err = e; // used in finally
+      throw e;
     } finally {
       // Release any pending backpressure so the upstream can proceed
       if (this.#readyForMore !== null) {
         this.#readyForMore.resolve();
         this.#readyForMore = null;
       }
-      const unprocessed = this.#queue.drain();
-      if (unprocessed.length) {
-        this.#lc.warn?.(
-          `dropped ${unprocessed.length} entries from the changeLog queue`,
-        );
-      }
+      this.#cancelQueueEntries(
+        this.#queue.drain().filter(entry => entry !== undefined),
+        err,
+      );
       this.#running = false;
       signalStopped();
       this.#lc.info?.('storer stopped');
+    }
+  }
+
+  #cancelQueueEntries(queue: QueueEntry[], e: unknown) {
+    if (queue.length === 0) {
+      return;
+    }
+    this.#lc.info?.(
+      `canceling ${queue.length} entries from the changeLog queue`,
+    );
+    const err = e instanceof Error ? e : new AbortError('server shutting down');
+    for (const entry of queue) {
+      if (entry === 'stop') {
+        continue;
+      }
+      const type = entry[0];
+      switch (type) {
+        case 'subscriber': {
+          // Disconnect subscribers waiting to be caught up so that they can
+          // reconnect and try again.
+          const {subscriber} = entry[1];
+          this.#lc.info?.(`disconnecting ${subscriber.id}`);
+          subscriber.fail(err);
+          break;
+        }
+      }
     }
   }
 
@@ -363,128 +414,139 @@ export class Storer implements Service {
     let msg: QueueEntry | false;
 
     const catchupQueue: SubscriberAndMode[] = [];
-    while ((msg = await this.#queue.dequeue()) !== 'stop') {
-      const [msgType] = msg;
-      switch (msgType) {
-        case 'ready': {
-          const signalReady = msg[1];
-          signalReady();
-          continue;
-        }
-        case 'subscriber': {
-          const subscriber = msg[1];
-          if (tx) {
-            catchupQueue.push(subscriber); // Wait for the current tx to complete.
-          } else {
-            await this.#startCatchup([subscriber]); // Catch up immediately.
+    try {
+      while ((msg = await this.#queue.dequeue()) !== 'stop') {
+        const [msgType] = msg;
+        switch (msgType) {
+          case 'ready': {
+            const signalReady = msg[1];
+            signalReady();
+            continue;
           }
-          continue;
-        }
-        case 'status':
-          this.#onConsumed(msg);
-          continue;
-        case 'abort': {
-          if (tx) {
-            tx.pool.abort();
-            await tx.pool.done();
-            tx = null;
+          case 'subscriber': {
+            const subscriber = msg[1];
+            if (tx) {
+              catchupQueue.push(subscriber); // Wait for the current tx to complete.
+            } else {
+              await this.#startCatchup([subscriber]); // Catch up immediately.
+            }
+            continue;
           }
-          continue;
+          case 'status':
+            this.#onConsumed(msg);
+            continue;
+          case 'abort': {
+            if (tx) {
+              tx.pool.abort();
+              await tx.pool.done();
+              tx = null;
+            }
+            continue;
+          }
         }
-      }
-      // msgType === 'change'
-      const [_, watermark, json, change] = msg;
-      const tag = change?.tag;
-      this.#approximateQueuedBytes -= json.length;
+        // msgType === 'change'
+        const [_, watermark, json, change] = msg;
+        const tag = change?.tag;
+        this.#approximateQueuedBytes -= json.length;
 
-      if (tag === 'begin') {
-        assert(!tx, 'received BEGIN in the middle of a transaction');
-        const {promise, resolve, reject} = resolver<ReplicationState>();
-        tx = {
-          pool: new TransactionPool(
-            this.#lc.withContext('watermark', watermark),
-            Mode.READ_COMMITTED,
-          ),
-          preCommitWatermark: watermark,
-          pos: 0,
-          startingReplicationState: promise,
-          ack: !change.skipAck,
-        };
-        tx.pool.run(this.#db);
-        // Acquire a lock on the replicationState row to detect and/or prevent
-        // a concurrent ownership change.
-        void tx.pool.process(tx => {
-          tx<ReplicationState[]> /*sql*/ `
+        if (tag === 'begin') {
+          assert(!tx, 'received BEGIN in the middle of a transaction');
+          const {promise, resolve, reject} = resolver<ReplicationState>();
+          void promise.catch(() => {}); // handle rejections before the await
+          tx = {
+            pool: new TransactionPool(
+              this.#lc.withContext('watermark', watermark),
+              {
+                mode: Mode.READ_COMMITTED,
+                statementResponseTimeout: this.#statementTimeoutMs,
+              },
+            ),
+            preCommitWatermark: watermark,
+            pos: 0,
+            startingReplicationState: promise,
+            ack: !change.skipAck,
+          };
+          tx.pool.run(this.#db);
+          // Acquire a lock on the replicationState row to detect and/or prevent
+          // a concurrent ownership change.
+          void tx.pool.process(tx => {
+            tx<ReplicationState[]> /*sql*/ `
           SELECT * FROM ${this.#cdc('replicationState')} FOR UPDATE`.then(
-            ([result]) => resolve(result),
-            reject,
-          );
-          return [];
-        });
-      } else {
-        assert(tx, () => `received change outside of transaction: ${json}`);
-        tx.pos++;
-      }
-
-      const entry = {
-        watermark: tag === 'commit' ? watermark : tx.preCommitWatermark,
-        precommit: tag === 'commit' ? tx.preCommitWatermark : null,
-        pos: tx.pos,
-        change: json,
-      };
-
-      const processed = tx.pool.process(sql => [
-        sql`INSERT INTO ${this.#cdc('changeLog')} ${sql(entry)}`,
-        ...(change !== null && isSchemaChange(change)
-          ? this.#trackBackfillMetadata(sql, change)
-          : []),
-      ]);
-
-      if (tx.pos % 100 === 0) {
-        // Backpressure is exerted on commit when awaiting tx.pool.done().
-        // However, backpressure checks need to be regularly done for
-        // very large transactions in order to avoid memory blowup.
-        await processed;
-      }
-      this.#maybeReleaseBackPressure();
-
-      if (tag === 'commit') {
-        const {owner} = await tx.startingReplicationState;
-        if (owner !== this.#taskID) {
-          // Ownership change reflected in the replicationState read in 'begin'.
-          tx.pool.fail(
-            new AbortError(`changeLog ownership has been assumed by ${owner}`),
-          );
+              ([result]) => resolve(result),
+              reject,
+            );
+            return [];
+          });
         } else {
-          // Update the replication state.
-          const lastWatermark = watermark;
-          void tx.pool.process(tx => [
-            tx`
+          assert(tx, () => `received change outside of transaction: ${json}`);
+          tx.pos++;
+        }
+
+        const entry = {
+          watermark: tag === 'commit' ? watermark : tx.preCommitWatermark,
+          precommit: tag === 'commit' ? tx.preCommitWatermark : null,
+          pos: tx.pos,
+          change: json,
+        };
+
+        const processed = tx.pool.process(sql => [
+          sql`INSERT INTO ${this.#cdc('changeLog')} ${sql(entry)}`,
+          ...(change !== null && isSchemaChange(change)
+            ? this.#trackBackfillMetadata(sql, change)
+            : []),
+        ]);
+
+        if (tx.pos % 100 === 0) {
+          // Backpressure is exerted on commit when awaiting tx.pool.done().
+          // However, backpressure checks need to be regularly done for
+          // very large transactions in order to avoid memory blowup.
+          await processed;
+        }
+        this.#maybeReleaseBackPressure();
+
+        if (tag === 'commit') {
+          const {owner} = await tx.startingReplicationState;
+          if (owner !== this.#taskID) {
+            // Ownership change reflected in the replicationState read in 'begin'.
+            tx.pool.fail(
+              new AbortError(
+                `changeLog ownership has been assumed by ${owner}`,
+              ),
+            );
+          } else {
+            // Update the replication state.
+            const lastWatermark = watermark;
+            void tx.pool.process(tx => [
+              tx`
             UPDATE ${this.#cdc('replicationState')} SET ${tx({lastWatermark})}`,
-          ]);
-          tx.pool.setDone();
+            ]);
+            tx.pool.setDone();
+          }
+
+          await tx.pool.done();
+
+          // ACK the LSN to the upstream Postgres.
+          if (tx.ack) {
+            this.#onConsumed(['commit', change, {watermark}]);
+          }
+          tx = null;
+
+          // Before beginning the next transaction, open a READONLY snapshot to
+          // concurrently catchup any queued subscribers.
+          await this.#startCatchup(catchupQueue.splice(0));
+        } else if (tag === 'rollback') {
+          // Aborted transactions are not stored in the changeLog. Abort the current tx
+          // and process catchup of subscribers that were waiting for it to end.
+          tx.pool.abort();
+          await tx.pool.done();
+          tx = null;
+
+          await this.#startCatchup(catchupQueue.splice(0));
         }
-
-        await tx.pool.done();
-
-        // ACK the LSN to the upstream Postgres.
-        if (tx.ack) {
-          this.#onConsumed(['commit', change, {watermark}]);
-        }
-        tx = null;
-
-        // Before beginning the next transaction, open a READONLY snapshot to
-        // concurrently catchup any queued subscribers.
-        await this.#startCatchup(catchupQueue.splice(0));
-      } else if (tag === 'rollback') {
-        // Aborted transactions are not stored in the changeLog. Abort the current tx
-        // and process catchup of subscribers that were waiting for it to end.
-        tx.pool.abort();
-        await tx.pool.done();
-        tx = null;
-
-        await this.#startCatchup(catchupQueue.splice(0));
       }
+    } catch (e) {
+      catchupQueue.forEach(({subscriber}) => subscriber.fail(e));
+      throw e;
     }
   }
 
@@ -495,19 +557,25 @@ export class Storer implements Service {
 
     const reader = new TransactionPool(
       this.#lc.withContext('pool', 'catchup'),
-      Mode.READONLY,
+      {mode: Mode.READONLY},
     );
     reader.run(this.#db);
 
-    // Ensure that the transaction has started (and is thus holding a snapshot
-    // of the database) before continuing on to commit more changes. This is
-    // done by performing a single read on the db, which determines the
-    // snapshot for the REPEATABLE_READ transaction.
-    const [{lastWatermark}] = await reader.processReadTask(
-      sql => sql<ReplicationState[]>`
+    let lastWatermark: string | undefined;
+    try {
+      // Ensure that the transaction has started (and is thus holding a snapshot
+      // of the database) before continuing on to commit more changes. This is
+      // done by performing a single read on the db, which determines the
+      // snapshot for the REPEATABLE_READ transaction.
+      [{lastWatermark}] = await reader.processReadTask(
+        sql => sql<ReplicationState[]>`
         SELECT * FROM ${this.#cdc('replicationState')}
       `,
-    );
+      );
+    } catch (e) {
+      subs.map(({subscriber}) => subscriber.fail(e));
+      throw e;
+    }
 
     // Run the actual catchup queries in the background. Errors are handled in
     // #catchup() by disconnecting the associated subscriber.
@@ -769,5 +837,84 @@ function toDownstream(entry: ChangeEntry): WatermarkedChange {
       return [watermark, ['rollback', change]];
     default:
       return [watermark, ['data', change]];
+  }
+}
+
+export class PurgeLock {
+  readonly #lc: LogContext;
+  readonly #tx: TransactionPool;
+  readonly replicaVersion: string;
+  readonly minWatermark: string;
+
+  constructor(
+    lc: LogContext,
+    tx: TransactionPool,
+    replicaVersion: string,
+    watermark: string,
+  ) {
+    this.#lc = lc;
+    this.#tx = tx;
+    this.replicaVersion = replicaVersion;
+    this.minWatermark = watermark;
+  }
+
+  #released = false;
+
+  async release() {
+    if (this.#released) {
+      return;
+    }
+    this.#released = true;
+    this.#tx.setDone();
+    await this.#tx
+      .done()
+      .catch(e => this.#lc.warn?.(`error from purge-lock release`, e));
+    this.#lc.info?.(`released purge lock on ${this.minWatermark}`);
+  }
+}
+
+export class PurgeLocker {
+  readonly #lc: LogContext;
+  readonly #shard: ShardID;
+  readonly #db: PostgresDB;
+
+  constructor(lc: LogContext, shard: ShardID, db: PostgresDB) {
+    this.#lc = lc.withContext('component', 'purge-locker');
+    this.#shard = shard;
+    this.#db = db;
+  }
+
+  // For readability in SQL statements.
+  #cdc(table: string) {
+    return this.#db(`${cdcSchema(this.#shard)}.${table}`);
+  }
+
+  async acquire() {
+    const tx = new TransactionPool(this.#lc, {mode: Mode.READ_COMMITTED}).run(
+      this.#db,
+    );
+    const row = await tx.processReadTask(
+      sql => sql<{watermark: string}[]>`
+      SELECT watermark FROM ${this.#cdc('changeLog')}
+        ORDER BY watermark, pos LIMIT 1
+        FOR SHARE 
+    `,
+    );
+    if (row.length === 0) {
+      this.#lc.info?.(`changeLog is empty. No rows to purge-lock.`);
+      tx.setDone();
+      await tx.done();
+      return null;
+    }
+    const [{watermark}] = row;
+    const [{replicaVersion}] = await tx.processReadTask(
+      sql => sql<{replicaVersion: string}[]>`
+        SELECT "replicaVersion" FROM ${this.#cdc('replicationConfig')}
+      `,
+    );
+    this.#lc.info?.(
+      `locked watermark ${watermark} from being purged from replica@${replicaVersion}`,
+    );
+    return new PurgeLock(this.#lc, tx, replicaVersion, watermark);
   }
 }

@@ -1,18 +1,19 @@
 import {expect, suite, test} from 'vitest';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {assert} from '../../../shared/src/asserts.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {CompoundKey, Ordering} from '../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../zero-protocol/src/primary-key.ts';
 import type {SchemaValue} from '../../../zero-schema/src/table-schema.ts';
 import {Catch, type CaughtNode} from './catch.ts';
+import {FlippedJoin} from './flipped-join.ts';
 import type {SourceSchema} from './schema.ts';
 import {Snitch, type SnitchMessage} from './snitch.ts';
-import {createSource} from './test/source-factory.ts';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
-import {FlippedJoin} from './flipped-join.ts';
 import {consume} from './stream.ts';
+import {createSource} from './test/source-factory.ts';
 
+import {makeSourceChangeAdd} from './source.ts';
 /**
  * These tests are based on join.fetch.test.ts.  Uses same cases.
  * Most of the data snapshots are the same expect for when
@@ -1917,7 +1918,7 @@ function fetchTest(t: FetchTest): FetchTestResults {
       t.primaryKeys[i],
     );
     for (const row of rows) {
-      consume(source.push({type: 'add', row}));
+      consume(source.push(makeSourceChangeAdd(row)));
     }
     const snitch = new Snitch(source.connect(ordering), String(i), log);
     return {

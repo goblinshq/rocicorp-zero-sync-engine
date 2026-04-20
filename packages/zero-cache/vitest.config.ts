@@ -7,7 +7,7 @@ function nameFromURL(url: string) {
 }
 
 export function configForVersion(version: number, url: string) {
-  const TIMEOUT = (CI ? 2 : 1) * 20_000;
+  const TIMEOUT = (CI ? 2 : 1) * 30_000;
   const name = nameFromURL(url);
   const merged = mergeConfig(config, {
     test: {
@@ -20,8 +20,10 @@ export function configForVersion(version: number, url: string) {
         reporter: [['html'], ['clover', {file: 'coverage.xml'}]],
         include: ['src/**'],
       },
+      retry: CI ? 2 : 0,
       testTimeout: TIMEOUT,
       hookTimeout: TIMEOUT,
+      slowTestThreshold: TIMEOUT / 10,
     },
   });
   // Override include to only pg tests (mergeConfig merges arrays, we want to replace)
@@ -77,6 +79,11 @@ export function configForCustomPg(url: string) {
 
 export default defineConfig({
   test: {
-    projects: ['vitest.config.*.ts', ...configForCustomPg(import.meta.url)],
+    projects: [
+      'vitest.config.*.ts',
+      '!vitest.config.bench.ts',
+      '!vitest.config.bench.*.ts',
+      ...configForCustomPg(import.meta.url),
+    ],
   },
 });

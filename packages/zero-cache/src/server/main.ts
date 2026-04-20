@@ -1,5 +1,5 @@
-import {resolver} from '@rocicorp/resolver';
 import path from 'node:path';
+import {resolver} from '@rocicorp/resolver';
 import {must} from '../../../shared/src/must.ts';
 import {getNormalizedZeroConfig} from '../config/zero-config.ts';
 import {initEventSink} from '../observability/events.ts';
@@ -33,6 +33,7 @@ import {
   MUTATOR_URL,
   REAPER_URL,
   REPLICATOR_URL,
+  SHADOW_SYNCER_URL,
   SYNCER_URL,
 } from './worker-urls.ts';
 
@@ -45,14 +46,18 @@ export default async function runWorker(
   const startMs = Date.now();
   const config = getNormalizedZeroConfig({env});
 
-  startOtelAuto(createLogContext(config, {worker: 'dispatcher'}, false));
-  const lc = createLogContext(config, {worker: 'dispatcher'}, true);
+  startOtelAuto(
+    createLogContext(config, 'dispatcher', 0, false),
+    'dispatcher',
+    0,
+  );
+  const lc = createLogContext(config, 'dispatcher');
   initEventSink(lc, config);
 
   const processes = new ProcessManager(lc, parent);
 
   const {numSyncWorkers: numSyncers} = config;
-  if (config.upstream.maxConns < numSyncers) {
+  if (config.enableCrudMutations && config.upstream.maxConns < numSyncers) {
     throw new Error(
       `Insufficient upstream connections (${config.upstream.maxConns}) for ${numSyncers} syncers.` +
         `Increase ZERO_UPSTREAM_MAX_CONNS or decrease ZERO_NUM_SYNC_WORKERS (which defaults to available cores).`,
@@ -94,71 +99,65 @@ export default async function runWorker(
   const runChangeStreamer =
     changeStreamerMode === 'dedicated' && changeStreamerURI === undefined;
 
-  let restoreStart = new Date();
-  if (litestream.backupURL || (litestream.executable && !runChangeStreamer)) {
-    try {
-      restoreStart = await restoreReplica(lc, config);
-    } catch (e) {
-      if (runChangeStreamer) {
-        // If the restore failed, e.g. due to a corrupt backup, the
-        // replication-manager recovers by re-syncing.
-        lc.error?.('error restoring backup. resyncing the replica.', e);
-      } else {
-        // View-syncers, on the other hand, have no option other than to retry
-        // until a valid backup has been published. This is achieved by
-        // shutting down and letting the container runner retry with its
-        // configured policy.
-        throw e;
-      }
+  let changeStreamer: Worker | undefined;
+
+  if (!runChangeStreamer) {
+    changeStreamer = undefined;
+    if (litestream.executable) {
+      // For view-syncers, the backup is restored here. For the replication-manager,
+      // the backup is restored in the change-streamer worker.
+      await restoreReplica(lc, config, null);
+    }
+  } else {
+    const {promise: changeStreamerReady, resolve: changeStreamerStarted} =
+      resolver();
+    changeStreamer = loadWorker(CHANGE_STREAMER_URL, 'supporting').once(
+      'message',
+      changeStreamerStarted,
+    );
+
+    // Wait for the change-streamer to be ready to guarantee that a replica
+    // file is present.
+    await changeStreamerReady;
+
+    if (litestream.backupURL) {
+      // Start a backup replicator and corresponding litestream backup process.
+      const {promise: backupReady, resolve} = resolver();
+      const mode: ReplicaFileMode = 'backup';
+      loadWorker(REPLICATOR_URL, 'supporting', mode, mode).once(
+        // Wait for the Replicator's first message (i.e. "ready") before starting
+        // litestream backup in order to avoid contending on the lock when the
+        // replicator first prepares the db file.
+        'message',
+        () => {
+          processes.addSubprocess(
+            startReplicaBackupProcess(lc, config),
+            'supporting',
+            'litestream',
+          );
+          resolve();
+        },
+      );
+      await backupReady;
     }
   }
 
-  const {promise: changeStreamerReady, resolve: changeStreamerStarted} =
-    resolver();
-  const changeStreamer = runChangeStreamer
-    ? loadWorker(
-        CHANGE_STREAMER_URL,
-        'supporting',
-        undefined,
-        String(restoreStart.getTime()),
-      ).once('message', changeStreamerStarted)
-    : (changeStreamerStarted() ?? undefined);
-
-  const {promise: reaperReady, resolve: reaperStarted} = resolver();
   if (numSyncers > 0) {
+    const {promise: reaperReady, resolve: reaperStarted} = resolver();
     loadWorker(REAPER_URL, 'supporting').once('message', reaperStarted);
-  } else {
-    reaperStarted();
+    // Before starting the view-syncers, ensure that the reaper has started
+    // up, indicating that any CVR db migrations have been performed.
+    await reaperReady;
   }
 
-  // Wait for the change-streamer to be ready to guarantee that a replica
-  // file is present.
-  await changeStreamerReady;
-
-  if (runChangeStreamer && litestream.backupURL) {
-    // Start a backup replicator and corresponding litestream backup process.
-    const {promise: backupReady, resolve} = resolver();
-    const mode: ReplicaFileMode = 'backup';
-    loadWorker(REPLICATOR_URL, 'supporting', mode, mode).once(
-      // Wait for the Replicator's first message (i.e. "ready") before starting
-      // litestream backup in order to avoid contending on the lock when the
-      // replicator first prepares the db file.
-      'message',
-      () => {
-        processes.addSubprocess(
-          startReplicaBackupProcess(lc, config),
-          'supporting',
-          'litestream',
-        );
-        resolve();
-      },
-    );
-    await backupReady;
+  // Only run the shadow-sync canary on the replication-manager (or in
+  // single-node mode, where it also owns upstream). Running on every
+  // view-syncer would hammer the upstream with N redundant canaries.
+  if (config.shadowSync.enabled && runChangeStreamer) {
+    const {promise: shadowReady, resolve: shadowStarted} = resolver();
+    loadWorker(SHADOW_SYNCER_URL, 'supporting').once('message', shadowStarted);
+    await shadowReady;
   }
-
-  // Before starting the view-syncers, ensure that the reaper has started
-  // up, indicating that any CVR db migrations have been performed.
-  await reaperReady;
 
   const syncers: Worker[] = [];
   if (numSyncers) {
@@ -178,7 +177,7 @@ export default async function runWorker(
 
     const notifier = createNotifierFrom(lc, replicator);
     for (let i = 0; i < numSyncers; i++) {
-      syncers.push(loadWorker(SYNCER_URL, 'user-facing', i + 1, mode));
+      syncers.push(loadWorker(SYNCER_URL, 'user-facing', i, mode, String(i)));
     }
     syncers.forEach(syncer => handleSubscriptionsFrom(lc, syncer, notifier));
   }

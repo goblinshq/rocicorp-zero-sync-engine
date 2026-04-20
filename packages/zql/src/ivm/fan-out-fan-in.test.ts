@@ -1,6 +1,7 @@
 import {expect, test, vi} from 'vitest';
 import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
+import type {BuilderDelegate} from '../builder/builder.ts';
 import {Catch} from './catch.ts';
 import {FanIn} from './fan-in.ts';
 import {FanOut} from './fan-out.ts';
@@ -10,10 +11,14 @@ import {
   FilterStart,
 } from './filter-operators.ts';
 import {Filter} from './filter.ts';
-import {createSource} from './test/source-factory.ts';
 import {consume} from './stream.ts';
-import type {BuilderDelegate} from '../builder/builder.ts';
+import {createSource} from './test/source-factory.ts';
 
+import {
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from './source.ts';
 const lc = createSilentLogContext();
 const mockDelegate = {
   addEdge() {},
@@ -39,11 +44,9 @@ test('fan-out pushes along all paths', () => {
   const fanIn = new FanIn(fanOut, []);
   fanOut.setFanIn(fanIn);
 
-  consume(s.push({type: 'add', row: {a: 1, b: 'foo'}}));
-  consume(
-    s.push({type: 'edit', oldRow: {a: 1, b: 'foo'}, row: {a: 1, b: 'bar'}}),
-  );
-  consume(s.push({type: 'remove', row: {a: 1, b: 'bar'}}));
+  consume(s.push(makeSourceChangeAdd({a: 1, b: 'foo'})));
+  consume(s.push(makeSourceChangeEdit({a: 1, b: 'bar'}, {a: 1, b: 'foo'})));
+  consume(s.push(makeSourceChangeRemove({a: 1, b: 'bar'})));
 
   expect(catch1.pushes).toMatchInlineSnapshot(`
     [
@@ -173,9 +176,9 @@ test('fan-out,fan-in pairing does not duplicate pushes', () => {
   });
   const out = new Catch(pipeline);
 
-  consume(s.push({type: 'add', row: {a: 1, b: 'foo'}}));
-  consume(s.push({type: 'add', row: {a: 2, b: 'foo'}}));
-  consume(s.push({type: 'add', row: {a: 3, b: 'foo'}}));
+  consume(s.push(makeSourceChangeAdd({a: 1, b: 'foo'})));
+  consume(s.push(makeSourceChangeAdd({a: 2, b: 'foo'})));
+  consume(s.push(makeSourceChangeAdd({a: 3, b: 'foo'})));
 
   expect(out.pushes).toMatchInlineSnapshot(`
     [
@@ -222,10 +225,10 @@ test('fan-in fetch', () => {
     ['a', 'b'],
   );
 
-  consume(s.push({type: 'add', row: {a: false, b: false}}));
-  consume(s.push({type: 'add', row: {a: false, b: true}}));
-  consume(s.push({type: 'add', row: {a: true, b: false}}));
-  consume(s.push({type: 'add', row: {a: true, b: true}}));
+  consume(s.push(makeSourceChangeAdd({a: false, b: false})));
+  consume(s.push(makeSourceChangeAdd({a: false, b: true})));
+  consume(s.push(makeSourceChangeAdd({a: true, b: false})));
+  consume(s.push(makeSourceChangeAdd({a: true, b: true})));
 
   const connector = s.connect([
     ['a', 'asc'],

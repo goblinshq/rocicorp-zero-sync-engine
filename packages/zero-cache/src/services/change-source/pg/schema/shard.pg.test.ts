@@ -84,16 +84,7 @@ describe('change-source/pg', () => {
 
     expect(
       (await db`SELECT evtname from pg_event_trigger`.values()).flat(),
-    ).toEqual([
-      'zro_ddl_start_0',
-      'zro_create_table_0',
-      'zro_alter_table_0',
-      'zro_create_index_0',
-      'zro_drop_table_0',
-      'zro_drop_index_0',
-      'zro_alter_publication_0',
-      'zro_alter_schema_0',
-    ]);
+    ).toEqual(['zro_ddl_start_0', 'zro_ddl_end_0']);
   });
 
   test('default publication, join table', async () => {
@@ -396,6 +387,26 @@ describe('change-source/pg', () => {
         },
       ]
     `);
+  });
+
+  test('publication must publish updates', () => {
+    expect(() =>
+      validatePublications(lc, {
+        publications: [
+          {
+            pubname: 'zero_data',
+            pubinsert: true,
+            pubupdate: false,
+            pubdelete: true,
+            pubtruncate: true,
+          },
+        ],
+        tables: [],
+        indexes: [],
+      }),
+    ).toThrowError(
+      'PUBLICATION zero_data must publish insert, update, delete, and truncate',
+    );
   });
 
   type InvalidUpstreamCase = {

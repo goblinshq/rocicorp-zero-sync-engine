@@ -189,7 +189,6 @@ export function ListPage({onReady}: {onReady: () => void}) {
     ) =>
       queries.issueListV2({
         listContext: listContextParams,
-        userID: z.userID,
         limit,
         start,
         dir,
@@ -465,7 +464,7 @@ export function ListPage({onReady}: {onReady: () => void}) {
       <div className="list-view-filter-container">
         <span className="filter-label">Filtered by:</span>
         <div className="set-filter-container">
-          {[...qs.entries()].map(([key, val]) => {
+          {Array.from(qs.entries(), ([key, val]) => {
             if (key === 'label' || key === 'creator' || key === 'assignee') {
               return (
                 <span

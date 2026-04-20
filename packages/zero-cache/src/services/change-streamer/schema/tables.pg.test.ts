@@ -1,3 +1,5 @@
+import {resolver} from '@rocicorp/resolver';
+import postgres from 'postgres';
 import {beforeEach, describe, expect} from 'vitest';
 import {createSilentLogContext} from '../../../../../shared/src/logging-test-utils.ts';
 import {Database} from '../../../../../zqlite/src/db.ts';
@@ -6,6 +8,7 @@ import type {PostgresDB} from '../../../types/pg.ts';
 import {initReplicationState} from '../../replicator/schema/replication-state.ts';
 import {
   AutoResetSignal,
+  CHANGE_STREAMER_APP_NAME,
   ensureReplicationConfig,
   markResetRequired,
   setupCDCTables,
@@ -249,5 +252,132 @@ describe('change-streamer/schema/tables', () => {
         true,
       ),
     ).rejects.toThrow(AutoResetSignal);
+  });
+
+  test('terminateChangeDBLockHolders with multiple blockers', async () => {
+    // Set up initial replication config.
+    await ensureReplicationConfig(
+      lc,
+      sql,
+      {
+        replicaVersion: '183',
+        publications: ['zero_data', 'zero_metadata'],
+        watermark: '183',
+      },
+      shard,
+      true,
+    );
+
+    // Insert some data so the changeLog table has rows to read.
+    await sql`
+      INSERT INTO "rezo_8/cdc"."changeLog" (watermark, pos, change)
+        VALUES ('184', 0, '{"tag":"begin"}'::json),
+               ('184', 1, '{"tag":"commit"}'::json),
+               ('185', 0, '{"tag":"begin"}'::json),
+               ('185', 1, '{"tag":"commit"}'::json)
+    `.simple();
+
+    // Create multiple secondary connections that simulate the old storer's
+    // catchup cursor reads. These hold read locks on the changeLog table.
+    const {host, port, user: username, pass, database} = sql.options;
+    const NUM_BLOCKERS = 3;
+    const blockerConns: postgres.Sql[] = [];
+    const blockerTxDone: Promise<void>[] = [];
+    const readyPromises: Promise<void>[] = [];
+
+    for (let i = 0; i < NUM_BLOCKERS; i++) {
+      const conn = postgres({
+        host: host[0],
+        port: port[0],
+        username,
+        password: pass ?? undefined,
+        database,
+        connection: {['application_name']: CHANGE_STREAMER_APP_NAME},
+      });
+      blockerConns.push(conn);
+
+      const {promise: ready, resolve: resolveReady} = resolver<void>();
+      readyPromises.push(ready);
+
+      // Start a long-running read transaction. The SELECT holds a
+      // lock that conflicts with TRUNCATE's ACCESS EXCLUSIVE lock.
+      const txDone = conn.begin(async tx => {
+        await tx`SELECT * FROM "rezo_8/cdc"."changeLog"`;
+        resolveReady();
+        // Keep the transaction open until terminated.
+        await new Promise<void>(() => {});
+      });
+      txDone.catch(() => {}); // Prevent unhandled rejection.
+      blockerTxDone.push(txDone);
+    }
+
+    // Wait for all blockers to have acquired their read locks.
+    await Promise.all(readyPromises);
+
+    // Wrap setTimeout to capture the scheduled delay and fire quickly (10ms).
+    let scheduledMs: number | undefined;
+    const shortSetTimeout = ((fn: () => void, ms: number) => {
+      scheduledMs = ms;
+      return setTimeout(fn, 10);
+    }) as typeof setTimeout;
+
+    // The connection doing the TRUNCATE needs application_name =
+    // CHANGE_STREAMER_APP_NAME to match the terminateChangeDBLockHolders query.
+    const truncateConn = postgres({
+      host: host[0],
+      port: port[0],
+      username,
+      password: pass ?? undefined,
+      database,
+      connection: {['application_name']: CHANGE_STREAMER_APP_NAME},
+    }) as unknown as PostgresDB;
+
+    try {
+      // ensureReplicationConfig will TRUNCATE (different replicaVersion),
+      // block on the read locks, then the short timer fires and terminates
+      // the blocking backends, allowing the TRUNCATE to proceed.
+      await ensureReplicationConfig(
+        lc,
+        truncateConn,
+        {
+          replicaVersion: '1g8',
+          publications: ['zero_data', 'zero_metadata'],
+          watermark: '1g8',
+        },
+        shard,
+        true,
+        shortSetTimeout,
+      );
+
+      // Verify the timer was scheduled for the production timeout.
+      expect(scheduledMs).toBe(5_000);
+
+      // Verify the tables were properly re-initialized.
+      await expectTables(sql, {
+        ['rezo_8/cdc.changeLog']: [
+          {watermark: '1g8', pos: 0n, change: {tag: 'begin'}, precommit: null},
+          {watermark: '1g8', pos: 1n, change: {tag: 'commit'}, precommit: null},
+        ],
+        ['rezo_8/cdc.replicationConfig']: [
+          {
+            replicaVersion: '1g8',
+            publications: ['zero_data', 'zero_metadata'],
+            resetRequired: null,
+            lock: 1,
+          },
+        ],
+      });
+    } finally {
+      // Verify all blocker transactions were terminated.
+      const results = await Promise.allSettled(blockerTxDone);
+      for (const result of results) {
+        expect(result.status).toBe('rejected');
+      }
+      expect(results).toHaveLength(NUM_BLOCKERS);
+
+      // Clean up all connections.
+      await Promise.all(blockerConns.map(c => c.end()));
+      await (truncateConn as unknown as postgres.Sql).end();
+    }
   });
 });

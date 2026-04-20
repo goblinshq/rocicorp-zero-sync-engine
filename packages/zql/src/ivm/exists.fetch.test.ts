@@ -1,22 +1,23 @@
 import {expect, suite, test, vi} from 'vitest';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {unreachable} from '../../../shared/src/asserts.ts';
 import type {JSONValue} from '../../../shared/src/json.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {CompoundKey, Ordering} from '../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../zero-protocol/src/primary-key.ts';
 import type {SchemaValue} from '../../../zero-schema/src/table-schema.ts';
+import type {BuilderDelegate} from '../builder/builder.ts';
 import {Catch, type CaughtNode} from './catch.ts';
 import {Exists} from './exists.ts';
+import {buildFilterPipeline, type FilterInput} from './filter-operators.ts';
 import {Join} from './join.ts';
 import {MemoryStorage} from './memory-storage.ts';
 import {Snitch, type SnitchMessage} from './snitch.ts';
-import {createSource} from './test/source-factory.ts';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
-import {buildFilterPipeline, type FilterInput} from './filter-operators.ts';
 import {consume} from './stream.ts';
-import type {BuilderDelegate} from '../builder/builder.ts';
+import {createSource} from './test/source-factory.ts';
 
+import {makeSourceChangeAdd} from './source.ts';
 const base = {
   columns: [
     {id: {type: 'string'}},
@@ -335,6 +336,15 @@ suite('EXISTS', () => {
             "fetch",
             {
               "constraint": {
+                "issueID": "i1",
+              },
+            },
+          ],
+          [
+            "1",
+            "fetch",
+            {
+              "constraint": {
                 "issueID": "i2",
               },
             },
@@ -345,15 +355,6 @@ suite('EXISTS', () => {
             {
               "constraint": {
                 "issueID": "i3",
-              },
-            },
-          ],
-          [
-            "1",
-            "fetch",
-            {
-              "constraint": {
-                "issueID": "i1",
               },
             },
           ],
@@ -387,6 +388,15 @@ suite('EXISTS', () => {
             "fetch",
             {
               "constraint": {
+                "issueID": "i1",
+              },
+            },
+          ],
+          [
+            "1",
+            "fetch",
+            {
+              "constraint": {
                 "issueID": "i2",
               },
             },
@@ -397,15 +407,6 @@ suite('EXISTS', () => {
             {
               "constraint": {
                 "issueID": "i3",
-              },
-            },
-          ],
-          [
-            "1",
-            "fetch",
-            {
-              "constraint": {
-                "issueID": "i1",
               },
             },
           ],
@@ -510,6 +511,51 @@ suite('EXISTS', () => {
             "fetch",
             {
               "constraint": {
+                "id": "i1",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i1",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i3",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i3",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i3",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
                 "id": "i3",
               },
             },
@@ -520,51 +566,6 @@ suite('EXISTS', () => {
             {
               "constraint": {
                 "id": "i4",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i1",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i1",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i3",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i3",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i3",
               },
             },
           ],
@@ -589,6 +590,51 @@ suite('EXISTS', () => {
             "fetch",
             {
               "constraint": {
+                "id": "i1",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i1",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i3",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i3",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
+                "id": "i3",
+              },
+            },
+          ],
+          [
+            "0",
+            "fetch",
+            {
+              "constraint": {
                 "id": "i3",
               },
             },
@@ -599,51 +645,6 @@ suite('EXISTS', () => {
             {
               "constraint": {
                 "id": "i4",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i1",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i1",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i3",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i3",
-              },
-            },
-          ],
-          [
-            "0",
-            "fetch",
-            {
-              "constraint": {
-                "id": "i3",
               },
             },
           ],
@@ -1095,7 +1096,7 @@ suite('NOT EXISTS', () => {
             "fetch",
             {
               "constraint": {
-                "issueID": "i3",
+                "issueID": "i2",
               },
             },
           ],
@@ -1104,7 +1105,7 @@ suite('NOT EXISTS', () => {
             "fetch",
             {
               "constraint": {
-                "issueID": "i2",
+                "issueID": "i3",
               },
             },
           ],
@@ -1138,7 +1139,7 @@ suite('NOT EXISTS', () => {
             "fetch",
             {
               "constraint": {
-                "issueID": "i3",
+                "issueID": "i2",
               },
             },
           ],
@@ -1147,7 +1148,7 @@ suite('NOT EXISTS', () => {
             "fetch",
             {
               "constraint": {
-                "issueID": "i2",
+                "issueID": "i3",
               },
             },
           ],
@@ -1345,24 +1346,6 @@ suite('NOT EXISTS', () => {
             "fetch",
             {
               "constraint": {
-                "issueID": "i2",
-              },
-            },
-          ],
-          [
-            "1",
-            "fetch",
-            {
-              "constraint": {
-                "issueID": "i3",
-              },
-            },
-          ],
-          [
-            "1",
-            "fetch",
-            {
-              "constraint": {
                 "issueID": "i1",
               },
             },
@@ -1373,6 +1356,24 @@ suite('NOT EXISTS', () => {
             {
               "constraint": {
                 "issueID": "i2",
+              },
+            },
+          ],
+          [
+            "1",
+            "fetch",
+            {
+              "constraint": {
+                "issueID": "i2",
+              },
+            },
+          ],
+          [
+            "1",
+            "fetch",
+            {
+              "constraint": {
+                "issueID": "i3",
               },
             },
           ],
@@ -1406,24 +1407,6 @@ suite('NOT EXISTS', () => {
             "fetch",
             {
               "constraint": {
-                "issueID": "i2",
-              },
-            },
-          ],
-          [
-            "1",
-            "fetch",
-            {
-              "constraint": {
-                "issueID": "i3",
-              },
-            },
-          ],
-          [
-            "1",
-            "fetch",
-            {
-              "constraint": {
                 "issueID": "i1",
               },
             },
@@ -1434,6 +1417,24 @@ suite('NOT EXISTS', () => {
             {
               "constraint": {
                 "issueID": "i2",
+              },
+            },
+          ],
+          [
+            "1",
+            "fetch",
+            {
+              "constraint": {
+                "issueID": "i2",
+              },
+            },
+          ],
+          [
+            "1",
+            "fetch",
+            {
+              "constraint": {
+                "issueID": "i3",
               },
             },
           ],
@@ -1564,7 +1565,7 @@ function fetchTest(t: FetchTest, reverse: boolean = false): FetchTestResults {
       t.primaryKeys[i],
     );
     for (const row of rows) {
-      consume(source.push({type: 'add', row}));
+      consume(source.push(makeSourceChangeAdd(row)));
     }
     const snitch = new Snitch(source.connect(ordering), String(i), log);
     return {

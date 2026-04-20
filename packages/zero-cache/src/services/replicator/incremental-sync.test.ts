@@ -10,11 +10,12 @@ import {
   type MockedFunction,
 } from 'vitest';
 import type {JSONObject} from '../../../../shared/src/bigint-json.ts';
+import type {Enum} from '../../../../shared/src/enum.ts';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import type {ZeroEvent} from '../../../../zero-events/src/index.ts';
-import {Database} from '../../../../zqlite/src/db.ts';
+import type {Database} from '../../../../zqlite/src/db.ts';
 import {initEventSinkForTesting} from '../../observability/events.ts';
-import {expectTables, initDB} from '../../test/lite.ts';
+import {DbFile, expectTables, initDB} from '../../test/lite.ts';
 import {Subscription} from '../../types/subscription.ts';
 import {orTimeoutWith} from '../../types/timeout.ts';
 import {
@@ -22,26 +23,41 @@ import {
   type Downstream,
   type SubscriberContext,
 } from '../change-streamer/change-streamer.ts';
+import * as ErrorType from '../change-streamer/error-type-enum.ts';
 import {IncrementalSyncer} from './incremental-sync.ts';
-import {initReplicationState} from './schema/replication-state.ts';
+import {ReplicationStatusPublisher} from './replication-status.ts';
+import {
+  createReplicationStateTables,
+  initReplicationState,
+} from './schema/replication-state.ts';
 import {ReplicationMessages} from './test-utils.ts';
+import {ThreadWriteWorkerClient} from './write-worker-client.ts';
+
+type ErrorType = Enum<typeof ErrorType>;
 
 const TASK_ID = 'task-id';
 const REPLICA_ID = 'incremental_sync_test_id';
 
 describe('replicator/incremental-sync', () => {
   let lc: LogContext;
-  let replica: Database;
+  let dbFile: DbFile;
+  let mainDb: Database;
+  let worker: ThreadWriteWorkerClient;
   let syncer: IncrementalSyncer;
+  let syncing: Promise<void> | undefined;
   let downstream: Subscription<Downstream>;
   let eventSink: ZeroEvent[];
   let subscribeFn: MockedFunction<
     (ctx: SubscriberContext) => Promise<Subscription<Downstream>>
   >;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     lc = createSilentLogContext();
-    replica = new Database(lc, ':memory:');
+    dbFile = new DbFile('incremental-sync-test');
+    mainDb = dbFile.connect(lc);
+    mainDb.pragma('journal_mode = wal');
+    createReplicationStateTables(mainDb);
+
     downstream = Subscription.create();
     eventSink = [];
     initEventSinkForTesting(
@@ -49,27 +65,45 @@ describe('replicator/incremental-sync', () => {
       new Date(Date.UTC(2025, 7, 14, 1, 2, 3)),
     );
     subscribeFn = vi.fn();
+    worker = new ThreadWriteWorkerClient();
+    await worker.init(
+      dbFile.path,
+      'serving',
+      {
+        busyTimeout: 30000,
+        analysisLimit: 1000,
+      },
+      {level: 'error', format: 'text'},
+    );
     syncer = new IncrementalSyncer(
+      lc,
       TASK_ID,
       REPLICA_ID,
       {subscribe: subscribeFn.mockResolvedValue(downstream)},
-      replica,
+      worker,
       'serving',
-      true,
+      ReplicationStatusPublisher.forReplicaFile(dbFile.path),
     );
   });
 
-  afterEach(() => {
-    syncer.stop(lc);
+  afterEach(async () => {
+    downstream?.cancel();
+    syncer?.stop(lc);
+    // Wait for the run loop to finish so any in-flight worker call
+    // completes before we send 'stop' to the worker.
+    await syncing?.catch(() => {});
+    await worker?.stop();
+    mainDb?.close();
+    dbFile?.delete();
   });
 
   test('replicates transactions', async () => {
     const issues = new ReplicationMessages({issues: ['issueID', 'bool']});
 
-    initReplicationState(replica, ['zero_data'], '02');
+    initReplicationState(mainDb, ['zero_data'], '02', {}, false);
 
     initDB(
-      replica,
+      mainDb,
       `
     CREATE TABLE issues(
       issueID INTEGER,
@@ -88,10 +122,11 @@ describe('replicator/incremental-sync', () => {
       `,
     );
 
-    const syncing = syncer.run(lc);
+    syncing = syncer.run();
     const notifications = syncer.subscribe();
     const versionReady = notifications[Symbol.asyncIterator]();
     await versionReady.next(); // Get the initial nextStateVersion.
+    await vi.waitFor(() => expect(subscribeFn).toHaveBeenCalled());
     expect(subscribeFn.mock.calls[0][0]).toEqual({
       protocolVersion: PROTOCOL_VERSION,
       taskID: 'task-id',
@@ -137,9 +172,9 @@ describe('replicator/incremental-sync', () => {
     }
 
     expectTables(
-      replica,
+      mainDb,
       {
-        issues: [
+        'issues': [
           {
             issueID: 123n,
             big: null,
@@ -350,10 +385,10 @@ describe('replicator/incremental-sync', () => {
   test('replicates schema changes', async () => {
     const issues = new ReplicationMessages({issues: ['issueID', 'bool']});
 
-    initReplicationState(replica, ['zero_data'], '09');
+    initReplicationState(mainDb, ['zero_data'], '09', {}, false);
 
     initDB(
-      replica,
+      mainDb,
       `
     CREATE TABLE issues(
       issueID INTEGER,
@@ -365,10 +400,11 @@ describe('replicator/incremental-sync', () => {
       `,
     );
 
-    const syncing = syncer.run(lc);
+    syncing = syncer.run();
     const notifications = syncer.subscribe();
     const versionReady = notifications[Symbol.asyncIterator]();
     await versionReady.next(); // Get the initial nextStateVersion.
+    await vi.waitFor(() => expect(subscribeFn).toHaveBeenCalled());
     expect(subscribeFn.mock.calls[0][0]).toEqual({
       protocolVersion: PROTOCOL_VERSION,
       taskID: 'task-id',
@@ -524,10 +560,10 @@ describe('replicator/incremental-sync', () => {
   test('does not notify on incomplete backfills', async () => {
     const issues = new ReplicationMessages({issues: ['issueID']});
 
-    initReplicationState(replica, ['zero_data'], '09');
+    initReplicationState(mainDb, ['zero_data'], '09', {}, false);
 
     initDB(
-      replica,
+      mainDb,
       /*sql*/ `
     CREATE TABLE issues(
       issueID INTEGER PRIMARY KEY,
@@ -541,10 +577,11 @@ describe('replicator/incremental-sync', () => {
       `,
     );
 
-    void syncer.run(lc);
+    syncing = syncer.run();
     const notifications = syncer.subscribe();
     const versionReady = notifications[Symbol.asyncIterator]();
     await versionReady.next(); // Get the initial nextStateVersion.
+    await vi.waitFor(() => expect(subscribeFn).toHaveBeenCalled());
     expect(subscribeFn.mock.calls[0][0]).toEqual({
       protocolVersion: PROTOCOL_VERSION,
       taskID: 'task-id',
@@ -594,7 +631,7 @@ describe('replicator/incremental-sync', () => {
     await noNotification(next);
 
     // And that row versions have not changed, even for backfilled rows.
-    const issuesDump = replica.prepare(/*sql*/ `SELECT * FROM issues`);
+    const issuesDump = mainDb.prepare(/*sql*/ `SELECT * FROM issues`);
     expect(issuesDump.all()).toEqual([
       {
         _0_version: '100',
@@ -652,7 +689,7 @@ describe('replicator/incremental-sync', () => {
 
     // The row version in the table metadata should be bumped.
     expect(
-      replica.prepare(/*sql*/ `SELECT * FROM "_zero.tableMetadata"`).get(),
+      mainDb.prepare(/*sql*/ `SELECT * FROM "_zero.tableMetadata"`).get(),
     ).toMatchObject({
       minRowVersion: '110.02',
       schema: 'public',
@@ -676,10 +713,11 @@ describe('replicator/incremental-sync', () => {
   });
 
   test('retry on initial change-streamer connection failure', async () => {
-    initReplicationState(replica, ['zero_data'], '02');
+    initReplicationState(mainDb, ['zero_data'], '02', {}, false);
 
     const {promise: hasRetried, resolve: retried} = resolver<true>();
     const syncer = new IncrementalSyncer(
+      lc,
       TASK_ID,
       REPLICA_ID,
       {
@@ -691,23 +729,25 @@ describe('replicator/incremental-sync', () => {
             return resolver().promise;
           }),
       },
-      replica,
+      worker,
       'serving',
-      true,
+      ReplicationStatusPublisher.forReplicaFile(dbFile.path),
     );
 
-    void syncer.run(lc);
+    const localSyncing = syncer.run();
 
     expect(await hasRetried).toBe(true);
 
-    void syncer.stop(lc);
+    syncer.stop(lc);
+    void localSyncing.catch(() => {});
   });
 
   test('retry on error in change-stream', async () => {
-    initReplicationState(replica, ['zero_data'], '02');
+    initReplicationState(mainDb, ['zero_data'], '02', {}, false);
 
     const {promise: hasRetried, resolve: retried} = resolver<true>();
     const syncer = new IncrementalSyncer(
+      lc,
       TASK_ID,
       REPLICA_ID,
       {
@@ -719,17 +759,32 @@ describe('replicator/incremental-sync', () => {
             return resolver().promise;
           }),
       },
-      replica,
+      worker,
       'serving',
-      true,
+      ReplicationStatusPublisher.forReplicaFile(dbFile.path),
     );
 
-    void syncer.run(lc);
+    const localSyncing = syncer.run();
 
     downstream.fail(new Error('doh'));
 
     expect(await hasRetried).toBe(true);
 
-    void syncer.stop(lc);
+    syncer.stop(lc);
+    void localSyncing.catch(() => {});
+  });
+
+  test('shut down on change-streamer error message', async () => {
+    initReplicationState(mainDb, ['zero_data'], '02', {}, false);
+
+    const syncing = syncer.run();
+
+    downstream.push([
+      'error',
+      {type: ErrorType.WrongReplicaVersion, message: 'restart yo'},
+    ]);
+
+    // Should stop / resolve
+    await syncing;
   });
 });

@@ -1,13 +1,17 @@
 import {beforeEach, expect, test, vi} from 'vitest';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
 import {CREATE_TABLE_METADATA_TABLE} from '../../zero-cache/src/services/replicator/schema/table-metadata.ts';
+import {
+  runAst,
+  type RunAstOptions,
+} from '../../zero-cache/src/services/run-ast.ts';
 import {hydrate} from '../../zero-cache/src/services/view-syncer/pipeline-driver.ts';
 import type {AST} from '../../zero-protocol/src/ast.ts';
 import type {ClientSchema} from '../../zero-protocol/src/client-schema.ts';
 import type {BuilderDelegate} from '../../zql/src/builder/builder.ts';
 import {Debug} from '../../zql/src/builder/debug-delegate.ts';
+import {ChangeType} from '../../zql/src/ivm/change-type.ts';
 import {Database} from '../../zqlite/src/db.ts';
-import {runAst, type RunAstOptions} from './run-ast.ts';
 
 const minimalClientSchema: ClientSchema = {tables: {}};
 
@@ -90,10 +94,13 @@ test('runAst always returns vendedRowCounts regardless of vendedRows option', as
     ast,
     isTransformed,
     options1,
+    async () => {},
   );
   expect(result1).toMatchInlineSnapshot(`
     {
       "afterPermissions": undefined,
+      "dbScansByQuery": {},
+      "elapsed": 13,
       "end": 1017,
       "readRowCount": 2,
       "readRowCountsByQuery": {
@@ -123,10 +130,13 @@ test('runAst always returns vendedRowCounts regardless of vendedRows option', as
     ast,
     isTransformed,
     options2,
+    async () => {},
   );
   expect(result2).toMatchInlineSnapshot(`
     {
       "afterPermissions": undefined,
+      "dbScansByQuery": {},
+      "elapsed": 13,
       "end": 1031,
       "readRowCount": 2,
       "readRowCountsByQuery": {
@@ -169,10 +179,13 @@ test('runAst always returns vendedRowCounts regardless of vendedRows option', as
     ast,
     isTransformed,
     options3,
+    async () => {},
   );
   expect(result3).toMatchInlineSnapshot(`
     {
       "afterPermissions": undefined,
+      "dbScansByQuery": {},
+      "elapsed": 13,
       "end": 1045,
       "readRowCount": 2,
       "readRowCountsByQuery": {
@@ -212,11 +225,14 @@ test('runAst returns empty object for vendedRowCounts when no debug tracking', a
     ast,
     isTransformed,
     options,
+    async () => {},
   );
 
   expect(result).toMatchInlineSnapshot(`
     {
       "afterPermissions": undefined,
+      "dbScansByQuery": {},
+      "elapsed": 13,
       "end": 1017,
       "readRowCount": 0,
       "readRowCountsByQuery": {},
@@ -252,11 +268,14 @@ test('runAst basic structure and functionality', async () => {
     ast,
     isTransformed,
     options,
+    async () => {},
   );
 
   expect(result).toMatchInlineSnapshot(`
     {
       "afterPermissions": undefined,
+      "dbScansByQuery": {},
+      "elapsed": 13,
       "end": 1017,
       "readRowCount": 2,
       "readRowCountsByQuery": {
@@ -278,7 +297,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
   vi.mocked(hydrate).mockImplementation(function* () {
     // First unique row from users table
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -287,7 +306,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
 
     // Second unique row from users table
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 2},
@@ -296,7 +315,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
 
     // Duplicate of first row (same table + row content)
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -305,7 +324,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
 
     // Unique row from different table
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'posts',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -314,7 +333,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
 
     // Duplicate of the posts row
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'posts',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -323,7 +342,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
 
     // Another unique row from users (different content)
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 3},
@@ -353,6 +372,7 @@ test('runAst counts only unique synced rows, skips duplicates', async () => {
     ast,
     isTransformed,
     options,
+    async () => {},
   );
 
   // Should count only 4 unique rows: 3 from users table, 1 from posts table
@@ -377,7 +397,7 @@ test('runAst handles case where all synced rows are duplicates', async () => {
 
     // Same row yielded multiple times
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -385,7 +405,7 @@ test('runAst handles case where all synced rows are duplicates', async () => {
     };
 
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -393,7 +413,7 @@ test('runAst handles case where all synced rows are duplicates', async () => {
     };
 
     yield {
-      type: 'add',
+      type: ChangeType.ADD,
       table: 'users',
       queryID: 'test-query-id',
       rowKey: {id: 1},
@@ -423,6 +443,7 @@ test('runAst handles case where all synced rows are duplicates', async () => {
     ast,
     isTransformed,
     options,
+    async () => {},
   );
 
   // Should count only 1 unique row despite 3 identical rows being yielded

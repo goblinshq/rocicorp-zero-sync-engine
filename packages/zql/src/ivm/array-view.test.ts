@@ -11,14 +11,25 @@ import {TestBuilderDelegate} from '../builder/test-builder-delegate.ts';
 import type {ResultType} from '../query/typed-view.ts';
 import {ArrayView} from './array-view.ts';
 import type {Change} from './change.ts';
+import {
+  makeAddChange,
+  makeChildChange,
+  makeEditChange,
+  makeRemoveChange,
+} from './change.ts';
 import {Join} from './join.ts';
 import {MemoryStorage} from './memory-storage.ts';
 import type {Input} from './operator.ts';
 import type {SourceSchema} from './schema.ts';
+import {
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from './source.ts';
+import {consume} from './stream.ts';
 import {Take} from './take.ts';
 import {createSource} from './test/source-factory.ts';
 import {refCountSymbol} from './view-apply-change.ts';
-import {consume} from './stream.ts';
 
 const lc = createSilentLogContext();
 
@@ -30,8 +41,8 @@ test('basics', () => {
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
-  consume(ms.push({row: {a: 2, b: 'b'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
+  consume(ms.push(makeSourceChangeAdd({a: 2, b: 'b'})));
 
   const view = new ArrayView(
     ms.connect([
@@ -67,7 +78,7 @@ test('basics', () => {
 
   expect(callCount).toBe(1);
 
-  consume(ms.push({row: {a: 3, b: 'c'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 3, b: 'c'})));
 
   // We don't get called until flush.
   expect(callCount).toBe(1);
@@ -92,9 +103,9 @@ test('basics', () => {
     },
   ]);
 
-  consume(ms.push({row: {a: 2, b: 'b'}, type: 'remove'}));
+  consume(ms.push(makeSourceChangeRemove({a: 2, b: 'b'})));
   expect(callCount).toBe(2);
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'remove'}));
+  consume(ms.push(makeSourceChangeRemove({a: 1, b: 'a'})));
   expect(callCount).toBe(2);
 
   view.flush();
@@ -108,7 +119,7 @@ test('basics', () => {
   ]);
 
   unlisten();
-  consume(ms.push({row: {a: 3, b: 'c'}, type: 'remove'}));
+  consume(ms.push(makeSourceChangeRemove({a: 3, b: 'c'})));
   expect(callCount).toBe(3);
 
   view.flush();
@@ -132,7 +143,7 @@ test('single-format', () => {
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
 
   const view = new ArrayView(
     ms.connect([
@@ -156,14 +167,14 @@ test('single-format', () => {
 
   // trying to add another element should be an error
   // pipeline should have been configured with a limit of one
-  expect(() => consume(ms.push({row: {a: 2, b: 'b'}, type: 'add'}))).toThrow(
+  expect(() => consume(ms.push(makeSourceChangeAdd({a: 2, b: 'b'})))).toThrow(
     "Singular relationship '' should not have multiple rows. You may need to declare this relationship with the `many` helper instead of the `one` helper in your schema.",
   );
 
   // Adding the same element is not an error in the ArrayView but it is an error
   // in the Source. This case is tested in view-apply-change.ts.
 
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'remove'}));
+  consume(ms.push(makeSourceChangeRemove({a: 1, b: 'a'})));
 
   // no call until flush
   expect(data).toEqual({a: 1, b: 'a'});
@@ -215,30 +226,10 @@ test('tree', () => {
     {id: {type: 'number'}, name: {type: 'string'}, childID: {type: 'number'}},
     ['id'],
   );
-  consume(
-    ms.push({
-      type: 'add',
-      row: {id: 1, name: 'foo', childID: 2},
-    }),
-  );
-  consume(
-    ms.push({
-      type: 'add',
-      row: {id: 2, name: 'foobar', childID: null},
-    }),
-  );
-  consume(
-    ms.push({
-      type: 'add',
-      row: {id: 3, name: 'mon', childID: 4},
-    }),
-  );
-  consume(
-    ms.push({
-      type: 'add',
-      row: {id: 4, name: 'monkey', childID: null},
-    }),
-  );
+  consume(ms.push(makeSourceChangeAdd({id: 1, name: 'foo', childID: 2})));
+  consume(ms.push(makeSourceChangeAdd({id: 2, name: 'foobar', childID: null})));
+  consume(ms.push(makeSourceChangeAdd({id: 3, name: 'mon', childID: 4})));
+  consume(ms.push(makeSourceChangeAdd({id: 4, name: 'monkey', childID: null})));
 
   const join = new Join({
     parent: ms.connect([
@@ -319,7 +310,7 @@ test('tree', () => {
   `);
 
   // add parent with child
-  consume(ms.push({type: 'add', row: {id: 5, name: 'chocolate', childID: 2}}));
+  consume(ms.push(makeSourceChangeAdd({id: 5, name: 'chocolate', childID: 2})));
   view.flush();
   expect(data).toMatchInlineSnapshot(`
     [
@@ -384,7 +375,7 @@ test('tree', () => {
 
   // remove parent with child
   consume(
-    ms.push({type: 'remove', row: {id: 5, name: 'chocolate', childID: 2}}),
+    ms.push(makeSourceChangeRemove({id: 5, name: 'chocolate', childID: 2})),
   );
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -436,14 +427,13 @@ test('tree', () => {
 
   // remove just child
   consume(
-    ms.push({
-      type: 'remove',
-      row: {
+    ms.push(
+      makeSourceChangeRemove({
         id: 2,
         name: 'foobar',
         childID: null,
-      },
-    }),
+      }),
+    ),
   );
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -481,14 +471,13 @@ test('tree', () => {
 
   // add child
   consume(
-    ms.push({
-      type: 'add',
-      row: {
+    ms.push(
+      makeSourceChangeAdd({
         id: 2,
         name: 'foobaz',
         childID: null,
-      },
-    }),
+      }),
+    ),
   );
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -547,18 +536,8 @@ test('tree-single', () => {
     {id: {type: 'number'}, name: {type: 'string'}, childID: {type: 'number'}},
     ['id'],
   );
-  consume(
-    ms.push({
-      type: 'add',
-      row: {id: 1, name: 'foo', childID: 2},
-    }),
-  );
-  consume(
-    ms.push({
-      type: 'add',
-      row: {id: 2, name: 'foobar', childID: null},
-    }),
-  );
+  consume(ms.push(makeSourceChangeAdd({id: 1, name: 'foo', childID: 2})));
+  consume(ms.push(makeSourceChangeAdd({id: 2, name: 'foobar', childID: null})));
 
   const take = new Take(
     ms.connect([
@@ -609,10 +588,7 @@ test('tree-single', () => {
 
   // remove the child
   consume(
-    ms.push({
-      type: 'remove',
-      row: {id: 2, name: 'foobar', childID: null},
-    }),
+    ms.push(makeSourceChangeRemove({id: 2, name: 'foobar', childID: null})),
   );
   view.flush();
 
@@ -624,12 +600,7 @@ test('tree-single', () => {
   });
 
   // remove the parent
-  consume(
-    ms.push({
-      type: 'remove',
-      row: {id: 1, name: 'foo', childID: 2},
-    }),
-  );
+  consume(ms.push(makeSourceChangeRemove({id: 1, name: 'foo', childID: 2})));
   view.flush();
   expect(data).toEqual(undefined);
 });
@@ -736,12 +707,7 @@ test('collapse', () => {
       },
     },
   } as const;
-  consume(
-    view.push({
-      type: 'add',
-      ...changeSansType,
-    }),
-  );
+  consume(view.push(makeAddChange(changeSansType.node)));
   view.flush();
 
   expect(data).toMatchInlineSnapshot(`
@@ -761,81 +727,69 @@ test('collapse', () => {
     ]
   `);
 
-  consume(
-    view.push({
-      type: 'remove',
-      ...changeSansType,
-    }),
-  );
+  consume(view.push(makeRemoveChange(changeSansType.node)));
   view.flush();
 
   expect(data).toMatchInlineSnapshot(`[]`);
 
-  consume(
-    view.push({
-      type: 'add',
-      ...changeSansType,
-    }),
-  );
+  consume(view.push(makeAddChange(changeSansType.node)));
   // no commit
   expect(data).toMatchInlineSnapshot(`[]`);
 
   consume(
-    view.push({
-      type: 'child',
-      node: {
-        row: {
-          id: 1,
-          name: 'issue',
-        },
-        relationships: {
-          labels: () => [
-            {
-              row: {
-                id: 1,
-                issueId: 1,
-                labelId: 1,
-                extra: 'a',
-              },
-              relationships: {
-                labels: () => [
-                  {
-                    row: {
-                      id: 1,
-                      name: 'label',
+    view.push(
+      makeChildChange(
+        {
+          row: {
+            id: 1,
+            name: 'issue',
+          },
+          relationships: {
+            labels: () => [
+              {
+                row: {
+                  id: 1,
+                  issueId: 1,
+                  labelId: 1,
+                  extra: 'a',
+                },
+                relationships: {
+                  labels: () => [
+                    {
+                      row: {
+                        id: 1,
+                        name: 'label',
+                      },
+                      relationships: {},
                     },
-                    relationships: {},
-                  },
-                ],
+                  ],
+                },
               },
-            },
-            {
-              row: {
-                id: 2,
-                issueId: 1,
-                labelId: 2,
-                extra: 'b',
-              },
-              relationships: {
-                labels: () => [
-                  {
-                    row: {
-                      id: 2,
-                      name: 'label2',
+              {
+                row: {
+                  id: 2,
+                  issueId: 1,
+                  labelId: 2,
+                  extra: 'b',
+                },
+                relationships: {
+                  labels: () => [
+                    {
+                      row: {
+                        id: 2,
+                        name: 'label2',
+                      },
+                      relationships: {},
                     },
-                    relationships: {},
-                  },
-                ],
+                  ],
+                },
               },
-            },
-          ],
+            ],
+          },
         },
-      },
-      child: {
-        relationshipName: 'labels',
-        change: {
-          type: 'add',
-          node: {
+        {
+          relationshipName: 'labels',
+          change: makeAddChange({
             row: {
               id: 2,
               issueId: 1,
@@ -853,10 +807,10 @@ test('collapse', () => {
                 },
               ],
             },
-          },
+          }),
         },
-      },
-    }),
+      ),
+    ),
   );
   view.flush();
 
@@ -884,34 +838,59 @@ test('collapse', () => {
 
   // edit the hidden row
   consume(
-    view.push({
-      type: 'child',
-      node: {
-        row: {
-          id: 1,
-          name: 'issue',
-        },
-        relationships: {
-          labels: () => [
-            {
-              row: {
-                id: 1,
-                issueId: 1,
-                labelId: 1,
-                extra: 'a',
-              },
-              relationships: {
-                labels: () => [
-                  {
-                    row: {
-                      id: 1,
-                      name: 'label',
+    view.push(
+      makeChildChange(
+        {
+          row: {
+            id: 1,
+            name: 'issue',
+          },
+          relationships: {
+            labels: () => [
+              {
+                row: {
+                  id: 1,
+                  issueId: 1,
+                  labelId: 1,
+                  extra: 'a',
+                },
+                relationships: {
+                  labels: () => [
+                    {
+                      row: {
+                        id: 1,
+                        name: 'label',
+                      },
+                      relationships: {},
                     },
-                    relationships: {},
-                  },
-                ],
+                  ],
+                },
               },
-            },
+              {
+                row: {
+                  id: 2,
+                  issueId: 1,
+                  labelId: 2,
+                  extra: 'b2',
+                },
+                relationships: {
+                  labels: () => [
+                    {
+                      row: {
+                        id: 2,
+                        name: 'label2',
+                      },
+                      relationships: {},
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        {
+          relationshipName: 'labels',
+          change: makeEditChange(
             {
               row: {
                 id: 2,
@@ -931,54 +910,29 @@ test('collapse', () => {
                 ],
               },
             },
-          ],
-        },
-      },
-      child: {
-        relationshipName: 'labels',
-        change: {
-          type: 'edit',
-          oldNode: {
-            row: {
-              id: 2,
-              issueId: 1,
-              labelId: 2,
-              extra: 'b',
-            },
-            relationships: {
-              labels: () => [
-                {
-                  row: {
-                    id: 2,
-                    name: 'label2',
+            {
+              row: {
+                id: 2,
+                issueId: 1,
+                labelId: 2,
+                extra: 'b',
+              },
+              relationships: {
+                labels: () => [
+                  {
+                    row: {
+                      id: 2,
+                      name: 'label2',
+                    },
+                    relationships: {},
                   },
-                  relationships: {},
-                },
-              ],
+                ],
+              },
             },
-          },
-          node: {
-            row: {
-              id: 2,
-              issueId: 1,
-              labelId: 2,
-              extra: 'b2',
-            },
-            relationships: {
-              labels: () => [
-                {
-                  row: {
-                    id: 2,
-                    name: 'label2',
-                  },
-                  relationships: {},
-                },
-              ],
-            },
-          },
+          ),
         },
-      },
-    }),
+      ),
+    ),
   );
   view.flush();
 
@@ -1006,34 +960,59 @@ test('collapse', () => {
 
   // edit the leaf
   consume(
-    view.push({
-      type: 'child',
-      node: {
-        row: {
-          id: 1,
-          name: 'issue',
-        },
-        relationships: {
-          labels: () => [
-            {
-              row: {
-                id: 1,
-                issueId: 1,
-                labelId: 1,
-                extra: 'a',
-              },
-              relationships: {
-                labels: () => [
-                  {
-                    row: {
-                      id: 1,
-                      name: 'label',
+    view.push(
+      makeChildChange(
+        {
+          row: {
+            id: 1,
+            name: 'issue',
+          },
+          relationships: {
+            labels: () => [
+              {
+                row: {
+                  id: 1,
+                  issueId: 1,
+                  labelId: 1,
+                  extra: 'a',
+                },
+                relationships: {
+                  labels: () => [
+                    {
+                      row: {
+                        id: 1,
+                        name: 'label',
+                      },
+                      relationships: {},
                     },
-                    relationships: {},
-                  },
-                ],
+                  ],
+                },
               },
-            },
+              {
+                row: {
+                  id: 2,
+                  issueId: 1,
+                  labelId: 2,
+                  extra: 'b2',
+                },
+                relationships: {
+                  labels: () => [
+                    {
+                      row: {
+                        id: 2,
+                        name: 'label2x',
+                      },
+                      relationships: {},
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        {
+          relationshipName: 'labels',
+          change: makeChildChange(
             {
               row: {
                 id: 2,
@@ -1053,22 +1032,9 @@ test('collapse', () => {
                 ],
               },
             },
-          ],
-        },
-      },
-      child: {
-        relationshipName: 'labels',
-        change: {
-          type: 'child',
-          node: {
-            row: {
-              id: 2,
-              issueId: 1,
-              labelId: 2,
-              extra: 'b2',
-            },
-            relationships: {
-              labels: () => [
+            {
+              relationshipName: 'labels',
+              change: makeEditChange(
                 {
                   row: {
                     id: 2,
@@ -1076,32 +1042,19 @@ test('collapse', () => {
                   },
                   relationships: {},
                 },
-              ],
-            },
-          },
-          child: {
-            relationshipName: 'labels',
-            change: {
-              type: 'edit',
-              oldNode: {
-                row: {
-                  id: 2,
-                  name: 'label2',
+                {
+                  row: {
+                    id: 2,
+                    name: 'label2',
+                  },
+                  relationships: {},
                 },
-                relationships: {},
-              },
-              node: {
-                row: {
-                  id: 2,
-                  name: 'label2x',
-                },
-                relationships: {},
-              },
+              ),
             },
-          },
+          ),
         },
-      },
-    }),
+      ),
+    ),
   );
   view.flush();
 
@@ -1230,12 +1183,7 @@ test('collapse-single', () => {
       },
     },
   } as const;
-  consume(
-    view.push({
-      type: 'add',
-      ...changeSansType,
-    }),
-  );
+  consume(view.push(makeAddChange(changeSansType.node)));
   view.flush();
 
   expect(data).toEqual([
@@ -1258,8 +1206,8 @@ test('basic with edit pushes', () => {
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
-  consume(ms.push({row: {a: 2, b: 'b'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
+  consume(ms.push(makeSourceChangeAdd({a: 2, b: 'b'})));
 
   const view = new ArrayView(
     ms.connect([['a', 'asc']]),
@@ -1293,9 +1241,7 @@ test('basic with edit pushes', () => {
 
   expect(callCount).toBe(1);
 
-  consume(
-    ms.push({type: 'edit', row: {a: 2, b: 'b2'}, oldRow: {a: 2, b: 'b'}}),
-  );
+  consume(ms.push(makeSourceChangeEdit({a: 2, b: 'b2'}, {a: 2, b: 'b'})));
 
   // We don't get called until flush.
   expect(callCount).toBe(1);
@@ -1317,9 +1263,7 @@ test('basic with edit pushes', () => {
     ]
   `);
 
-  consume(
-    ms.push({type: 'edit', row: {a: 3, b: 'b3'}, oldRow: {a: 2, b: 'b2'}}),
-  );
+  consume(ms.push(makeSourceChangeEdit({a: 3, b: 'b3'}, {a: 2, b: 'b2'})));
 
   view.flush();
   expect(callCount).toBe(3);
@@ -1360,7 +1304,7 @@ test('tree edit', () => {
     {id: 3, name: 'mon', data: 'c', childID: 4},
     {id: 4, name: 'monkey', data: 'd', childID: null},
   ] as const) {
-    consume(ms.push({type: 'add', row}));
+    consume(ms.push(makeSourceChangeAdd(row)));
   }
 
   const join = new Join({
@@ -1449,11 +1393,12 @@ test('tree edit', () => {
 
   // Edit root
   consume(
-    ms.push({
-      type: 'edit',
-      oldRow: {id: 1, name: 'foo', data: 'a', childID: 2},
-      row: {id: 1, name: 'foo', data: 'a2', childID: 2},
-    }),
+    ms.push(
+      makeSourceChangeEdit(
+        {id: 1, name: 'foo', data: 'a2', childID: 2},
+        {id: 1, name: 'foo', data: 'a', childID: 2},
+      ),
+    ),
   );
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -1523,7 +1468,7 @@ test('edit to change the order', () => {
     {a: 20, b: 'b'},
     {a: 30, b: 'c'},
   ] as const) {
-    consume(ms.push({row, type: 'add'}));
+    consume(ms.push(makeSourceChangeAdd(row)));
   }
 
   const view = new ArrayView(
@@ -1558,13 +1503,7 @@ test('edit to change the order', () => {
     ]
   `);
 
-  consume(
-    ms.push({
-      type: 'edit',
-      oldRow: {a: 20, b: 'b'},
-      row: {a: 5, b: 'b2'},
-    }),
-  );
+  consume(ms.push(makeSourceChangeEdit({a: 5, b: 'b2'}, {a: 20, b: 'b'})));
   view.flush();
   expect(data).toMatchInlineSnapshot(`
     [
@@ -1586,13 +1525,7 @@ test('edit to change the order', () => {
     ]
   `);
 
-  consume(
-    ms.push({
-      type: 'edit',
-      oldRow: {a: 5, b: 'b2'},
-      row: {a: 4, b: 'b3'},
-    }),
-  );
+  consume(ms.push(makeSourceChangeEdit({a: 4, b: 'b3'}, {a: 5, b: 'b2'})));
 
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -1615,13 +1548,7 @@ test('edit to change the order', () => {
     ]
   `);
 
-  consume(
-    ms.push({
-      type: 'edit',
-      oldRow: {a: 4, b: 'b3'},
-      row: {a: 20, b: 'b4'},
-    }),
-  );
+  consume(ms.push(makeSourceChangeEdit({a: 20, b: 'b4'}, {a: 4, b: 'b3'})));
   view.flush();
   expect(data).toMatchInlineSnapshot(`
     [
@@ -1691,9 +1618,8 @@ test('edit to preserve relationships', () => {
     () => void 0,
   );
   consume(
-    view.push({
-      type: 'add',
-      node: {
+    view.push(
+      makeAddChange({
         row: {id: 1, title: 'issue1'},
         relationships: {
           labels: () => [
@@ -1703,13 +1629,12 @@ test('edit to preserve relationships', () => {
             },
           ],
         },
-      },
-    }),
+      }),
+    ),
   );
   consume(
-    view.push({
-      type: 'add',
-      node: {
+    view.push(
+      makeAddChange({
         row: {id: 2, title: 'issue2'},
         relationships: {
           labels: () => [
@@ -1719,8 +1644,8 @@ test('edit to preserve relationships', () => {
             },
           ],
         },
-      },
-    }),
+      }),
+    ),
   );
   let data: unknown[] = [];
   view.addListener(entries => {
@@ -1758,14 +1683,15 @@ test('edit to preserve relationships', () => {
   `);
 
   consume(
-    view.push({
-      type: 'edit',
-      oldNode: {
-        row: {id: 1, title: 'issue1'},
-        relationships: {},
-      },
-      node: {row: {id: 1, title: 'issue1 changed'}, relationships: {}},
-    }),
+    view.push(
+      makeEditChange(
+        {row: {id: 1, title: 'issue1 changed'}, relationships: {}},
+        {
+          row: {id: 1, title: 'issue1'},
+          relationships: {},
+        },
+      ),
+    ),
   );
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -1799,11 +1725,12 @@ test('edit to preserve relationships', () => {
 
   // And now edit to change order
   consume(
-    view.push({
-      type: 'edit',
-      oldNode: {row: {id: 1, title: 'issue1 changed'}, relationships: {}},
-      node: {row: {id: 3, title: 'issue1 is now issue3'}, relationships: {}},
-    }),
+    view.push(
+      makeEditChange(
+        {row: {id: 3, title: 'issue1 is now issue3'}, relationships: {}},
+        {row: {id: 1, title: 'issue1 changed'}, relationships: {}},
+      ),
+    ),
   );
   view.flush();
   expect(data).toMatchInlineSnapshot(`
@@ -1844,8 +1771,8 @@ test('listeners receive error when queryComplete rejects - plural', async () => 
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
-  consume(ms.push({row: {a: 2, b: 'b'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
+  consume(ms.push(makeSourceChangeAdd({a: 2, b: 'b'})));
 
   const testError: ErroredQuery = {
     error: 'app',
@@ -1902,7 +1829,7 @@ test('listeners receive error when queryComplete rejects - singular', async () =
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
 
   const testError: ErroredQuery = {
     error: 'parse',
@@ -1952,7 +1879,7 @@ test('all listeners receive error when queryComplete rejects', async () => {
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
 
   const testError: ErroredQuery = {
     error: 'parse',
@@ -2007,7 +1934,7 @@ test('listeners added after error still receive error state', async () => {
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
 
   const testError: ErroredQuery = {
     error: 'app',
@@ -2050,7 +1977,7 @@ test('error state persists through flush operations', async () => {
     {a: {type: 'number'}, b: {type: 'string'}},
     ['a'],
   );
-  consume(ms.push({row: {a: 1, b: 'a'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 1, b: 'a'})));
 
   const testError: ErroredQuery = {
     error: 'app',
@@ -2082,7 +2009,7 @@ test('error state persists through flush operations', async () => {
   const callsAfterError = callCount;
 
   // Add more data and flush
-  consume(ms.push({row: {a: 2, b: 'b'}, type: 'add'}));
+  consume(ms.push(makeSourceChangeAdd({a: 2, b: 'b'})));
   view.flush();
 
   // Should still be in error state
@@ -2120,12 +2047,15 @@ test('duplicate relationship alias uses last-writer-wins', () => {
 
   // Add user AND cjc BEFORE pipeline
   // The cjc has job_id='other-job', which won't match the filter 'target-job'
-  consume(users.push({type: 'add', row: {id: 'user-1', name: 'Test User'}}));
+  consume(users.push(makeSourceChangeAdd({id: 'user-1', name: 'Test User'})));
   consume(
-    candidateJobConnections.push({
-      type: 'add',
-      row: {id: 'cjc-1', candidate_id: 'user-1', job_id: 'other-job'},
-    }),
+    candidateJobConnections.push(
+      makeSourceChangeAdd({
+        id: 'cjc-1',
+        candidate_id: 'user-1',
+        job_id: 'other-job',
+      }),
+    ),
   );
 
   const sources = {users, candidate_job_connections: candidateJobConnections};
@@ -2203,10 +2133,13 @@ test('duplicate relationship alias uses last-writer-wins', () => {
   // and the filtered source connection filters out the remove (predicate fails)
   expect(() => {
     consume(
-      candidateJobConnections.push({
-        type: 'remove',
-        row: {id: 'cjc-1', candidate_id: 'user-1', job_id: 'other-job'},
-      }),
+      candidateJobConnections.push(
+        makeSourceChangeRemove({
+          id: 'cjc-1',
+          candidate_id: 'user-1',
+          job_id: 'other-job',
+        }),
+      ),
     );
     view.flush();
   }).not.toThrow();
@@ -2233,12 +2166,15 @@ test('unique relationship aliases work correctly', () => {
     ['id'],
   );
 
-  consume(users.push({type: 'add', row: {id: 'user-1', name: 'Test User'}}));
+  consume(users.push(makeSourceChangeAdd({id: 'user-1', name: 'Test User'})));
   consume(
-    candidateJobConnections.push({
-      type: 'add',
-      row: {id: 'cjc-1', candidate_id: 'user-1', job_id: 'other-job'},
-    }),
+    candidateJobConnections.push(
+      makeSourceChangeAdd({
+        id: 'cjc-1',
+        candidate_id: 'user-1',
+        job_id: 'other-job',
+      }),
+    ),
   );
 
   const sources = {users, candidate_job_connections: candidateJobConnections};
@@ -2316,10 +2252,13 @@ test('unique relationship aliases work correctly', () => {
   // Delete should work fine with unique aliases
   expect(() => {
     consume(
-      candidateJobConnections.push({
-        type: 'remove',
-        row: {id: 'cjc-1', candidate_id: 'user-1', job_id: 'other-job'},
-      }),
+      candidateJobConnections.push(
+        makeSourceChangeRemove({
+          id: 'cjc-1',
+          candidate_id: 'user-1',
+          job_id: 'other-job',
+        }),
+      ),
     );
     view.flush();
   }).not.toThrow();

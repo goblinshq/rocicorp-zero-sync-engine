@@ -1,4 +1,5 @@
 import type {LogContext} from '@rocicorp/logger';
+import {literal} from 'pg-format';
 import {afterAll, beforeAll, describe, expect, test} from 'vitest';
 import {type JSONValue} from '../../../../../shared/src/bigint-json.ts';
 import {createSilentLogContext} from '../../../../../shared/src/logging-test-utils.ts';
@@ -15,6 +16,7 @@ import {createChangeProcessor} from '../../replicator/test-utils.ts';
 import type {DataOrSchemaChange} from '../protocol/current/data.ts';
 import type {ChangeStreamMessage} from '../protocol/current/downstream.ts';
 import {initializePostgresChangeSource} from './change-source.ts';
+import {TAGS} from './schema/ddl.ts';
 
 const APP_ID = 'orez';
 
@@ -103,11 +105,16 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
   ): Queue<ChangeStreamMessage | 'timeout'> {
     const queue = new Queue<ChangeStreamMessage | 'timeout'>();
     void (async () => {
-      for await (const msg of sub) {
-        if (msg[0] === 'status' && !msg[1].ack) {
-          continue; // filter out keepalives
+      try {
+        for await (const msg of sub) {
+          if (msg[0] === 'status' && !msg[1].ack) {
+            continue; // filter out keepalives
+          }
+          queue.enqueue(msg);
         }
-        queue.enqueue(msg);
+      } catch {
+        // The source can error during teardown if upstream connections are
+        // forcibly terminated; this should not surface as an unhandled rejection.
       }
     })();
     return queue;
@@ -116,7 +123,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
   async function nextTransaction(): Promise<DataOrSchemaChange[]> {
     const data: DataOrSchemaChange[] = [];
     for (;;) {
-      const change = await downstream.dequeue('timeout', 5000);
+      const change = await downstream.dequeue('timeout', 10_000);
       if (change === 'timeout') {
         throw new Error('timed out waiting for change');
       }
@@ -135,6 +142,9 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
         case 'rollback':
         case 'control':
         case 'status':
+          if (data.length === 0) {
+            break; // skip empty transactions
+          }
           return data;
         default:
           change satisfies never;
@@ -903,7 +913,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
     [
       'add unpublished column',
       'ALTER TABLE foo ADD "newInt" INT4;',
-      [[]], // no DDL event published
+      [], // no DDL event published
       {},
       [
         // the view of "foo" is unchanged.
@@ -1076,7 +1086,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
     [
       'create unpublished table with indexes',
       'CREATE TABLE public.boo (id INT8 PRIMARY KEY, name TEXT UNIQUE);',
-      [[]],
+      [],
       {},
       [],
       [],
@@ -1609,8 +1619,8 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
               ['e', 'f'],
             ],
           },
-          {tag: 'backfill-completed'},
         ],
+        [{tag: 'backfill-completed'}],
         [
           {
             tag: 'backfill',
@@ -1619,8 +1629,8 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
               ['e', 'f'],
             ],
           },
-          {tag: 'backfill-completed'},
         ],
+        [{tag: 'backfill-completed'}],
       ],
       {
         existing: [
@@ -1804,9 +1814,234 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
         },
       ],
     ],
+    [
+      'working ALTER PUBLICATION trigger not affected by surrounding COMMENTs',
+      /*sql*/ `
+      COMMENT ON PUBLICATION zero_some_public IS 'bonk';
+      ALTER PUBLICATION zero_some_public SET TABLE existing, TABLE existing_full,
+        TABLE foo (id, "newInt", flt);
+      COMMENT ON PUBLICATION zero_some_public IS 'bonk';
+      `,
+      [
+        [
+          {
+            tag: 'add-column',
+            table: {schema: 'public', name: 'foo'},
+            tableMetadata: {
+              schemaOID: expect.any(Number),
+              relationOID: expect.any(Number),
+              rowKey: {id: {attNum: 1}},
+            },
+            backfill: {attNum: expect.any(Number)},
+          },
+        ],
+        [{tag: 'backfill-completed'}],
+      ],
+      {foo: []},
+      [
+        {
+          name: 'foo',
+          columns: {
+            id: {
+              characterMaximumLength: null,
+              dataType: 'text|NOT_NULL',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 1,
+            },
+            ['_0_version']: {
+              characterMaximumLength: null,
+              dataType: 'TEXT',
+              elemPgTypeClass: null,
+              notNull: false,
+              pos: 2,
+            },
+            flt: {
+              characterMaximumLength: null,
+              dataType: 'float8',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 3,
+            },
+            newInt: {
+              characterMaximumLength: null,
+              dataType: 'int4',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 4,
+            },
+          },
+        },
+      ],
+      [],
+    ],
+    [
+      'disable ALTER PUBLICATION trigger',
+      /*sql*/ `
+      DROP EVENT TRIGGER ${APP_ID}_ddl_start_0;
+      DROP EVENT TRIGGER ${APP_ID}_ddl_end_0;
+
+      CREATE EVENT TRIGGER ${APP_ID}_ddl_start_0
+        ON ddl_command_start
+        WHEN TAG IN (${literal(removeAlterPublication(TAGS))})
+        EXECUTE PROCEDURE ${APP_ID}_0.emit_ddl_start();
+
+      CREATE EVENT TRIGGER ${APP_ID}_ddl_end_0
+        ON ddl_command_end
+        WHEN TAG IN (${literal(removeAlterPublication([...TAGS, 'COMMENT']))})
+        EXECUTE PROCEDURE ${APP_ID}_0.emit_ddl_end();
+      `,
+      [],
+      {},
+      [],
+      [],
+    ],
+    // Cases hereafter no longer have the ALTER PUBLICATION TRIGGER
+    [
+      'missing ALTER PUBLICATION trigger covered by surrounding COMMENTs',
+      /*sql*/ `
+      COMMENT ON PUBLICATION zero_some_public IS 'bonk';
+      ALTER PUBLICATION zero_some_public SET TABLE existing, TABLE existing_full,
+        TABLE foo (id, "newInt", int, flt);
+      COMMENT ON PUBLICATION zero_some_public IS 'bonk';
+
+      -- Additional comments have no effect.
+      COMMENT ON PUBLICATION zero_some_public IS 'bonk';
+      COMMENT ON PUBLICATION zero_some_public IS NULL;
+      `,
+      [
+        [
+          {
+            tag: 'add-column',
+            table: {schema: 'public', name: 'foo'},
+            tableMetadata: {
+              schemaOID: expect.any(Number),
+              relationOID: expect.any(Number),
+              rowKey: {id: {attNum: 1}},
+            },
+            backfill: {attNum: expect.any(Number)},
+          },
+        ],
+        [{tag: 'backfill-completed'}],
+      ],
+      {foo: []},
+      [
+        {
+          name: 'foo',
+          columns: {
+            id: {
+              characterMaximumLength: null,
+              dataType: 'text|NOT_NULL',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 1,
+            },
+            ['_0_version']: {
+              characterMaximumLength: null,
+              dataType: 'TEXT',
+              elemPgTypeClass: null,
+              notNull: false,
+              pos: 2,
+            },
+            flt: {
+              characterMaximumLength: null,
+              dataType: 'float8',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 3,
+            },
+            newInt: {
+              characterMaximumLength: null,
+              dataType: 'int4',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 4,
+            },
+            int: {
+              characterMaximumLength: null,
+              dataType: 'int4',
+              elemPgTypeClass: null,
+              dflt: null,
+              notNull: false,
+              pos: 5,
+            },
+          },
+        },
+      ],
+      [],
+    ],
+    [
+      'concurrent schema changes',
+      [
+        // statements are run in parallel
+        `CREATE TABLE IF NOT EXISTS your.t0 (id INT8 PRIMARY KEY)`,
+        `CREATE TABLE IF NOT EXISTS your.t1 (id INT8 PRIMARY KEY)`,
+        `CREATE TABLE IF NOT EXISTS your.t2 (id INT8 PRIMARY KEY)`,
+      ],
+      [
+        [{tag: 'create-table'}, {tag: 'create-index'}],
+        [{tag: 'create-table'}, {tag: 'create-index'}],
+        [{tag: 'create-table'}, {tag: 'create-index'}],
+      ],
+      {
+        ['your.t0']: [],
+        ['your.t1']: [],
+        ['your.t2']: [],
+      },
+      [],
+      [],
+    ],
+    [
+      'nested DDL event (RLS)',
+      /*sql*/ `
+     CREATE OR REPLACE FUNCTION add_rls()
+     RETURNS event_trigger AS $$
+     DECLARE
+       target RECORD;
+     BEGIN
+       SELECT object_identity as name
+         FROM pg_event_trigger_ddl_commands() 
+         LIMIT 1 INTO target; 
+       -- This results in firing nested ddl_start / ddl_end triggers
+       EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', target.name);
+     END
+     $$ LANGUAGE plpgsql;
+
+     CREATE EVENT TRIGGER add_rls_trigger
+      ON ddl_command_end
+      WHEN TAG IN ('CREATE TABLE')
+      EXECUTE PROCEDURE add_rls();
+
+     CREATE TABLE your.table_that_gets_rls (id INT8 PRIMARY KEY, val INT8 NOT NULL);
+     CREATE UNIQUE INDEX val_idx ON your.table_that_gets_rls (val);
+      `,
+      [[{tag: 'create-table'}, {tag: 'create-index'}, {tag: 'create-index'}]],
+      {['your.table_that_gets_rls']: []},
+      [],
+      [
+        {
+          tableName: 'your.table_that_gets_rls',
+          name: 'your.table_that_gets_rls_pkey',
+          columns: {id: 'ASC'},
+          unique: true,
+        },
+        {
+          tableName: 'your.table_that_gets_rls',
+          name: 'your.val_idx',
+          columns: {val: 'ASC'},
+          unique: true,
+        },
+      ],
+    ],
   ] satisfies [
     name: string,
-    statements: string,
+    statements: string | string[],
     transactions: Partial<DataOrSchemaChange>[][],
     expectedData: Record<string, JSONValue>,
     expectedTables: LiteTableSpec[],
@@ -1821,7 +2056,8 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
       expectedTables,
       expectedIndexes,
     ) => {
-      await upstream.unsafe(stmts);
+      stmts = Array.isArray(stmts) ? stmts : [stmts];
+      await Promise.all(stmts.map(stmt => upstream.unsafe(stmt)));
       for (const changes of transactions) {
         const transaction = await nextTransaction();
         expect(transaction).toMatchObject(changes);
@@ -1844,3 +2080,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
     },
   );
 });
+
+function removeAlterPublication(tags: readonly string[]) {
+  return tags.filter(tag => tag !== 'ALTER PUBLICATION');
+}

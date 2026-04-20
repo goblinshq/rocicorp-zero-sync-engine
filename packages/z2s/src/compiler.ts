@@ -8,7 +8,6 @@ import {
 import {hasOwn} from '../../shared/src/has-own.ts';
 import {type JSONValue} from '../../shared/src/json.ts';
 import {must} from '../../shared/src/must.ts';
-import {pgToZqlStringTypeMap} from '../../zero-cache/src/types/pg-data-type.ts';
 import type {
   AST,
   Condition,
@@ -25,10 +24,7 @@ import {
   type NameMapper,
 } from '../../zero-schema/src/name-mapper.ts';
 import type {Schema} from '../../zero-types/src/schema.ts';
-import type {
-  ServerColumnSchema,
-  ServerSchema,
-} from '../../zero-types/src/server-schema.ts';
+import type {ServerSchema} from '../../zero-types/src/server-schema.ts';
 import type {Format} from '../../zql/src/ivm/view.ts';
 import {completeOrdering} from '../../zql/src/query/complete-ordering.ts';
 import {
@@ -36,7 +32,6 @@ import {
   sqlConvertColumnArg,
   sqlConvertPluralLiteralArg,
   sqlConvertSingularLiteralArg,
-  Z2S_COLLATION,
   type PluralLiteralType,
 } from './sql.ts';
 
@@ -166,33 +161,21 @@ export function orderBy(
     return sql``;
   }
   return sql`ORDER BY ${sql.join(
-    orderBy.map(([col, dir]) => {
-      const serverColumnSchema = getServerColumn(spec.server, table, col);
-      return dir === 'asc'
+    orderBy.map(([col, dir]) =>
+      dir === 'asc'
         ? // Oh postgres. The table must be referred to by client name but the column by server name.
           // E.g., `SELECT server_col as client_col FROM server_table as client_table ORDER BY client_Table.server_col`
           sql`${colIdent(spec.server, {
             table,
             zql: col,
-          })}${maybeCollate(serverColumnSchema)} ASC NULLS FIRST`
+          })} ASC NULLS FIRST`
         : sql`${colIdent(spec.server, {
             table,
             zql: col,
-          })}${maybeCollate(serverColumnSchema)} DESC NULLS LAST`;
-    }),
+          })} DESC NULLS LAST`,
+    ),
     ', ',
   )}`;
-}
-
-function maybeCollate(serverColumnSchema: ServerColumnSchema): SQLQuery {
-  if (serverColumnSchema.type === 'uuid' || serverColumnSchema.isEnum) {
-    return sql`::text COLLATE ${sql.ident(Z2S_COLLATION)}`;
-  }
-  if (Object.hasOwn(pgToZqlStringTypeMap, serverColumnSchema.type)) {
-    return sql` COLLATE ${sql.ident(Z2S_COLLATION)}`;
-  }
-
-  return sql``;
 }
 
 function related(
@@ -474,18 +457,10 @@ function valueComparison(
   const valuePosType = valuePos.type;
   switch (valuePosType) {
     case 'column': {
-      const serverColumnSchema = getServerColumn(
-        spec.server,
-        table,
-        valuePos.name,
-      );
       const qualified: QualifiedColumn = {
         table,
         zql: valuePos.name,
       };
-      if (serverColumnSchema.type === 'uuid' || serverColumnSchema.isEnum) {
-        return sql`${colIdent(spec.server, qualified)}::text`;
-      }
       return colIdent(spec.server, qualified);
     }
     case 'literal':
@@ -650,20 +625,44 @@ function selectIdent(server: ServerSpec, column: QualifiedColumn): SQLQuery {
       server.mapper.columnName(column.table.zql, column.zql)
     ];
   const serverType = serverColumnSchema.type;
-  if (
-    !serverColumnSchema.isEnum &&
-    (serverType === 'date' ||
-      serverType === 'timestamp' ||
-      serverType === 'timestamp without time zone' ||
-      serverType === 'timestamptz' ||
-      serverType === 'timestamp with time zone')
-  ) {
-    if (serverColumnSchema.isArray) {
-      // Map EXTRACT(EPOCH FROM ...) * 1000 over array elements
-      return sql`ARRAY(SELECT EXTRACT(EPOCH FROM unnest(${colIdent(server, column)})) * 1000) as ${sql.ident(column.zql)}`;
+  if (!serverColumnSchema.isEnum) {
+    let needsNormalization = false;
+    switch (serverType) {
+      case 'timestamptz':
+      // @ts-expect-error Fallthrough intended
+      case 'timetz':
+        needsNormalization = true;
+      // fallthrough
+
+      case 'date':
+      case 'time':
+      case 'time without time zone':
+      case 'time with time zone':
+      case 'timestamp':
+      case 'timestamp without time zone':
+      case 'timestamp with time zone': {
+        // EXTRACT(EPOCH FROM timetz) can be negative when the UTC offset is
+        // positive (e.g. 01:00+02 = 23:00 UTC prev day = -3600s). Wrap with
+        // modular arithmetic to normalize to 0..86400000.
+        const toMs = (epochExpr: SQLQuery): SQLQuery =>
+          needsNormalization
+            ? sql`((${epochExpr})::bigint + 86400000) % 86400000`
+            : epochExpr;
+
+        if (serverColumnSchema.isArray) {
+          const col = colIdent(server, column);
+          return sql`CASE WHEN ${col} IS NULL THEN NULL ELSE ARRAY(SELECT ${toMs(
+            sql`EXTRACT(EPOCH FROM unnest(${col})) * 1000`,
+          )}) END as ${sql.ident(column.zql)}`;
+        }
+
+        return sql`${toMs(
+          sql`EXTRACT(EPOCH FROM ${colIdent(server, column)}) * 1000`,
+        )} as ${sql.ident(column.zql)}`;
+      }
     }
-    return sql`EXTRACT(EPOCH FROM ${colIdent(server, column)}) * 1000 as ${sql.ident(column.zql)}`;
   }
+
   return sql`${colIdent(server, column)} as ${sql.ident(column.zql)}`;
 }
 

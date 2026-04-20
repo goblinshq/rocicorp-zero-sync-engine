@@ -11,10 +11,12 @@ import type {PostgresDB} from '../types/pg.ts';
 import * as Mode from './mode-enum.ts';
 import {
   importSnapshot,
+  ResponseTimeoutError,
   sharedSnapshot,
   synchronizedSnapshots,
   TIMEOUT_TASKS,
   TransactionPool,
+  type Options,
   type Task,
 } from './transaction-pool.ts';
 
@@ -53,15 +55,17 @@ describe('db/transaction-pool', () => {
     maxWorkers = initialWorkers,
     timeoutTasks = TIMEOUT_TASKS, // Overridden for tests.
   ) {
-    const pool = new TransactionPool(
-      lc,
-      mode,
-      init,
-      cleanup,
-      initialWorkers,
-      maxWorkers,
+    return newTransactionPoolWithOpts(
+      {mode, init, cleanup, initialWorkers, maxWorkers},
       timeoutTasks,
     );
+  }
+
+  function newTransactionPoolWithOpts(
+    opts: Options,
+    timeoutTasks = TIMEOUT_TASKS,
+  ) {
+    const pool = new TransactionPool(lc, opts, timeoutTasks);
     pools.push(pool);
     return pool;
   }
@@ -110,40 +114,37 @@ describe('db/transaction-pool', () => {
     });
   });
 
-  test('ref counting', async () => {
-    const single = newTransactionPool(
-      Mode.SERIALIZABLE,
-      initTask,
-      cleanupTask,
-      1,
-      1,
-    );
+  test('response timeout', async () => {
+    await db`INSERT INTO foo (id) VALUES (1)`;
 
-    expect(single.isRunning()).toBe(false);
-    single.run(db);
-    expect(single.isRunning()).toBe(true);
+    // To induce a response timeout, we hold a lock in one tx and wait
+    // for another tx to timeout.
+    const lockHolder = newTransactionPool(Mode.READ_COMMITTED).run(db);
+    void lockHolder.process(task(`SELECT * FROM foo FOR UPDATE`));
 
-    // 1 -> 2 -> 3
-    single.ref();
-    expect(single.isRunning()).toBe(true);
-    single.ref();
-    expect(single.isRunning()).toBe(true);
+    const lockWaiter = newTransactionPoolWithOpts({
+      mode: Mode.READ_COMMITTED,
+      statementResponseTimeout: 50,
+    }).run(db);
 
-    // 3 -> 2 -> 1
-    single.unref();
-    expect(single.isRunning()).toBe(true);
-    single.unref();
-    expect(single.isRunning()).toBe(true);
+    const promise = lockWaiter.process(task(`DELETE FROM foo`));
+    lockWaiter.setDone();
 
-    // 1 -> 0
-    single.unref();
-    expect(single.isRunning()).toBe(false);
+    // Note: The promise returned by process never throws, but it should
+    //       resolve once the response timeout aborts the transaction.
+    await promise;
 
-    await single.done();
+    // Release the lock to allow the transaction to proceed.
+    lockHolder.setDone();
 
+    // The final transaction should abort with the ResponseTimeoutError.
+    await expect(lockWaiter.done()).rejects.toThrow(ResponseTimeoutError);
+
+    await lockHolder.done();
+
+    // The delete should not have succeeded.
     await expectTables(db, {
-      ['public.workers']: [{id: 1}],
-      ['public.cleaned']: [{id: 1}],
+      ['public.foo']: [{id: 1, val: null}],
     });
   });
 
@@ -449,7 +450,6 @@ describe('db/transaction-pool', () => {
     void pool.process(task(`INSERT INTO foo (id) VALUES (2)`));
     void pool.process(task(`INSERT INTO foo (id, val) VALUES (8, 'foo')`));
     void pool.process(task(`INSERT INTO foo (id) VALUES (5)`));
-    pool.setDone();
 
     // Set the failure before running.
     pool.fail(new Error('oh nose'));
@@ -887,6 +887,88 @@ describe('db/transaction-pool', () => {
         {id: 6, val: null},
       ],
     });
+  });
+
+  // Regression test for the race condition where a non-exporter worker's cleanup
+  // ran before new workers were spawned, setting firstWorkerDone=true and causing
+  // those new workers to skip SET TRANSACTION SNAPSHOT.
+  test('sharedSnapshot - non-exporter cleanup does not disable snapshot for new workers', async () => {
+    await db`
+    INSERT INTO foo (id) VALUES (1);
+    INSERT INTO foo (id) VALUES (2);
+    INSERT INTO foo (id) VALUES (3);
+    `.simple();
+
+    const processing = new Queue<boolean>();
+    const canProceed = new Queue<boolean>();
+
+    const {init, cleanup} = sharedSnapshot();
+    // initialWorkers=1 (worker 1 is the exporter), maxWorkers=2.
+    // Extra workers (worker 2+) exit after a very short idle timeout so that
+    // we can deterministically observe their cleanup running before a new worker
+    // is spawned.
+    const pool = newTransactionPool(Mode.READONLY, init, cleanup, 1, 2, {
+      forInitialWorkers: TIMEOUT_TASKS.forInitialWorkers,
+      forExtraWorkers: {timeoutMs: 20, task: 'done' as const},
+    });
+    pool.run(db);
+
+    const readTask = () => async (tx: postgres.TransactionSql) => {
+      processing.enqueue(true);
+      await canProceed.dequeue();
+      return (await tx<{id: number}[]>`SELECT id FROM foo;`.values()).flat();
+    };
+
+    // Queue 2 tasks immediately. Worker 1 (exporter, initial) handles the first;
+    // the pool expands to spawn Worker 2 (non-exporter, extra) for the second.
+    const batch1: Promise<number[]>[] = [];
+    batch1.push(pool.processReadTask(readTask())); // task A → worker 1
+    batch1.push(pool.processReadTask(readTask())); // task B → worker 2
+
+    // Wait for both workers to start their tasks.
+    await processing.dequeue();
+    await processing.dequeue();
+
+    // Insert rows outside the snapshot. These must not be visible.
+    await db`
+    INSERT INTO foo (id) VALUES (4);
+    INSERT INTO foo (id) VALUES (5);
+    INSERT INTO foo (id) VALUES (6);
+    `.simple();
+
+    // Let task B (worker 2, non-exporter) finish while task A (worker 1) is
+    // still blocking. Worker 2 becomes idle and exits after its 20ms idle timeout,
+    // running its cleanup task.
+    canProceed.enqueue(true);
+
+    // Give worker 2 time to hit the idle timeout and fully run its cleanup.
+    // With a 20ms timeout and ~100ms sleep this is a comfortable margin.
+    await sleep(100);
+
+    // Worker 2 has now exited (#numWorkers decremented to 1).
+    // Queue task C while worker 1 is still blocking (#numWorking=1), so that
+    // the pool expands again and spawns Worker 3.
+    const batch2: Promise<number[]>[] = [];
+    batch2.push(pool.processReadTask(readTask())); // task C → worker 3
+
+    // Wait for worker 3 to start.
+    await processing.dequeue();
+
+    // Release the remaining blocked tasks.
+    canProceed.enqueue(true); // worker 3 (task C)
+    canProceed.enqueue(true); // worker 1 (task A)
+
+    const results = await Promise.all([...batch1, ...batch2]);
+    for (const result of results) {
+      // Before the fix, worker 2's cleanup set firstWorkerDone=true, causing
+      // worker 3 to skip SET TRANSACTION SNAPSHOT and see rows 4,5,6.
+      // After the fix, only the exporter (worker 1) flips firstWorkerDone,
+      // so worker 3 correctly imports the snapshot and sees only [1,2,3].
+      expect(result).toEqual([1, 2, 3]);
+    }
+
+    pool.setDone();
+    await pool.done();
   });
 
   test('externally shared snapshot', async () => {

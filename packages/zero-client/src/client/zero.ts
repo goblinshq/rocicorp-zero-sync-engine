@@ -1,4 +1,4 @@
-import {LogContext, type LogLevel} from '@rocicorp/logger';
+import {LogContext, type LogLevel, type LogSink} from '@rocicorp/logger';
 import {type Resolver, resolver} from '@rocicorp/resolver';
 import {type DeletedClients} from '../../../replicache/src/deleted-clients.ts';
 import {getKVStoreProvider} from '../../../replicache/src/get-kv-store-provider.ts';
@@ -256,6 +256,8 @@ const NULL_LAST_MUTATION_ID_SENT = {clientID: '', id: -1} as const;
 
 const DEFAULT_QUERY_CHANGE_THROTTLE_MS = 10;
 
+export const LOGGED_OUT_STORAGE_USER_ID = '__anonymous__';
+
 function convertOnUpdateNeededReason(
   reason: ReplicacheUpdateNeededReason,
 ): UpdateNeededReason {
@@ -330,7 +332,7 @@ export class Zero<
 
   readonly #rep: ReplicacheImpl<WithCRUD<MutatorDefs>>;
   readonly #server: HTTPString | null;
-  readonly userID: string;
+  readonly userID: string | undefined;
   readonly storageKey: string;
 
   readonly #lc: LogContext;
@@ -470,12 +472,17 @@ export class Zero<
       maxRecentQueries = 0,
       slowMaterializeThreshold = 5_000,
     } = options;
-    if (!userID) {
+
+    if (userID === '') {
       throw new ClientError({
         kind: ClientErrorKind.Internal,
-        message: 'ZeroOptions.userID must not be empty.',
+        message:
+          'ZeroOptions.userID should not be empty. Omit it entirely for logged-out clients.',
       });
     }
+
+    this.#checkAuthValid(userID ?? undefined, options.auth);
+
     const cacheURL = options.cacheURL ?? options.server;
     const server = getServer(cacheURL);
     this.#enableAnalytics = shouldEnableAnalytics(
@@ -517,6 +524,7 @@ export class Zero<
       consoleLogLevel: options.logLevel ?? 'warn',
       server: null, //server, // Reenable remote logging
       enableAnalytics: this.#enableAnalytics,
+      consoleLogSink: options.logSink,
     });
     const logOptions = this.#logOptions;
 
@@ -566,6 +574,9 @@ export class Zero<
       queryUrl: options.queryURL ?? options.getQueriesURL ?? '',
     });
     const hashedKey = h64(nameKey).toString(36);
+    // Logged-out clients still need a stable local storage namespace.
+    // This sentinel is only for IDB naming; logged-out connections omit userID on the wire.
+    const storageScopedUserID = userID ?? LOGGED_OUT_STORAGE_USER_ID;
 
     const replicacheOptions: ReplicacheOptions<WithCRUD<MutatorDefs>> = {
       // The schema stored in IDB is dependent upon both the ClientSchema
@@ -574,7 +585,7 @@ export class Zero<
       logLevel: logOptions.logLevel,
       logSinks: [logOptions.logSink],
       mutators: replicacheMutators,
-      name: `zero-${userID}-${hashedKey}`,
+      name: `zero-${storageScopedUserID}-${hashedKey}`,
       pusher: (req, reqID) => this.#pusher(req, reqID),
       puller: (req, reqID) => this.#puller(req, reqID),
       pushDelay: 0,
@@ -635,8 +646,15 @@ export class Zero<
       internalReplicacheImplMap.set(this, rep);
     }
     this.#server = server;
-    this.userID = userID;
+    this.userID = userID ?? undefined;
     this.#lc = lc.withContext('clientID', rep.clientID);
+
+    if (userID === 'anon') {
+      this.#lc.warn?.(
+        'ZeroOptions.userID "anon" is deprecated for logged-out clients. Omit it entirely for logged-out clients.',
+      );
+    }
+
     this.#connection = new ConnectionImpl(
       this.#connectionManager,
       this.#lc,
@@ -744,7 +762,17 @@ export class Zero<
       this.#mutationTracker,
       rep.clientID,
       schema.tables,
-      msg => this.#send(msg),
+      msg => {
+        let body = msg[1];
+        if (this.#options.getTraceparent) {
+          body = {
+            ...msg[1],
+            traceparent: this.#options.getTraceparent?.(),
+          };
+        }
+
+        this.#send([msg[0], body]);
+      },
       rep.experimentalWatch.bind(rep),
       maxRecentQueries,
       options.queryChangeThrottleMs ?? DEFAULT_QUERY_CHANGE_THROTTLE_MS,
@@ -874,6 +902,7 @@ export class Zero<
     consoleLogLevel: LogLevel;
     server: HTTPString | null;
     enableAnalytics: boolean;
+    consoleLogSink?: LogSink | undefined;
   }): LogOptions {
     if (TESTING) {
       const testZero = asTestZero(this);
@@ -1500,6 +1529,7 @@ export class Zero<
         'changeDesiredQueries',
         {
           desiredQueriesPatch: [...queriesPatch.values()],
+          traceparent: this.#options.getTraceparent?.(),
         },
       ]);
     } else if (this.#initConnectionQueries === undefined) {
@@ -1518,6 +1548,7 @@ export class Zero<
           userPushHeaders: this.#options.mutateHeaders,
           userQueryURL: this.#options.queryURL ?? this.#options.getQueriesURL,
           userQueryHeaders: this.#options.queryHeaders,
+          traceparent: this.#options.getTraceparent?.(),
         },
       ]);
       this.#deletedClients = undefined;
@@ -1874,6 +1905,7 @@ export class Zero<
           mutations: [zeroM],
           pushVersion: req.pushVersion,
           requestID,
+          traceparent: this.#options.getTraceparent?.(),
         },
       ];
       send(socket, msg);
@@ -2252,6 +2284,8 @@ export class Zero<
    * @param auth - The authentication token to set.
    */
   #setAuth(auth: string | undefined | null): void {
+    this.#checkAuthValid(this.userID, auth);
+
     this.#rep.auth = toReplicacheAuthToken(auth);
 
     if (auth) {
@@ -2451,6 +2485,18 @@ export class Zero<
       ...(args as ClientMetricMap[keyof ClientMetricMap]),
     );
   };
+
+  #checkAuthValid(
+    userID: string | undefined,
+    auth: string | null | undefined,
+  ): void {
+    if (userID === undefined && auth) {
+      throw new ClientError({
+        kind: ClientErrorKind.Internal,
+        message: 'ZeroOptions.userID is required when auth is set.',
+      });
+    }
+  }
 }
 
 export class OnlineManager extends Subscribable<boolean> {
@@ -2478,7 +2524,7 @@ export async function createSocket(
   clientID: string,
   clientGroupID: string,
   clientSchema: ClientSchema,
-  userID: string,
+  userID: string | undefined,
   auth: string | undefined,
   lmid: number,
   wsid: string,
@@ -2572,7 +2618,7 @@ export async function createConnectionURL(
   socketOrigin: HTTPString | WSString,
   clientID: string,
   clientGroupID: string,
-  userID: string,
+  userID: string | undefined,
   baseCookie: string | null,
   lmid: number,
   wsid: string,
@@ -2587,7 +2633,9 @@ export async function createConnectionURL(
   const {searchParams} = url;
   searchParams.set('clientID', clientID);
   searchParams.set('clientGroupID', clientGroupID);
-  searchParams.set('userID', userID);
+  if (userID !== undefined) {
+    searchParams.set('userID', userID);
+  }
   searchParams.set('baseCookie', baseCookie === null ? '' : String(baseCookie));
   searchParams.set('ts', String(performance.now()));
   searchParams.set('lmid', String(lmid));

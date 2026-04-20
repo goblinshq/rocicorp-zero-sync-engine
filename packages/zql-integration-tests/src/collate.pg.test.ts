@@ -1,3 +1,17 @@
+/**
+ * Collation consistency tests between z2s (PostgreSQL), zqlite (SQLite), and
+ * zql (in-memory).
+ *
+ * These tests are effectively relaxed: z2s no longer adds COLLATE "ucs_basic"
+ * to queries, so PostgreSQL uses its native (locale-aware) collation which may
+ * order text and enum columns differently than SQLite/zql byte ordering.
+ *
+ * The tests currently verify:
+ * - zql and zqlite produce identical ordering (both use byte-order comparison)
+ * - PostgreSQL returns the same *set* of rows (but possibly in different order)
+ *
+ * Kept in case we eventually align collations across all three environments.
+ */
 import {Client} from 'pg';
 import {afterAll, beforeAll, describe, expect, test} from 'vitest';
 import {testLogConfig} from '../../otel/src/test-log-config.ts';
@@ -15,6 +29,7 @@ import {
 } from '../../zero-schema/src/builder/table-builder.ts';
 import type {ServerSchema} from '../../zero-types/src/server-schema.ts';
 import {MemorySource} from '../../zql/src/ivm/memory-source.ts';
+import {consume} from '../../zql/src/ivm/stream.ts';
 import type {QueryDelegate} from '../../zql/src/query/query-delegate.ts';
 import {newQuery} from '../../zql/src/query/query-impl.ts';
 import {asQueryInternals} from '../../zql/src/query/query-internals.ts';
@@ -26,10 +41,10 @@ import {
   mapResultToClientNames,
   newQueryDelegate,
 } from '../../zqlite/src/test/source-factory.ts';
-import {consume} from '../../zql/src/ivm/stream.ts';
 import './helpers/comparePg.ts';
 import {fillPgAndSync} from './helpers/setup.ts';
 
+import {makeSourceChangeAdd} from '../../zql/src/ivm/source.ts';
 const lc = createSilentLogContext();
 
 const DB_NAME = 'collate-test';
@@ -137,12 +152,7 @@ beforeAll(async () => {
 
   // Initialize memory sources with test data
   for (const row of testData.item) {
-    consume(
-      memorySources.item.push({
-        type: 'add',
-        row,
-      }),
-    );
+    consume(memorySources.item.push(makeSourceChangeAdd(row)));
   }
 
   // Check that PG, SQLite, and test data are in sync
@@ -207,18 +217,28 @@ describe('collation behavior', () => {
       const memoryResult = await memoryQueryDelegate.run(
         memoryItemQuery.orderBy(col, 'asc'),
       );
-      expect(zqlResult).toEqualPg(pgResult);
-      expect(memoryResult).toEqualPg(pgResult);
+      // ZQL (SQLite) and memory should produce the same ordering
+      // (both use byte-order comparison).
+      expect(zqlResult).toEqualPg(memoryResult);
+      // PG should return the same set of rows (order may differ
+      // due to locale-aware collation for text/enum columns).
+      expect(zqlResult).toEqual(expect.arrayContaining(pgResult as unknown[]));
+      expect(pgResult).toEqual(expect.arrayContaining(zqlResult as unknown[]));
 
       function makeQuery(
         query: Query<'item', Schema>,
         i: number,
       ): Query<'item', Schema> {
         return query
-          .where(col, '>', memoryResult[i].name)
+          .where(col, '>', memoryResult[i][col])
           .limit(1)
           .orderBy(col, 'asc');
       }
+      // Cursor-style tests: only compare ZQL vs memory. PG is excluded
+      // because its locale-aware collation (e.g. en_US.UTF-8) orders
+      // strings differently than ZQL/memory byte ordering, so
+      // WHERE col > 'x' ORDER BY col LIMIT 1 may return a different
+      // "next row" from PG than from ZQL/memory.
       for (let i = 0; i < memoryResult.length - 1; i++) {
         const memResult = await memoryQueryDelegate.run(
           makeQuery(memoryItemQuery, i),
@@ -228,9 +248,7 @@ describe('collation behavior', () => {
           schema,
           'item',
         );
-        const pgResult = await runAsSQL(makeQuery(itemQuery, i), runPgQuery);
-        expect(zqlResult).toEqualPg(pgResult);
-        expect(memResult).toEqualPg(pgResult);
+        expect(zqlResult).toEqualPg(memResult);
       }
 
       return zqlResult;

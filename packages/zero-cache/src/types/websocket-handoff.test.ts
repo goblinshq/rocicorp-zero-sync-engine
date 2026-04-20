@@ -1,5 +1,5 @@
-import {resolver} from '@rocicorp/resolver';
 import {Server} from 'node:http';
+import {resolver} from '@rocicorp/resolver';
 import {afterAll, afterEach, beforeAll, describe, expect, test} from 'vitest';
 import {WebSocket, WebSocketServer, type RawData} from 'ws';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
@@ -283,7 +283,7 @@ describe('types/websocket-handoff', () => {
         // Simulate the race condition: close the websocket before the callback runs
         ws.close();
         // Wait a tick for the close to take effect
-        setTimeout(() => callback(ws, req), 10);
+        setTimeout(callback, 10, ws, req);
       });
     };
 

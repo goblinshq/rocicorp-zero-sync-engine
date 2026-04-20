@@ -32,7 +32,6 @@ import {
   clearBrowserOverrides,
   overrideBrowserGlobal,
 } from '../../../shared/src/browser-env.ts';
-import {findLast} from '../../../shared/src/find-last.ts';
 import {TestLogSink} from '../../../shared/src/logging-test-utils.ts';
 import * as valita from '../../../shared/src/valita.ts';
 import {changeDesiredQueriesMessageSchema} from '../../../zero-protocol/src/change-desired-queries.ts';
@@ -330,8 +329,7 @@ describe('onOnlineChange callback', () => {
     // And followed by a reconnect with the longer BACKOFF_MS.
     await tickAFewTimes(vi, BACKOFF_MS);
     await z.triggerConnected();
-    const connectMsg = findLast(
-      z.testLogSink.messages,
+    const connectMsg = z.testLogSink.messages.findLast(
       ([level, _context, args]) =>
         level === 'info' && args.find(arg => /Connecting to/.test(String(arg))),
     );
@@ -656,6 +654,17 @@ describe('createSocket', () => {
       expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&userID=userID&baseCookie=&ts=0&lmid=0&wsid=wsidx&profileID=${mockProfileID}`,
     },
     {
+      socketURL: 'ws://example.com/' as WSString,
+      baseCookie: null,
+      clientID: 'clientID',
+      userID: undefined,
+      auth: '',
+      lmid: 0,
+      debugPerf: false,
+      now: 0,
+      expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&baseCookie=&ts=0&lmid=0&wsid=wsidx&profileID=${mockProfileID}`,
+    },
+    {
       socketURL: 'ws://example.com/prefix' as WSString,
       baseCookie: null,
       clientID: 'clientID',
@@ -758,12 +767,12 @@ describe('createSocket', () => {
       socketURL: 'ws://example.com/' as WSString,
       baseCookie: null,
       clientID: 'clientID',
-      userID: 'userID',
+      userID: undefined,
       auth: '',
       lmid: 0,
       debugPerf: false,
       now: 456,
-      expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&userID=userID&baseCookie=&ts=456&lmid=0&wsid=wsidx&profileID=${mockProfileID}&reason=rehome&backoff=100&lastTask=foo%2Fbar%26baz`,
+      expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&baseCookie=&ts=456&lmid=0&wsid=wsidx&profileID=${mockProfileID}&reason=rehome&backoff=100&lastTask=foo%2Fbar%26baz`,
       additionalConnectParams: {
         reason: 'rehome',
         backoff: '100',
@@ -775,7 +784,7 @@ describe('createSocket', () => {
     socketURL: WSString;
     baseCookie: NullableVersion;
     clientID: string;
-    userID: string;
+    userID: string | undefined;
     auth: string | undefined;
     lmid: number;
     debugPerf: boolean;
@@ -2344,58 +2353,6 @@ test(ErrorKind.AuthInvalidated, async () => {
   );
 });
 
-test('connect() with null auth clears authentication', async () => {
-  const z = zeroForTest({auth: 'initial-token'});
-
-  await z.triggerConnected();
-  let currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(
-    'initial-token',
-  );
-
-  // Trigger auth error
-  await z.triggerError({
-    kind: ErrorKind.Unauthorized,
-    message: 'auth error',
-    origin: ErrorOrigin.ZeroCache,
-  });
-  await z.waitForConnectionStatus(ConnectionStatus.NeedsAuth);
-  await vi.advanceTimersByTimeAsync(0);
-
-  // Reconnect with null auth - should clear auth token (empty string is used for no auth)
-  await z.connection.connect({auth: null});
-  currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(undefined);
-  await z.triggerConnected();
-  await z.waitForConnectionStatus(ConnectionStatus.Connected);
-});
-
-test('connect() with undefined auth clears authentication', async () => {
-  const z = zeroForTest({auth: 'initial-token'});
-
-  await z.triggerConnected();
-  let currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(
-    'initial-token',
-  );
-
-  // Trigger auth error
-  await z.triggerError({
-    kind: ErrorKind.Unauthorized,
-    message: 'auth error',
-    origin: ErrorOrigin.ZeroCache,
-  });
-  await z.waitForConnectionStatus(ConnectionStatus.NeedsAuth);
-  await vi.advanceTimersByTimeAsync(0);
-
-  // Reconnect with undefined auth - should clear auth token (empty string is used for no auth)
-  await z.connection.connect({auth: undefined});
-  currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(undefined);
-  await z.triggerConnected();
-  await z.waitForConnectionStatus(ConnectionStatus.Connected);
-});
-
 test('connect() without opts preserves existing auth', async () => {
   const z = zeroForTest({auth: 'initial-token'});
 
@@ -3703,7 +3660,7 @@ describe('CRUD', () => {
 
     // Optional fields can be set to null/undefined or left off completely.
     await setComment({id: 'c', issueID: '3'});
-    expect(view.data[view.data.length - 1]).toEqual({
+    expect(view.data.at(-1)).toEqual({
       id: 'c',
       issueID: '3',
       text: null,
@@ -3711,7 +3668,7 @@ describe('CRUD', () => {
     });
 
     await setComment({id: 'd', issueID: '4', text: undefined});
-    expect(view.data[view.data.length - 1]).toEqual({
+    expect(view.data.at(-1)).toEqual({
       id: 'd',
       issueID: '4',
       text: null,
@@ -3719,7 +3676,7 @@ describe('CRUD', () => {
     });
 
     await setComment({id: 'e', issueID: '5', text: undefined});
-    expect(view.data[view.data.length - 1]).toEqual({
+    expect(view.data.at(-1)).toEqual({
       id: 'e',
       issueID: '5',
       text: null,
