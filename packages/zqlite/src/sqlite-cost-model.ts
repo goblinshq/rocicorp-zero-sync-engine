@@ -28,9 +28,32 @@ interface ScanstatusLoop {
 }
 
 /**
+ * Default selectivity returned when a recursive cycle is detected
+ * during correlated subquery selectivity estimation.
+ */
+const CYCLE_DEFAULT_SELECTIVITY = 0.5;
+
+/**
+ * Internal cost model function signature with recursion tracking.
+ */
+type InternalCostModel = (
+  tableName: string,
+  sort: Ordering,
+  filters: Condition | undefined,
+  constraint: PlannerConstraint | undefined,
+  visited: Set<string>,
+) => CostModelCost;
+
+/**
  * Creates a SQLite-based cost model for query planning.
  * Uses SQLite's scanstatus API to estimate query costs based on the actual
  * SQLite query planner's analysis.
+ *
+ * For correlated subquery conditions (EXISTS/NOT EXISTS), the scanstatus API
+ * cannot provide estimates since these are subqueries. Instead, we recursively
+ * estimate their selectivity by calling the cost model on the child table,
+ * computing child selectivity, and translating it to a parent match probability
+ * using the fanout between parent and child.
  *
  * @param db Database instance for preparing statements
  * @param tableSpecs Map of table names to their table specs with ZQL schemas
@@ -41,15 +64,19 @@ export function createSQLiteCostModel(
   tableSpecs: Map<string, {zqlSpec: Record<string, SchemaValue>}>,
 ): ConnectionCostModel {
   const fanoutEstimator = new SQLiteStatFanout(db);
-  return (
-    tableName: string,
-    sort: Ordering,
-    filters: Condition | undefined,
-    constraint: PlannerConstraint | undefined,
-  ): CostModelCost => {
+
+  // Inner function that supports recursion tracking for correlated
+  // subquery selectivity estimation.
+  const costModelImpl: InternalCostModel = (
+    tableName,
+    sort,
+    filters,
+    constraint,
+    visited = new Set(),
+  ) => {
     // Transform filters to remove correlated subqueries
-    // The cost model can't handle correlated subqueries, so we estimate cost
-    // without them. This is conservative - actual cost may be higher.
+    // The cost model can't handle correlated subqueries in scanstatus,
+    // so we estimate cost without them and then apply selectivity adjustment.
     const noSubqueryFilters = filters
       ? removeCorrelatedSubqueries(filters)
       : undefined;
@@ -90,8 +117,176 @@ export function createSQLiteCostModel(
       fanoutEstimator.getFanout(tableName, columns),
     );
 
+    // Estimate selectivity contribution from correlated subquery conditions
+    // and apply it to reduce the row estimate. Without this, EXISTS-only
+    // filters look unselective (selectivity=1.0) because scanstatus can't
+    // see correlated subqueries.
+    if (filters) {
+      const correlatedSelectivity = estimateCorrelatedSelectivity(
+        filters,
+        tableName,
+        sort,
+        constraint,
+        costModelImpl,
+        fanoutEstimator,
+        tableSpecs,
+        visited,
+      );
+      if (correlatedSelectivity < 1.0) {
+        ret.rows *= correlatedSelectivity;
+      }
+    }
+
     return ret;
   };
+
+  // Return the public interface (without the visited parameter)
+  return (tableName, sort, filters, constraint) =>
+    costModelImpl(tableName, sort, filters, constraint, new Set());
+}
+
+/**
+ * Estimates the selectivity contribution of correlated subquery conditions
+ * within a filter tree.
+ *
+ * Selectivity = fraction of rows that pass the correlated subquery conditions.
+ * This is used to adjust the row count from scanstatus (which cannot see
+ * correlated subqueries) to account for their filtering effect.
+ *
+ * For each correlated subquery (EXISTS), we:
+ * 1. Recursively call the cost model on the child table to estimate child selectivity
+ * 2. Get the fanout (average child rows per parent key) from SQLite statistics
+ * 3. Compute parent match probability using: 1 - (1 - childSelectivity)^fanout
+ *    This is the same formula used in planner-join.ts for join cost estimation.
+ *
+ * For NOT EXISTS, we return 1.0 since the planner never flips NOT EXISTS joins.
+ *
+ * For AND/OR, we combine selectivities assuming independence (same assumption
+ * as the rest of the planner).
+ *
+ * @param condition The condition tree to estimate selectivity for
+ * @param parentTable The parent table name (used for recursion tracking)
+ * @param sort Current ordering (passed to recursive cost model calls)
+ * @param parentConstraint Current constraint (passed to recursive cost model calls)
+ * @param costModel The internal cost model function (for recursive calls)
+ * @param fanoutEstimator The fanout estimator (for getting fanout data)
+ * @param tableSpecs Table specs (for recursive cost model calls)
+ * @param visited Set of visited (parent:child:fields) keys to prevent infinite recursion
+ * @returns Selectivity value between 0 and 1 (1 = no filtering, 0 = no rows pass)
+ */
+export function estimateCorrelatedSelectivity(
+  condition: Condition,
+  parentTable: string,
+  sort: Ordering,
+  parentConstraint: PlannerConstraint | undefined,
+  costModel: InternalCostModel,
+  fanoutEstimator: SQLiteStatFanout,
+  tableSpecs: Map<string, {zqlSpec: Record<string, SchemaValue>}>,
+  visited: Set<string>,
+): number {
+  switch (condition.type) {
+    case 'simple':
+      // Simple conditions are already accounted for by scanstatus
+      return 1.0;
+
+    case 'correlatedSubquery': {
+      // NOT EXISTS joins are never flipped by the planner, so don't estimate
+      if (condition.op === 'NOT EXISTS') {
+        return 1.0;
+      }
+
+      const {related} = condition;
+      const childTable = related.subquery.table;
+      const childFields = [...related.correlation.childField];
+
+      // Check for recursion to prevent infinite loops
+      const visitedKey = `${parentTable}:${childTable}:${childFields.join(',')}`;
+      if (visited.has(visitedKey)) {
+        return CYCLE_DEFAULT_SELECTIVITY;
+      }
+
+      const newVisited = new Set(visited);
+      newVisited.add(visitedKey);
+
+      // Estimate child selectivity: fraction of child rows matching subquery filters.
+      // We do NOT pass the correlation fields as a constraint here. The correlation
+      // fields are the join condition (every parent row matches exactly one child row
+      // via them), not a filter. Passing them would cause a PK/constraint lookup
+      // returning 1 row, making childSelectivity = 1/1 = 1.0 regardless of the
+      // actual subquery selectivity.
+      //
+      // What we want: what fraction of ALL child rows pass the subquery's WHERE?
+      // That's childWithFilters.rows / childTotalRows.rows where neither call
+      // includes the correlation constraint.
+      const childWithFilters = costModel(
+        childTable,
+        related.subquery.orderBy ?? [],
+        related.subquery.where,
+        undefined, // no constraint: we want total child row counts
+        newVisited,
+      );
+      const childWithoutFilters = costModel(
+        childTable,
+        related.subquery.orderBy ?? [],
+        undefined, // no filters = all child rows
+        undefined, // no constraint: we want total child row counts
+        newVisited,
+      );
+
+      const childSelectivity =
+        childWithoutFilters.rows > 0
+          ? childWithFilters.rows / childWithoutFilters.rows
+          : 1.0;
+
+      // Get fanout for the correlation columns (average child rows per parent key)
+      const fanoutResult = fanoutEstimator.getFanout(childTable, childFields);
+      const fanout = fanoutResult.fanout;
+
+      // Probability that at least one child matches a given parent row
+      // Same formula as planner-join.ts line 319:
+      //   1 - (1 - childSelectivity)^fanout
+      const parentMatchProb = 1 - Math.pow(1 - childSelectivity, fanout);
+
+      return parentMatchProb;
+    }
+
+    case 'and': {
+      // AND: multiply selectivities (assuming independence)
+      let selectivity = 1.0;
+      for (const sub of condition.conditions) {
+        selectivity *= estimateCorrelatedSelectivity(
+          sub,
+          parentTable,
+          sort,
+          parentConstraint,
+          costModel,
+          fanoutEstimator,
+          tableSpecs,
+          visited,
+        );
+      }
+      return selectivity;
+    }
+
+    case 'or': {
+      // OR: P(A or B) = 1 - P(not A) * P(not B) (assuming independence)
+      let missProb = 1.0;
+      for (const sub of condition.conditions) {
+        const sel = estimateCorrelatedSelectivity(
+          sub,
+          parentTable,
+          sort,
+          parentConstraint,
+          costModel,
+          fanoutEstimator,
+          tableSpecs,
+          visited,
+        );
+        missProb *= 1 - sel;
+      }
+      return 1 - missProb;
+    }
+  }
 }
 
 /**
