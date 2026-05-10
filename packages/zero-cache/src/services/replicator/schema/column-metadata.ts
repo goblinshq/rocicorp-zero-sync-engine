@@ -142,6 +142,11 @@ export class ColumnMetadataStore {
    * Returns `undefined` if the metadata table doesn't exist yet.
    */
   static getInstance(db: Database): ColumnMetadataStore | undefined {
+    const cached = ColumnMetadataStore.#instances.get(db);
+    if (cached) {
+      return cached;
+    }
+
     // Check if table exists
     const tableExists = db
       .prepare(
@@ -153,11 +158,8 @@ export class ColumnMetadataStore {
       return undefined;
     }
 
-    let instance = ColumnMetadataStore.#instances.get(db);
-    if (!instance) {
-      instance = new ColumnMetadataStore(db);
-      ColumnMetadataStore.#instances.set(db, instance);
-    }
+    const instance = new ColumnMetadataStore(db);
+    ColumnMetadataStore.#instances.set(db, instance);
     return instance;
   }
 

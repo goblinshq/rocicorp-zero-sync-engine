@@ -13,7 +13,6 @@ import {
 import {
   computeZqlSpecs,
   listIndexes,
-  listTables,
   type LiteTableSpecWithReplicationStatus,
 } from '../../db/lite-tables.ts';
 import {
@@ -21,6 +20,7 @@ import {
   mapPostgresToLiteColumn,
   mapPostgresToLiteIndex,
 } from '../../db/pg-to-lite.ts';
+import type {LiteTableSpec} from '../../db/specs.ts';
 import type {StatementRunner} from '../../db/statements.ts';
 import type {LexiVersion} from '../../types/lexi-version.ts';
 import {
@@ -391,11 +391,16 @@ class TransactionProcessor {
 
   #reloadTableSpecs() {
     this.#tableSpecs.clear();
+    const fullTables = new Map<string, LiteTableSpec>();
     // zqlSpecs include the primary key derived from unique indexes
-    const zqlSpecs = computeZqlSpecs(this.#lc, this.#db.db, {
-      includeBackfillingColumns: true,
-    });
-    for (let spec of listTables(this.#db.db)) {
+    const zqlSpecs = computeZqlSpecs(
+      this.#lc,
+      this.#db.db,
+      {includeBackfillingColumns: true},
+      new Map(),
+      fullTables,
+    );
+    for (let spec of fullTables.values()) {
       if (!spec.primaryKey) {
         spec = {
           ...spec,
