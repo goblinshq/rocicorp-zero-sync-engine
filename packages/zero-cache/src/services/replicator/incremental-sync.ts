@@ -1,7 +1,10 @@
 import type {LogContext} from '@rocicorp/logger';
 import {AbortError} from '../../../../shared/src/abort-error.ts';
 import type {Enum} from '../../../../shared/src/enum.ts';
-import {getOrCreateCounter} from '../../observability/metrics.ts';
+import {
+  getOrCreateCounter,
+  getOrCreateLatencyHistogram,
+} from '../../observability/metrics.ts';
 import type {Source} from '../../types/streams.ts';
 import type {DownloadStatus} from '../change-source/protocol/current.ts';
 import type {ChangeStreamData} from '../change-source/protocol/current/downstream.ts';
@@ -47,6 +50,11 @@ export class IncrementalSyncer {
     'replication',
     'events',
     'Number of replication events processed',
+  );
+  readonly #messageProcessTime = getOrCreateLatencyHistogram(
+    'replication',
+    'message.process-time',
+    'Time spent by the replicator write worker processing a replication stream message.',
   );
 
   constructor(
@@ -171,9 +179,14 @@ export class IncrementalSyncer {
                 backfillStatus = status; // Update the current status
               }
 
+              const start = performance.now();
               const result = await this.#worker.processMessage(
                 message as ChangeStreamData,
               );
+              this.#messageProcessTime.recordMs(performance.now() - start, {
+                mode: this.#mode,
+                tag: msg.tag,
+              });
 
               this.#handleResult(lc, result);
               if (result?.completedBackfill) {
