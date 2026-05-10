@@ -7,7 +7,7 @@ import type {PrimaryKey} from '../../zero-protocol/src/primary-key.ts';
 import type {SchemaValue} from '../../zero-schema/src/table-schema.ts';
 import {Catch, type CaughtNode} from '../../zql/src/ivm/catch.ts';
 import {FlippedJoin} from '../../zql/src/ivm/flipped-join.ts';
-import type {FetchRequest} from '../../zql/src/ivm/operator.ts';
+import type {FetchRequest, Input} from '../../zql/src/ivm/operator.ts';
 import {makeSourceChangeAdd} from '../../zql/src/ivm/source.ts';
 import {consume} from '../../zql/src/ivm/stream.ts';
 import {Database} from './db.ts';
@@ -336,6 +336,44 @@ test('multiple children sharing a parent are returned in child-input order', () 
   expect(parentIds(result)).toEqual(['o1']);
   // child connect ordering is id asc, so the relationship is m1, m2, m3.
   expect(memberIds(result[0])).toEqual(['m1', 'm2', 'm3']);
+});
+
+test('unique-index path dedupes children sharing a parent-key fetch', () => {
+  const f = orgFixture({
+    childRows: [
+      {id: 'm1', orgId: 'o1', orgSlug: 'acme', userId: 'u1'},
+      {id: 'm2', orgId: 'o1', orgSlug: 'acme', userId: 'u2'},
+      {id: 'm3', orgId: 'o1', orgSlug: 'acme', userId: 'u3'},
+      {id: 'm4', orgId: 'o2', orgSlug: 'globex', userId: 'u4'},
+    ],
+  });
+  let parentFetches = 0;
+  const parentInput = f.parent.connect([['id', 'asc']]);
+  const countedParent: Input = {
+    getSchema: () => parentInput.getSchema(),
+    fetch: req => {
+      parentFetches++;
+      return parentInput.fetch(req);
+    },
+    setOutput: output => parentInput.setOutput(output),
+    destroy: () => parentInput.destroy(),
+  };
+
+  const join = new FlippedJoin({
+    parent: countedParent,
+    child: f.child.connect([['id', 'asc']]),
+    parentKey: ['slug'],
+    childKey: ['orgSlug'],
+    relationshipName: 'memberships',
+    hidden: false,
+    system: 'client',
+  });
+
+  const result = new Catch(join).fetch();
+  expect(parentIds(result)).toEqual(['o1', 'o2']);
+  expect(memberIds(result[0])).toEqual(['m1', 'm2', 'm3']);
+  expect(memberIds(result[1])).toEqual(['m4']);
+  expect(parentFetches).toBe(2);
 });
 
 test('child rows with NULL in childKey are skipped (no parent match possible)', () => {

@@ -189,7 +189,10 @@ export class FlippedJoin implements Input {
     req: FetchRequest,
     childNodes: Node[],
   ): Stream<Node | 'yield'> {
-    const pairs: {childNode: Node; parentNode: Node}[] = [];
+    const childNodesByParentKey = new Map<
+      string,
+      {constraint: Constraint; childNodes: Node[]}
+    >();
     for (const childNode of childNodes) {
       const constraintFromChild = buildJoinConstraint(
         childNode.row,
@@ -203,11 +206,25 @@ export class FlippedJoin implements Input {
       ) {
         continue;
       }
+      const key = canonicalKey(constraintFromChild, this.#parentKey);
+      const existing = childNodesByParentKey.get(key);
+      if (existing) {
+        existing.childNodes.push(childNode);
+      } else {
+        childNodesByParentKey.set(key, {
+          constraint: constraintFromChild,
+          childNodes: [childNode],
+        });
+      }
+    }
+
+    const pairs: {childNodes: Node[]; parentNode: Node}[] = [];
+    for (const {constraint, childNodes} of childNodesByParentKey.values()) {
       const stream = this.#parent.fetch({
         ...req,
         constraint: {
           ...req.constraint,
-          ...constraintFromChild,
+          ...constraint,
         },
       });
       // parentKey matches a unique index, so this fetch returns at most
@@ -219,7 +236,7 @@ export class FlippedJoin implements Input {
           yield 'yield';
           continue;
         }
-        pairs.push({childNode, parentNode: node});
+        pairs.push({childNodes, parentNode: node});
       }
     }
 
@@ -238,7 +255,7 @@ export class FlippedJoin implements Input {
         i < pairs.length &&
         compareRows(pairs[i].parentNode.row, minParentNode.row) === 0
       ) {
-        relatedChildNodes.push(pairs[i].childNode);
+        relatedChildNodes.push(...pairs[i].childNodes);
         i++;
       }
       yield* this.#yieldParentWithOverlay(minParentNode, relatedChildNodes);
