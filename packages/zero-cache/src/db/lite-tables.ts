@@ -5,6 +5,7 @@ import * as v from '../../../shared/src/valita.ts';
 import {primaryKeySchema} from '../../../zero-protocol/src/primary-key.ts';
 import type {Database} from '../../../zqlite/src/db.ts';
 import {
+  type ColumnMetadata,
   ColumnMetadataStore,
   metadataToLiteTypeString,
 } from '../services/replicator/schema/column-metadata.ts';
@@ -72,6 +73,10 @@ export function listTables(
   const minRowVersions = useTableMetadata
     ? new TableMetadataTracker(db).getMinRowVersions()
     : new Map();
+  const columnMetadata = useColumnMetadata
+    ? ColumnMetadataStore.getInstance(db)
+    : undefined;
+  const metadataByTable = new Map<string, Map<string, ColumnMetadata>>();
   const tables: LiteTableSpecWithReplicationStatus[] = [];
   let table: MutableLiteTableSpecWithReplicationStatus | undefined;
 
@@ -94,9 +99,15 @@ export function listTables(
       | typeof PostgresTypeClass.Enum
       | null;
 
-    const metadata = useColumnMetadata
-      ? ColumnMetadataStore.getInstance(db)?.getColumn(col.table, col.name)
-      : undefined;
+    let metadata: ColumnMetadata | undefined;
+    if (columnMetadata) {
+      let tableMetadata = metadataByTable.get(col.table);
+      if (!tableMetadata) {
+        tableMetadata = columnMetadata.getTable(col.table);
+        metadataByTable.set(col.table, tableMetadata);
+      }
+      metadata = tableMetadata.get(col.name);
+    }
     if (metadata) {
       // Read from metadata table and convert to pipe notation
       dataType = metadataToLiteTypeString(metadata);
