@@ -324,24 +324,6 @@ suite('fetch one:many', () => {
           "fetch",
           {
             "constraint": {
-              "id": "i1",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i2",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
               "id": "i2",
             },
           },
@@ -966,34 +948,7 @@ suite('fetch one:many:many', () => {
           "fetch",
           {
             "constraint": {
-              "id": "c1",
-            },
-          },
-        ],
-        [
-          "1",
-          "fetch",
-          {
-            "constraint": {
               "id": "c2",
-            },
-          },
-        ],
-        [
-          "1",
-          "fetch",
-          {
-            "constraint": {
-              "id": "c2",
-            },
-          },
-        ],
-        [
-          "1",
-          "fetch",
-          {
-            "constraint": {
-              "id": "c3",
             },
           },
         ],
@@ -1016,38 +971,11 @@ suite('fetch one:many:many', () => {
           },
         ],
         [
-          "1",
-          "fetch",
-          {
-            "constraint": {
-              "id": "c4",
-            },
-          },
-        ],
-        [
           "0",
           "fetch",
           {
             "constraint": {
               "id": "i1",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i1",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i2",
             },
           },
         ],
@@ -1347,15 +1275,6 @@ suite('fetch one:many:one', () => {
             },
           },
         ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i1",
-            },
-          },
-        ],
       ]
     `);
   });
@@ -1493,24 +1412,6 @@ suite('fetch one:many:one', () => {
           {
             "constraint": {
               "id": "i1",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i1",
-            },
-          },
-        ],
-        [
-          "0",
-          "fetch",
-          {
-            "constraint": {
-              "id": "i2",
             },
           },
         ],

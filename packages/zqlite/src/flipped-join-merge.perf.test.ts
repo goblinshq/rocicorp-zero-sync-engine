@@ -8,29 +8,17 @@ import {Database} from './db.ts';
 import {TableSource} from './table-source.ts';
 
 /**
- * Wall-clock perf for FlippedJoin against a real zqlite TableSource on
- * the non-unique parentKey path — the path optimized by the heap-merge
- * + dedup changes.
+ * Wall-clock perf for FlippedJoin against a real zqlite TableSource.
  *
- * Two compounding wins this test surfaces:
- *  - **Dedup of redundant parent fetches.** Children sharing a
- *    parent-key value now produce one parent cursor, not N. Pre-fix the
- *    code opened one cursor per child and each cursor refetched the
- *    same parent rows.
- *  - **Heap-based K-way merge.** O(log K) per emit instead of O(K) per
- *    emit (linear scan of every iterator's head row). K = number of
- *    open per-key cursors, so K = #childNodes pre-dedup vs #unique-keys
- *    post-dedup — the dedup win shrinks K too.
+ * Cases:
+ *  - non-unique parentKey: exercises the merge-sort path optimized by
+ *    heap-merge + per-parent-key dedup.
+ *  - unique parentKey: exercises the quicksort path optimized by
+ *    per-parent-key dedup.
  *
  * Gated on PERF=1 so it doesn't run in CI. To run:
  *
  *   PERF=1 npm --workspace=zqlite run test -- flipped-join-merge.perf
- *
- * To compare against the pre-heap-merge / pre-dedup algorithm, check
- * out a revision before those changes landed in a worktree and port
- * this file across — the FlippedJoin and TableSource constructor
- * signatures are identical at that revision, so no test-side changes
- * are needed.
  */
 
 const lc = createSilentLogContext();
@@ -38,20 +26,23 @@ const lc = createSilentLogContext();
 function setupDb(
   numChildren: number,
   uniqueBuckets: number,
+  uniqueParentKey = false,
 ): {parent: TableSource; child: TableSource} {
   const db = new Database(lc, ':memory:');
-  // parent.bucket is intentionally NOT unique — that's what forces
-  // FlippedJoin down the merge-sort path (i.e. the path the heap-merge
-  // + dedup changes optimized). With a unique parent key the operator
-  // takes the quicksort path instead, which doesn't exercise either of
-  // the wins we want to measure.
+  // In non-unique mode, parent.bucket intentionally forces FlippedJoin
+  // down the merge-sort path. In unique mode, parent.bucket is unique,
+  // forcing the quicksort path while children still duplicate parent-key
+  // lookups.
+  const parentBucketIndex = uniqueParentKey
+    ? 'CREATE UNIQUE INDEX parent_bucket_idx ON parent (bucket);'
+    : 'CREATE INDEX parent_bucket_idx ON parent (bucket);';
   db.exec(/* sql */ `
     CREATE TABLE parent (
       id INTEGER NOT NULL,
       bucket INTEGER NOT NULL
     );
     CREATE UNIQUE INDEX parent_id_idx ON parent (id);
-    CREATE INDEX parent_bucket_idx ON parent (bucket);
+    ${parentBucketIndex}
     CREATE TABLE child (
       id INTEGER NOT NULL,
       bucket INTEGER NOT NULL
@@ -60,10 +51,11 @@ function setupDb(
     CREATE INDEX child_bucket_idx ON child (bucket);
   `);
 
-  // 1:1 parents-to-children-per-bucket so total emitted-row count is
-  // independent of the dedup factor — only the merge K and per-cursor
-  // work change across cases.
-  const numParents = numChildren;
+  // Non-unique mode uses 1:1 parents-to-children-per-bucket so total
+  // emitted-row count is independent of the dedup factor. Unique mode
+  // has one parent per bucket so repeated child rows duplicate unique
+  // parent lookups.
+  const numParents = uniqueParentKey ? uniqueBuckets : numChildren;
   const insertParent = db.prepare(
     'INSERT INTO parent (id, bucket) VALUES (?,?)',
   );
@@ -104,8 +96,12 @@ type RunResult = {
   elapsedMs: number;
 };
 
-function runOnce(numChildren: number, uniqueBuckets: number): RunResult {
-  const {parent, child} = setupDb(numChildren, uniqueBuckets);
+function runOnce(
+  numChildren: number,
+  uniqueBuckets: number,
+  uniqueParentKey = false,
+): RunResult {
+  const {parent, child} = setupDb(numChildren, uniqueBuckets, uniqueParentKey);
 
   const fj = new FlippedJoin({
     parent: parent.connect([['id', 'asc']]),
@@ -153,7 +149,7 @@ function logRow(r: RunResult) {
 }
 
 describe.skipIf(!process.env.PERF)(
-  'FlippedJoin perf — non-unique parentKey (merge-sort path)',
+  'FlippedJoin perf',
   {timeout: 600_000},
   () => {
     test('2.5k children, sweep dedup factor', () => {
@@ -188,6 +184,19 @@ describe.skipIf(!process.env.PERF)(
       logHeader();
       for (let i = 0; i < 3; i++) {
         logRow(runOnce(N, N / 25));
+      }
+    });
+
+    test('unique parentKey quicksort path, sweep duplicate parent lookups', () => {
+      const N = 10_000;
+      runOnce(500, 50, true);
+
+      console.log(
+        `\n=== FlippedJoin quicksort: ${N.toLocaleString()} children, UNIQUE parent bucket ===`,
+      );
+      logHeader();
+      for (const buckets of [N, N / 5, N / 25, N / 125, N / 625]) {
+        logRow(runOnce(N, buckets, true));
       }
     });
   },
