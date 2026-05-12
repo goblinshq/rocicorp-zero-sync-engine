@@ -3,9 +3,8 @@ import type {AddressInfo} from 'node:net';
 import {monitorEventLoopDelay, performance} from 'node:perf_hooks';
 import {fileURLToPath} from 'node:url';
 import WebSocket, {WebSocketServer, type RawData} from 'ws';
-import {BigIntJSON, type JSONValue} from '../../shared/src/bigint-json.ts';
+import {BigIntJSON} from '../../shared/src/bigint-json.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
-import * as v from '../../shared/src/valita.ts';
 import {
   downstreamSchema,
   type Downstream,
@@ -16,7 +15,6 @@ import {
   type Source,
 } from '../src/types/streams.ts';
 import {Subscription, type Result} from '../src/types/subscription.ts';
-import {expectPingsForLiveness} from '../src/types/ws.ts';
 import {loadPayloadProfiles, type PayloadProfile} from './load-fixtures.ts';
 import {
   argValue,
@@ -29,7 +27,6 @@ import {
   writeJsonSummary,
 } from './perf-utils.ts';
 
-const pingIntervalMs = 30_000;
 const threshold =
   'Ship production cumulative ack only if every scenario has no p95 latency regression greater than 1 ms or 5%, and cumulative ack reduces ack messages, elapsed time, or p95 event-loop delay by >10% (or ack traffic by >=50%).';
 
@@ -103,11 +100,6 @@ type Summary = {
   readonly results: readonly ScenarioResult[];
   readonly comparisons: readonly ScenarioComparison[];
   readonly decision: BenchmarkDecision;
-};
-
-type Streamed<T> = {
-  readonly msg: T;
-  readonly id: number;
 };
 
 type WebSocketPair = {
@@ -238,68 +230,6 @@ async function closeWebSocketPair(pair: WebSocketPair) {
   });
 }
 
-async function streamInPerMessage<T extends JSONValue>(
-  lc: ReturnType<typeof createSilentLogContext>,
-  source: WebSocket,
-  schema: v.Type<T>,
-): Promise<Source<T>> {
-  expectPingsForLiveness(lc, source, pingIntervalMs);
-
-  const streamedSchema = v.object({
-    msg: schema,
-    id: v.number(),
-  });
-  const sink: Subscription<T, Streamed<T>> = new Subscription<T, Streamed<T>>(
-    {
-      consumed: ({id}) => source.send(JSON.stringify({ack: id})),
-      cleanup: () => cleanup(),
-    },
-    ({msg}) => msg,
-  );
-
-  function cleanup() {
-    source.removeEventListener('message', handleMessage);
-    source.removeEventListener('close', handleClose);
-    source.removeEventListener('error', handleError);
-    if (!webSocketClosed(source)) {
-      source.close();
-    }
-  }
-
-  function handleMessage(event: WebSocket.MessageEvent) {
-    const data = event.data.toString();
-    if (!sink.active) {
-      return;
-    }
-    try {
-      const value = BigIntJSON.parse(data);
-      const msg = v.parse(value, streamedSchema, 'passthrough');
-      sink.push(msg);
-    } catch (err) {
-      sink.fail(ensureError(err));
-    }
-  }
-
-  function handleClose() {
-    sink.end();
-  }
-
-  function handleError(event: WebSocket.ErrorEvent) {
-    sink.fail(ensureError(event.error));
-  }
-
-  source.addEventListener('message', handleMessage);
-  source.addEventListener('close', handleClose);
-  source.addEventListener('error', handleError);
-
-  await waitForOpen(source);
-  return sink;
-}
-
-function ensureError(err: unknown) {
-  return err instanceof Error ? err : new Error(String(err));
-}
-
 async function consumeMessages(
   source: Source<Downstream>,
   latencies: number[],
@@ -390,12 +320,9 @@ async function runScenario(
   });
 
   try {
-    const inbound =
-      strategy === 'per-message-ack'
-        ? await streamInPerMessage(lc, pair.clientSocket, downstreamSchema)
-        : await streamIn(lc, pair.clientSocket, downstreamSchema, {
-            ack: 'cumulative',
-          });
+    const inbound = await streamIn(lc, pair.clientSocket, downstreamSchema, {
+      ack: strategy === 'per-message-ack' ? 'per-message' : 'cumulative',
+    });
     const consumer = consumeMessages(inbound, latencies);
     const outbound = streamOutStringified(lc, source, pair.serverSocket);
     const eventLoopDelay = monitorEventLoopDelay({resolution: 10});
@@ -468,20 +395,18 @@ async function runScenarioPair(
   payload: PayloadProfile,
   messages: number,
 ): Promise<readonly [ScenarioResult, ScenarioResult]> {
-  const runs = await Promise.all(
-    strategyOrder.map(strategy =>
-      runScenario(strategy, scenario, payload, messages),
-    ),
+  const baseline = await runScenario(
+    strategyOrder[0],
+    scenario,
+    payload,
+    messages,
   );
-  const baseline = runs.find(result => result.strategy === 'per-message-ack');
-  const cumulative = runs.find(
-    result => result.strategy === 'production-cumulative-ack',
+  const cumulative = await runScenario(
+    strategyOrder[1],
+    scenario,
+    payload,
+    messages,
   );
-  if (!baseline || !cumulative) {
-    throw new Error(
-      `Missing strategy result for ${scenario.name} ${payload.size}`,
-    );
-  }
   return [baseline, cumulative];
 }
 
