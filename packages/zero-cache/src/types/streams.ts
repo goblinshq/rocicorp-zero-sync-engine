@@ -28,7 +28,7 @@ import {
 // Consistent with Postgres keepalives, and shorter than the
 // commonly used default idle timeout of 1 minute.
 const PING_INTERVAL_MS = 30_000;
-const CUMULATIVE_ACK_EVERY = 32;
+const CUMULATIVE_ACK_EVERY = 8;
 const CUMULATIVE_ACK_INTERVAL_MS = 5;
 
 export type Source<T> = AsyncIterable<T> & {

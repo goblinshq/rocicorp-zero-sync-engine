@@ -519,7 +519,7 @@ export async function main() {
   const mode: Mode = full ? 'full' : 'smoke';
   const messages = envInt('ZERO_ACK_MESSAGES', full ? 5000 : 1000);
   const ackBatch: AckBatchConfig = {
-    every: 32,
+    every: 8,
     intervalMs: 5,
   };
   const output = argValue('out') ?? process.env.ZERO_BENCH_OUT;
