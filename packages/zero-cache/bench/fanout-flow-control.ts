@@ -1,3 +1,4 @@
+/* oxlint-disable no-console */
 import {performance} from 'node:perf_hooks';
 import {fileURLToPath} from 'node:url';
 import {BigIntJSON} from '../../shared/src/bigint-json.ts';
