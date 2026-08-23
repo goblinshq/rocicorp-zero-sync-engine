@@ -1,10 +1,20 @@
+import type {LogContext} from '@rocicorp/logger';
 import {expect, vi} from 'vitest';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
 import {h128} from '../../../../shared/src/hash.ts';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import {Queue} from '../../../../shared/src/queue.ts';
+import {
+  ANYONE_CAN_DO_ANYTHING,
+  definePermissions,
+} from '../../../../zero-permissions/src/permissions.ts';
 import type {AST} from '../../../../zero-protocol/src/ast.ts';
 import {type ClientSchema} from '../../../../zero-protocol/src/client-schema.ts';
+import type {
+  TransformRequestMessage,
+  TransformResponseBody,
+  TransformResponseMessage,
+} from '../../../../zero-protocol/src/custom-queries.ts';
 import type {Downstream} from '../../../../zero-protocol/src/down.ts';
 import type {PokePartBody} from '../../../../zero-protocol/src/poke.ts';
 import type {UpQueriesPatch} from '../../../../zero-protocol/src/queries-patch.ts';
@@ -20,23 +30,20 @@ import {
   table,
 } from '../../../../zero-schema/src/builder/table-builder.ts';
 import type {PermissionsConfig} from '../../../../zero-schema/src/compiled-permissions.ts';
-import {
-  ANYONE_CAN_DO_ANYTHING,
-  definePermissions,
-} from '../../../../zero-schema/src/permissions.ts';
 import type {ExpressionBuilder} from '../../../../zql/src/query/expression.ts';
 import {
   CREATE_STORAGE_TABLE,
   DatabaseStorage,
 } from '../../../../zqlite/src/database-storage.ts';
 import {Database} from '../../../../zqlite/src/db.ts';
-import {AuthSessionImpl, type ValidateLegacyJWT} from '../../auth/auth.ts';
 import type {NormalizedZeroConfig} from '../../config/normalize.ts';
 import type {ZeroConfig} from '../../config/zero-config.ts';
 import {CustomQueryTransformer} from '../../custom-queries/transform-query.ts';
 import {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import type {TestDBs} from '../../test/db.ts';
 import {DbFile} from '../../test/lite.ts';
+import type {ViewSyncerDownstream} from '../../types/downstream.ts';
+import type {PostgresDB} from '../../types/pg.ts';
 import {upstreamSchema} from '../../types/shards.ts';
 import {id} from '../../types/sql.ts';
 import type {Source} from '../../types/streams.ts';
@@ -45,6 +52,7 @@ import {getMutationsTableDefinition} from '../change-source/pg/schema/shard.ts';
 import type {ReplicaState} from '../replicator/replicator.ts';
 import {initReplicationState} from '../replicator/schema/replication-state.ts';
 import {fakeReplicator, ReplicationMessages} from '../replicator/test-utils.ts';
+import {ConnectionContextManagerImpl} from './connection-context-manager.ts';
 import {DrainCoordinator} from './drain-coordinator.ts';
 import {PipelineDriver} from './pipeline-driver.ts';
 import {initViewSyncerSchema} from './schema/init.ts';
@@ -576,13 +584,72 @@ async function expectDesired(
 
 export const TEST_ADMIN_PASSWORD = 'test-pwd';
 
+type SetupOptions = Readonly<{
+  authConfig?: Partial<NormalizedZeroConfig['auth']> | undefined;
+  lc?: LogContext | undefined;
+  /**
+   * Enables a default `/query` stub for PG integration tests that should still
+   * exercise real auth-validation code paths without having to model full
+   * custom-query transform responses.
+   */
+  queryFetchMode?: 'none' | 'empty-validation' | undefined;
+}>;
+
+export type QueryFetchCall = {
+  kind: 'validation' | 'transform';
+  url: string;
+  headers: Headers;
+  request: TransformRequestMessage;
+};
+
+type QueryFetchBehavior = (
+  call: QueryFetchCall,
+) => Response | Promise<Response>;
+
+export type QueryFetchMock = {
+  readonly calls: QueryFetchCall[];
+  readonly validationCalls: QueryFetchCall[];
+  readonly transformCalls: QueryFetchCall[];
+
+  respond(body: TransformResponseBody): void;
+  respondOnce(body: TransformResponseBody): void;
+
+  reply(response: Response): void;
+  replyOnce(response: Response): void;
+
+  reject(error: unknown): void;
+  rejectOnce(error: unknown): void;
+
+  handle(handler: QueryFetchBehavior): void;
+  handleOnce(handler: QueryFetchBehavior): void;
+
+  reset(): void;
+};
+
+type InternalQueryFetchMock = QueryFetchMock & {
+  consumeBehavior(): QueryFetchBehavior | undefined;
+};
+
+/** Shared PG view-syncer harness used by integration-style tests in this directory. */
 export async function setup(
   testDBs: TestDBs,
   testName: string,
   permissions: PermissionsConfig | undefined,
-  validateLegacyJWT: ValidateLegacyJWT | undefined = undefined,
+  options: SetupOptions = {},
 ) {
-  const lc = createSilentLogContext();
+  const {
+    authConfig = {},
+    lc = createSilentLogContext(),
+    queryFetchMode = 'none',
+  } = options;
+  const effectiveQueryConfig: ZeroConfig['query'] =
+    queryFetchMode === 'none' ? {...queryConfig, url: []} : queryConfig;
+  const queryFetch = createQueryFetchMock();
+  const restoreFetch = installQueryFetchStub(
+    queryFetchMode,
+    effectiveQueryConfig.url?.[0],
+    queryFetch,
+  );
   const storageDB = new Database(lc, ':memory:');
   storageDB.prepare(CREATE_STORAGE_TABLE).run();
 
@@ -689,12 +756,12 @@ export async function setup(
   const replicator = fakeReplicator(lc, replica);
   const stateChanges: Subscription<ReplicaState> = Subscription.create();
   const drainCoordinator = new DrainCoordinator();
-  const operatorStorage = new DatabaseStorage(
-    storageDB,
-  ).createClientGroupStorage(serviceID);
+  const databaseStorage = new DatabaseStorage(storageDB);
+  const operatorStorage = databaseStorage.createClientGroupStorage(serviceID);
 
   const config = {
-    query: queryConfig,
+    auth: {...authConfig},
+    query: effectiveQueryConfig,
     adminPassword: TEST_ADMIN_PASSWORD,
     app: {
       id: 'this_app',
@@ -709,16 +776,35 @@ export async function setup(
 
   // Create the custom query transformer if configured
   const {query} = config;
+  const queryURLs = query.url ?? [];
   const customQueryTransformer =
-    query.url &&
-    new CustomQueryTransformer(
-      lc,
-      {url: query.url, forwardCookies: query.forwardCookies},
-      SHARD,
-    );
+    queryURLs.length > 0 ? new CustomQueryTransformer(lc, SHARD) : undefined;
 
   const inspectorDelegate = new InspectorDelegate(customQueryTransformer);
-  const authSession = new AuthSessionImpl(lc, serviceID, validateLegacyJWT);
+  const connContextManager = new ConnectionContextManagerImpl(
+    lc,
+    config.auth.revalidateIntervalSeconds,
+    config.auth.retransformIntervalSeconds,
+    {
+      url: query.url,
+      apiKey: query.apiKey,
+      allowedClientHeaders: query.allowedClientHeaders,
+      allowedRequestHeaders: query.allowedRequestHeaders,
+      forwardCookies: query.forwardCookies,
+    },
+    {
+      url: config.push?.url ?? config.mutate?.url,
+      apiKey: config.push?.apiKey ?? config.mutate?.apiKey,
+      allowedClientHeaders:
+        config.push?.allowedClientHeaders ??
+        config.mutate?.allowedClientHeaders,
+      allowedRequestHeaders:
+        config.push?.allowedRequestHeaders ??
+        config.mutate?.allowedRequestHeaders,
+      forwardCookies:
+        config.push?.forwardCookies ?? config.mutate?.forwardCookies ?? false,
+    },
+  );
   const vs = new ViewSyncerService(
     config,
     lc,
@@ -740,9 +826,9 @@ export async function setup(
     drainCoordinator,
     100,
     inspectorDelegate,
+    connContextManager,
     customQueryTransformer,
     (_lc, _description, op) => op(),
-    authSession,
     undefined,
     setTimeoutFn,
   );
@@ -759,8 +845,34 @@ export async function setup(
     desiredQueriesPatch: UpQueriesPatch,
     clientSchema: ClientSchema | null = defaultClientSchema,
     activeClients?: string[],
-  ): {queue: Queue<Downstream>; source: Source<Downstream>} {
-    const source = vs.initConnection(ctx, [
+  ): {queue: Queue<Downstream>; source: Source<ViewSyncerDownstream>} {
+    const selector = {clientID: ctx.clientID, wsID: ctx.wsID};
+    vs.connContextManager.registerConnection(
+      selector,
+      {
+        protocolVersion: ctx.protocolVersion,
+        clientID: ctx.clientID,
+        clientGroupID: serviceID,
+        profileID: ctx.profileID,
+        baseCookie: ctx.baseCookie,
+        timestamp: Date.now(),
+        lmID: 0,
+        wsID: ctx.wsID,
+        debugPerf: false,
+        auth: ctx.auth?.raw,
+        userID: ctx.userID,
+        initConnectionMsg: undefined,
+        httpCookie: ctx.httpCookie,
+        origin: ctx.origin,
+      },
+      ctx.auth,
+    );
+    vs.connContextManager.initConnection(selector, {
+      desiredQueriesPatch,
+      clientSchema: clientSchema ?? undefined,
+      activeClients,
+    });
+    const source = vs.initConnection(selector, [
       'initConnection',
       {
         desiredQueriesPatch,
@@ -772,8 +884,8 @@ export async function setup(
 
     void (async function () {
       try {
-        for await (const msg of source) {
-          queue.enqueue(msg);
+        for await (const {message} of source) {
+          queue.enqueue(message);
         }
       } catch (e) {
         queue.enqueueRejection(e);
@@ -802,7 +914,6 @@ export async function setup(
     drainCoordinator,
     operatorStorage,
     vs,
-    authSession,
     viewSyncerDone,
     replicator,
     connect,
@@ -810,7 +921,296 @@ export async function setup(
     setTimeoutFn,
     inspectorDelegate,
     customQueryTransformer,
+    queryFetch,
+    clearMocks: () => {
+      queryFetch.reset();
+      restoreFetch();
+    },
+    config,
+    databaseStorage,
   };
+}
+
+/**
+ * Builds a fresh {@link ViewSyncerService} against resources produced by
+ * {@link setup}. Intended for tests that need to simulate a process restart —
+ * the original `vs` must have been `stop()`ed (destroys pipelines / operator
+ * storage / snapshotter) before calling this. The returned instance shares
+ * `storageDB`, `replicaDbFile`, `cvrDB`, and `customQueryTransformer` with the
+ * original but gets its own pipelines, snapshotter, operator storage,
+ * state-change subscription, drain coordinator, and connection-context
+ * manager.
+ */
+export function restartViewSyncer(params: {
+  databaseStorage: DatabaseStorage;
+  replicaDbFile: DbFile;
+  cvrDB: PostgresDB;
+  config: NormalizedZeroConfig;
+  customQueryTransformer: CustomQueryTransformer | undefined;
+  setTimeoutFn: Awaited<ReturnType<typeof setup>>['setTimeoutFn'];
+}) {
+  const {
+    databaseStorage,
+    replicaDbFile,
+    cvrDB,
+    config,
+    customQueryTransformer,
+    setTimeoutFn,
+  } = params;
+  const lc = createSilentLogContext();
+
+  const stateChanges: Subscription<ReplicaState> = Subscription.create();
+  const drainCoordinator = new DrainCoordinator();
+  const operatorStorage = databaseStorage.createClientGroupStorage(serviceID);
+  const inspectorDelegate = new InspectorDelegate(customQueryTransformer);
+
+  const {query} = config;
+  const connContextManager = new ConnectionContextManagerImpl(
+    lc,
+    config.auth.revalidateIntervalSeconds,
+    config.auth.retransformIntervalSeconds,
+    {
+      url: query.url,
+      apiKey: query.apiKey,
+      allowedClientHeaders: query.allowedClientHeaders,
+      allowedRequestHeaders: query.allowedRequestHeaders,
+      forwardCookies: query.forwardCookies,
+    },
+    {
+      url: config.push?.url ?? config.mutate?.url,
+      apiKey: config.push?.apiKey ?? config.mutate?.apiKey,
+      allowedClientHeaders:
+        config.push?.allowedClientHeaders ??
+        config.mutate?.allowedClientHeaders,
+      allowedRequestHeaders:
+        config.push?.allowedRequestHeaders ??
+        config.mutate?.allowedRequestHeaders,
+      forwardCookies:
+        config.push?.forwardCookies ?? config.mutate?.forwardCookies ?? false,
+    },
+  );
+
+  const vs = new ViewSyncerService(
+    config,
+    lc,
+    SHARD,
+    TASK_ID,
+    serviceID,
+    cvrDB,
+    new PipelineDriver(
+      lc.withContext('component', 'pipeline-driver'),
+      testLogConfig,
+      new Snapshotter(lc, replicaDbFile.path, SHARD),
+      SHARD,
+      operatorStorage,
+      'view-syncer-restart',
+      inspectorDelegate,
+      () => YIELD_THRESHOLD_MS,
+    ),
+    stateChanges,
+    drainCoordinator,
+    100,
+    inspectorDelegate,
+    connContextManager,
+    customQueryTransformer,
+    (_lc, _description, op) => op(),
+    undefined,
+    setTimeoutFn,
+  );
+  const viewSyncerDone = vs.run();
+
+  function connect(
+    ctx: SyncContext,
+    desiredQueriesPatch: UpQueriesPatch,
+    clientSchema: ClientSchema | null = defaultClientSchema,
+    activeClients?: string[],
+  ): Queue<Downstream> {
+    const selector = {clientID: ctx.clientID, wsID: ctx.wsID};
+    vs.connContextManager.registerConnection(
+      selector,
+      {
+        protocolVersion: ctx.protocolVersion,
+        clientID: ctx.clientID,
+        clientGroupID: serviceID,
+        profileID: ctx.profileID,
+        baseCookie: ctx.baseCookie,
+        timestamp: Date.now(),
+        lmID: 0,
+        wsID: ctx.wsID,
+        debugPerf: false,
+        auth: ctx.auth?.raw,
+        userID: ctx.userID,
+        initConnectionMsg: undefined,
+        httpCookie: ctx.httpCookie,
+        origin: ctx.origin,
+      },
+      ctx.auth,
+    );
+    vs.connContextManager.initConnection(selector, {
+      desiredQueriesPatch,
+      clientSchema: clientSchema ?? undefined,
+      activeClients,
+    });
+    const source = vs.initConnection(selector, [
+      'initConnection',
+      {
+        desiredQueriesPatch,
+        clientSchema: clientSchema ?? undefined,
+        activeClients,
+      },
+    ]);
+    const queue = new Queue<Downstream>();
+    void (async function () {
+      try {
+        for await (const {message} of source) {
+          queue.enqueue(message);
+        }
+      } catch (e) {
+        queue.enqueueRejection(e);
+      }
+    })();
+    return queue;
+  }
+
+  return {vs, stateChanges, viewSyncerDone, drainCoordinator, connect};
+}
+
+/**
+ * Installs an opt-in default `/query` stub for PG tests.
+ *
+ * The `empty-validation` mode auto-responds to validation requests and routes
+ * non-empty transform requests through the returned `queryFetch` controller.
+ */
+function installQueryFetchStub(
+  mode: SetupOptions['queryFetchMode'],
+  queryURL: string | undefined,
+  queryFetch: InternalQueryFetchMock,
+) {
+  if (mode !== 'empty-validation' || !queryURL) {
+    return () => {};
+  }
+
+  const expected = new URL(queryURL);
+  vi.stubGlobal('fetch', (url: RequestInfo | URL, init?: RequestInit) => {
+    const actual = new URL(url.toString());
+    // We do a simple check to make sure that the fetch is to the query URL.
+    if (
+      actual.origin === expected.origin &&
+      actual.pathname === expected.pathname
+    ) {
+      const request = parseTransformRequest(init);
+      if (request[1].length === 0) {
+        queryFetch.validationCalls.push({
+          kind: 'validation',
+          url: actual.toString(),
+          headers: new Headers(init?.headers),
+          request,
+        });
+        queryFetch.calls.push(queryFetch.validationCalls.at(-1)!);
+        return Promise.resolve(
+          Response.json(['transformed', []] satisfies TransformResponseMessage),
+        );
+      }
+
+      const call: QueryFetchCall = {
+        kind: 'transform',
+        url: actual.toString(),
+        headers: new Headers(init?.headers),
+        request,
+      };
+      queryFetch.transformCalls.push(call);
+      queryFetch.calls.push(call);
+
+      const behavior = queryFetch.consumeBehavior();
+      if (!behavior) {
+        throw new Error(
+          'No query fetch response is configured for a custom-query transform. Use the `queryFetch` controller returned by setup().',
+        );
+      }
+      return behavior(call);
+    }
+    throw new Error(
+      `Unexpected fetch call to ${url.toString()} - the query URL is expected to be ${queryURL}.`,
+    );
+  });
+
+  return () => {
+    vi.unstubAllGlobals();
+  };
+}
+
+function createQueryFetchMock(): InternalQueryFetchMock {
+  const calls: QueryFetchCall[] = [];
+  const validationCalls: QueryFetchCall[] = [];
+  const transformCalls: QueryFetchCall[] = [];
+  const queuedBehaviors: QueryFetchBehavior[] = [];
+  let defaultBehavior: QueryFetchBehavior | undefined;
+
+  return {
+    calls,
+    validationCalls,
+    transformCalls,
+
+    respond(body) {
+      defaultBehavior = makeTransformedBehavior(body);
+    },
+    respondOnce(body) {
+      queuedBehaviors.push(makeTransformedBehavior(body));
+    },
+
+    reply(response) {
+      defaultBehavior = () => response.clone();
+    },
+    replyOnce(response) {
+      queuedBehaviors.push(() => response.clone());
+    },
+
+    reject(error) {
+      defaultBehavior = () => Promise.reject(error);
+    },
+    rejectOnce(error) {
+      queuedBehaviors.push(() => Promise.reject(error));
+    },
+
+    handle(handler) {
+      defaultBehavior = handler;
+    },
+    handleOnce(handler) {
+      queuedBehaviors.push(handler);
+    },
+
+    reset() {
+      calls.length = 0;
+      validationCalls.length = 0;
+      transformCalls.length = 0;
+      queuedBehaviors.length = 0;
+      defaultBehavior = undefined;
+    },
+    consumeBehavior() {
+      return queuedBehaviors.shift() ?? defaultBehavior;
+    },
+  };
+
+  function makeTransformedBehavior(
+    body: TransformResponseBody,
+  ): QueryFetchBehavior {
+    return () =>
+      Response.json(['transformed', body] satisfies TransformResponseMessage);
+  }
+}
+
+function parseTransformRequest(init?: RequestInit): TransformRequestMessage {
+  const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+  if (
+    !Array.isArray(body) ||
+    body[0] !== 'transform' ||
+    !Array.isArray(body[1])
+  ) {
+    throw new Error(
+      `Expected a custom-query transform request body, got: ${JSON.stringify(body)}`,
+    );
+  }
+  return body as TransformRequestMessage;
 }
 
 export const messages = new ReplicationMessages({

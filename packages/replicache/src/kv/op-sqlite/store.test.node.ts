@@ -1,13 +1,13 @@
-import sqlite3 from '@rocicorp/zero-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
+import sqlite3 from '@rocicorp/zero-sqlite3';
 import {expect, test, vi} from 'vitest';
 import {withRead, withWrite} from '../../with-transactions.ts';
 import {
   registerCreatedFile,
   runSQLiteStoreTests,
 } from '../sqlite-store-test-util.ts';
-import {clearAllNamedStoresForTesting} from '../sqlite-store.ts';
+import {clearAllNamedStoresForTesting, safeFilename} from '../sqlite-store.ts';
 import {opSQLiteStoreProvider, type OpSQLiteStoreOptions} from './store.ts';
 
 // Mock the @op-engineering/op-sqlite module with Node SQLite implementation
@@ -29,34 +29,26 @@ vi.mock('@op-engineering/op-sqlite', () => {
       // Create a new database connection - SQLite handles file locking and concurrency
       const db = sqlite3(filename);
 
+      // Mimic op-sqlite `>=17` executeRaw shape: `{rawRows, ...}`. See `RawResult`.
+      const exec = (sql: string, params: string[] = []) => {
+        const stmt = db.prepare(sql);
+        let rawRows: unknown[][] = [];
+        if (/^\s*select/i.test(sql)) {
+          const result = stmt.all(...params);
+          rawRows = Array.isArray(result)
+            ? result.map(row => Object.values(row as Record<string, unknown>))
+            : [];
+        } else {
+          stmt.run(...params);
+        }
+        return {rowsAffected: 0, insertId: 0, rawRows, columnNames: []};
+      };
+
       return {
         // oxlint-disable-next-line require-await
-        executeRaw: async (sql: string, params: string[] = []) => {
-          const stmt = db.prepare(sql);
-          const isSelectQuery = /^\s*select/i.test(sql);
-          if (isSelectQuery) {
-            const result = stmt.all(...params);
-            // Convert to raw format (array of arrays)
-            return Array.isArray(result)
-              ? result.map(row => Object.values(row as Record<string, unknown>))
-              : [];
-          }
-          stmt.run(...params);
-          return [];
-        },
-        executeRawSync: (sql: string, params: string[] = []) => {
-          const stmt = db.prepare(sql);
-          const isSelectQuery = /^\s*select/i.test(sql);
-          if (isSelectQuery) {
-            const result = stmt.all(...params);
-            // Convert to raw format (array of arrays)
-            return Array.isArray(result)
-              ? result.map(row => Object.values(row as Record<string, unknown>))
-              : [];
-          }
-          stmt.run(...params);
-          return [];
-        },
+        executeRaw: async (sql: string, params: string[] = []) =>
+          exec(sql, params),
+        executeRawSync: exec,
         close: () => {
           // SQLite handles this properly, just close the connection
           db.close();
@@ -140,4 +132,35 @@ test('OpSQLite specific configuration options', async () => {
   });
 
   await storeWithOptions.close();
+});
+
+test('withWriteNoImplicitCommit reports both operation and rollback errors', async () => {
+  const storeName = 'auto-rollback-op';
+  const store = createStore(storeName);
+  const filename = path.resolve(__dirname, `op_${safeFilename(storeName)}.db`);
+  const triggerDb = sqlite3(filename);
+  triggerDb.exec(`
+    DROP TRIGGER IF EXISTS entry_auto_rollback_op;
+    CREATE TRIGGER entry_auto_rollback_op
+    BEFORE INSERT ON entry
+    WHEN NEW.key = 'trigger-rollback'
+    BEGIN
+      SELECT RAISE(ROLLBACK, 'auto rollback put failure');
+    END;
+  `);
+  triggerDb.close();
+
+  const err = await withWrite(store, async write => {
+    await write.put('trigger-rollback', 'value');
+  }).then(
+    () => undefined,
+    e => e,
+  );
+
+  expect(err).toBeInstanceOf(Error);
+  expect(String(err)).toContain('auto rollback put failure');
+  expect(String(err)).toContain('cannot rollback');
+  expect(String((err as Error).cause)).toContain('auto rollback put failure');
+
+  await store.close();
 });

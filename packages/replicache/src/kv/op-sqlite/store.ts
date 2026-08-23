@@ -5,7 +5,7 @@ import type {
 } from '../sqlite-store.ts';
 import {dropStore, SQLiteStore} from '../sqlite-store.ts';
 import type {StoreProvider} from '../store.ts';
-import {open, type DB} from './types.ts';
+import {open, rawResultRows, type DB} from './types.ts';
 
 export type OpSQLiteStoreOptions = SQLiteStoreOptions & {
   // OpSQLite-specific options
@@ -13,10 +13,14 @@ export type OpSQLiteStoreOptions = SQLiteStoreOptions & {
   encryptionKey?: string;
 };
 
-function dropOpSQLiteStore(name: string): Promise<void> {
+function dropOpSQLiteStore(
+  name: string,
+  opts?: OpSQLiteStoreOptions,
+): Promise<void> {
   return dropStore(
     name,
-    (filename, opts) => new OpSQLiteDatabase(filename, opts),
+    (filename, options) => new OpSQLiteDatabase(filename, options),
+    opts,
   );
 }
 
@@ -36,7 +40,7 @@ export function opSQLiteStoreProvider(
         (name, options) => new OpSQLiteDatabase(name, options),
         opts,
       ),
-    drop: dropOpSQLiteStore,
+    drop: name => dropOpSQLiteStore(name, opts),
   };
 }
 
@@ -49,13 +53,12 @@ class OpSQLitePreparedStatement implements PreparedStatement {
     this.#sql = sql;
   }
 
-  async firstValue(params: string[]): Promise<string | undefined> {
-    const rows = await this.#db.executeRaw(this.#sql, params);
-    return rows[0]?.[0];
-  }
-
   async exec(params: string[]): Promise<void> {
     await this.#db.executeRaw(this.#sql, params);
+  }
+
+  async all(params: string[]): Promise<unknown[][]> {
+    return rawResultRows(await this.#db.executeRaw(this.#sql, params));
   }
 }
 

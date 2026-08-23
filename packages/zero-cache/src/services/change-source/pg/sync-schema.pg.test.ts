@@ -81,7 +81,7 @@ describe('change-streamer/pg/sync-schema', () => {
       replicaPostState: {
         [`${APP_ID}_${SHARD_NUM}.clients`]: [],
         ['_zero.versionHistory']: [CURRENT_SCHEMA_VERSIONS],
-        users: [
+        'users': [
           {userID: 123, handle: '@zoot', ['_0_version']: WATERMARK_REGEX},
           {userID: 456, handle: '@bonk', ['_0_version']: WATERMARK_REGEX},
         ],
@@ -122,8 +122,8 @@ describe('change-streamer/pg/sync-schema', () => {
           createSilentLogContext(),
           'test',
           replicaFile.path,
-          (log, tx) =>
-            initialSync(
+          async (log, tx) => {
+            await initialSync(
               log,
               shard,
               tx,
@@ -132,7 +132,8 @@ describe('change-streamer/pg/sync-schema', () => {
                 tableCopyWorkers: 5,
               },
               TEST_CONTEXT,
-            ),
+            );
+          },
         );
 
         await expectTables(upstream, c.upstreamPostState);

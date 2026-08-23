@@ -20,6 +20,7 @@ import {
   type CVRSnapshot,
   CVRUpdater,
 } from './cvr.ts';
+import {formatSignature} from './row-set-signature.ts';
 import {
   type ClientsRow,
   compareClientsRows,
@@ -42,6 +43,24 @@ const SHARD_NUM = 3;
 const SHARD = {appID: APP_ID, shardNum: SHARD_NUM};
 
 const LAST_CONNECT = Date.UTC(2024, 2, 1);
+
+/**
+ * Strips `rowSetSignature` from every QueryRecord in a CVR (or partial CVR)
+ * snapshot so test fixtures that pre-date the signature column can compare via
+ * `toEqual` without listing it in expected output. The signature itself is
+ * verified by dedicated tests (see row-set-signature.test.ts and the
+ * Cap-drift integration tests).
+ */
+function stripRowSetSignatures<T extends {queries: Record<string, object>}>(
+  cvr: T,
+): T {
+  const queries: Record<string, object> = {};
+  for (const [id, q] of Object.entries(cvr.queries)) {
+    const {rowSetSignature: _, ...rest} = q as {rowSetSignature?: unknown};
+    queries[id] = rest;
+  }
+  return {...cvr, queries} as T;
+}
 
 describe('view-syncer/cvr', () => {
   type DBState = {
@@ -149,6 +168,18 @@ describe('view-syncer/cvr', () => {
           break;
         }
         case 'queries': {
+          // Strip rowSetSignature from actual rows when no fixture in
+          // tableState explicitly mentions it. Tests that don't care about
+          // signatures stay terse; tests that DO care can include their
+          // expected value in the fixture.
+          const expectsSig = (tableState as Partial<QueriesRow>[]).some(
+            row => row.rowSetSignature !== undefined,
+          );
+          if (!expectsSig) {
+            for (const row of res as QueriesRow[]) {
+              delete (row as {rowSetSignature?: string | null}).rowSetSignature;
+            }
+          }
           (res as QueriesRow[]).sort(compareQueriesRows);
           (tableState as QueriesRow[]).sort(compareQueriesRows);
           break;
@@ -323,6 +354,93 @@ describe('view-syncer/cvr', () => {
       queries: [],
       desires: [],
     });
+  });
+
+  test('serializes concurrent first flushes for a new CVR', async () => {
+    // Delay creation so both stores reach the missing-row path before either
+    // first flush commits. Without serialization, both flushes can commit the
+    // same CVR version with different clients.
+    await cvrDb.unsafe(`
+      CREATE FUNCTION delay_cvr_instance_insert()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        PERFORM pg_sleep(0.1);
+        RETURN NEW;
+      END;
+      $$;
+
+      CREATE TRIGGER delay_cvr_instance_insert
+      BEFORE INSERT ON "dapp_3/cvr".instances
+      FOR EACH ROW
+      EXECUTE FUNCTION delay_cvr_instance_insert();
+    `);
+
+    const storeA = new CVRStore(
+      lc,
+      cvrDb,
+      SHARD,
+      'task-a',
+      'new-client-group',
+      ON_FAILURE,
+    );
+    const storeB = new CVRStore(
+      lc,
+      cvrDb,
+      SHARD,
+      'task-b',
+      'new-client-group',
+      ON_FAILURE,
+    );
+    const [cvrA, cvrB] = await Promise.all([
+      storeA.load(lc, LAST_CONNECT),
+      storeB.load(lc, LAST_CONNECT),
+    ]);
+    const updaterA = new CVRConfigDrivenUpdater(storeA, cvrA, SHARD);
+    const updaterB = new CVRConfigDrivenUpdater(storeB, cvrB, SHARD);
+    updaterA.ensureClient('client-a');
+    updaterB.ensureClient('client-b');
+
+    const lastActive = Date.UTC(2024, 3, 20);
+    const results = await Promise.allSettled([
+      updaterA.flush(
+        lc,
+        LAST_CONNECT,
+        lastActive,
+        ttlClockFromNumber(lastActive),
+      ),
+      updaterB.flush(
+        lc,
+        LAST_CONNECT,
+        lastActive,
+        ttlClockFromNumber(lastActive),
+      ),
+    ]);
+
+    expect(
+      results.filter(result => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    const rejected = results.find(result => result.status === 'rejected');
+    expect(rejected).toBeDefined();
+    expect((rejected as PromiseRejectedResult).reason).toBeInstanceOf(
+      ConcurrentModificationException,
+    );
+
+    expect(
+      await cvrDb`
+        SELECT "version"
+        FROM "dapp_3/cvr".instances
+        WHERE "clientGroupID" = 'new-client-group'
+      `,
+    ).toEqual([{version: '00:01'}]);
+    expect(
+      await cvrDb`
+        SELECT "clientID"
+        FROM "dapp_3/cvr".clients
+        WHERE "clientGroupID" = 'new-client-group'
+      `,
+    ).toHaveLength(1);
   });
 
   test('set client schema', async () => {
@@ -788,7 +906,9 @@ describe('view-syncer/cvr', () => {
       ON_FAILURE,
     );
     const reloaded = await cvrStore2.load(lc, LAST_CONNECT);
-    expect(reloaded).toEqual(updated);
+    expect(stripRowSetSignatures(reloaded)).toEqual(
+      stripRowSetSignatures(updated),
+    );
 
     // Let the takeover write that's fired during load to reach PG.
     await vi.waitFor(() =>
@@ -1178,7 +1298,7 @@ describe('view-syncer/cvr', () => {
         "statements": 6,
       }
     `);
-    expect(updated).toEqual({
+    expect(stripRowSetSignatures(updated)).toEqual({
       id: 'abc123',
       version: {stateVersion: '1aa', configVersion: 1}, // configVersion bump
       replicaVersion: '101',
@@ -1575,7 +1695,9 @@ describe('view-syncer/cvr', () => {
       ON_FAILURE,
     );
     const reloaded = await cvrStore2.load(lc, LAST_CONNECT);
-    expect(reloaded).toEqual(updated);
+    expect(stripRowSetSignatures(reloaded)).toEqual(
+      stripRowSetSignatures(updated),
+    );
 
     // Add the deleted desired query back. This ensures that the
     // desired query update statement is an UPSERT.
@@ -2045,7 +2167,7 @@ describe('view-syncer/cvr', () => {
       ]
     `);
 
-    expect(updated).toEqual({
+    expect(stripRowSetSignatures(updated)).toEqual({
       ...cvr,
       replicaVersion: '123',
       version: newVersion,
@@ -2080,7 +2202,9 @@ describe('view-syncer/cvr', () => {
       ON_FAILURE,
     );
     const reloaded = await cvrStore2.load(lc, LAST_CONNECT);
-    expect(reloaded).toEqual(updated);
+    expect(stripRowSetSignatures(reloaded)).toEqual(
+      stripRowSetSignatures(updated),
+    );
 
     await expectState(cvrDb, {
       instances: [
@@ -2214,6 +2338,108 @@ describe('view-syncer/cvr', () => {
         },
       ],
     });
+  });
+
+  test('deleteUnreferencedRows skips row deletes already emitted by received', async () => {
+    const initialState: DBState = {
+      instances: [
+        {
+          clientGroupID: 'abc123',
+          version: '1aa',
+          replicaVersion: '123',
+          lastActive: Date.UTC(2024, 3, 23),
+          ttlClock: ttlClockFromNumber(Date.UTC(2024, 3, 23)),
+          clientSchema: null,
+        },
+      ],
+      clients: [
+        {
+          clientGroupID: 'abc123',
+          clientID: 'fooClient',
+        },
+      ],
+      queries: [
+        {
+          clientGroupID: 'abc123',
+          queryArgs: null,
+          queryName: null,
+          queryHash: 'oneHash',
+          clientAST: {table: 'issues'},
+          transformationHash: 'serverOneHash',
+          transformationVersion: '1aa',
+          patchVersion: '1aa:01',
+          internal: null,
+          deleted: null,
+        },
+        {
+          clientGroupID: 'abc123',
+          queryArgs: null,
+          queryName: null,
+          queryHash: 'twoHash',
+          clientAST: {table: 'issues'},
+          transformationHash: 'serverTwoHash',
+          transformationVersion: '1aa',
+          patchVersion: '1aa:02',
+          internal: null,
+          deleted: null,
+        },
+      ],
+      desires: [
+        {
+          clientGroupID: 'abc123',
+          clientID: 'fooClient',
+          queryHash: 'oneHash',
+          patchVersion: '1a9:01',
+          deleted: null,
+          inactivatedAt: null,
+          ttl: DEFAULT_TTL_MS,
+        },
+      ],
+      rows: [
+        {
+          clientGroupID: 'abc123',
+          rowKey: ROW_KEY1,
+          rowVersion: '03',
+          refCounts: {oneHash: 1},
+          patchVersion: '1a0',
+          schema: 'public',
+          table: 'issues',
+        },
+      ],
+    };
+
+    await setInitialState(cvrDb, initialState);
+
+    const cvrStore = new CVRStore(
+      lc,
+      cvrDb,
+      SHARD,
+      'my-task',
+      'abc123',
+      ON_FAILURE,
+    );
+    const cvr = await cvrStore.load(lc, LAST_CONNECT);
+    const updater = new CVRQueryDrivenUpdater(cvrStore, cvr, '1aa', '123');
+
+    const {newVersion} = updater.trackQueries(
+      lc,
+      [{id: 'oneHash', transformationHash: 'serverOneHash'}],
+      [{id: 'twoHash'}],
+    );
+    expect(newVersion).toEqual({stateVersion: '1aa', configVersion: 1});
+
+    expect(
+      await updater.received(
+        lc,
+        new Map([[ROW_ID1, {refCounts: {oneHash: -1}}]]),
+      ),
+    ).toEqual([
+      {
+        toVersion: newVersion,
+        patch: {type: 'row', op: 'del', id: ROW_ID1},
+      },
+    ] satisfies PatchToVersion[]);
+    expect(await updater.deleteUnreferencedRows(lc)).toEqual([]);
   });
 
   // ^^: just run this test twice? Once for executed once for transformed
@@ -2505,7 +2731,7 @@ describe('view-syncer/cvr', () => {
       ]
     `);
 
-    expect(updated).toEqual({
+    expect(stripRowSetSignatures(updated)).toEqual({
       ...cvr,
       version: newVersion,
       queries: {
@@ -3106,7 +3332,7 @@ describe('view-syncer/cvr', () => {
       ]
     `);
 
-    expect(updated).toEqual({
+    expect(stripRowSetSignatures(updated)).toEqual({
       ...cvr,
       version: newVersion,
       lastActive: 1713834000000,
@@ -3545,7 +3771,7 @@ describe('view-syncer/cvr', () => {
       ]
     `);
 
-    expect(updated).toEqual({
+    expect(stripRowSetSignatures(updated)).toEqual({
       ...cvr,
       version: newVersion,
       queries: {},
@@ -4090,7 +4316,7 @@ describe('view-syncer/cvr', () => {
       ]
     `);
 
-    expect(updated).toEqual(cvr);
+    expect(stripRowSetSignatures(updated)).toEqual(stripRowSetSignatures(cvr));
 
     // Verify round tripping.
     const doCVRStore2 = new CVRStore(
@@ -4258,7 +4484,9 @@ describe('view-syncer/cvr', () => {
       ON_FAILURE,
     );
     const reloaded = await cvrStore2.load(lc, LAST_CONNECT);
-    expect(reloaded).toEqual(updated);
+    expect(stripRowSetSignatures(reloaded)).toEqual(
+      stripRowSetSignatures(updated),
+    );
 
     await expectState(cvrDb, {
       instances: [
@@ -4466,7 +4694,9 @@ describe('view-syncer/cvr', () => {
       ON_FAILURE,
     );
     const reloaded = await cvrStore2.load(lc, LAST_CONNECT);
-    expect(reloaded).toEqual(updated);
+    expect(stripRowSetSignatures(reloaded)).toEqual(
+      stripRowSetSignatures(updated),
+    );
 
     await expectState(cvrDb, {
       instances: [
@@ -4735,7 +4965,9 @@ describe('view-syncer/cvr', () => {
       ON_FAILURE,
     );
     const reloaded = await cvrStore2.load(lc, LAST_CONNECT);
-    expect(reloaded).toEqual(updated);
+    expect(stripRowSetSignatures(reloaded)).toEqual(
+      stripRowSetSignatures(updated),
+    );
 
     await expectState(cvrDb, {
       instances: [
@@ -5119,6 +5351,90 @@ describe('view-syncer/cvr', () => {
     );
   });
 
+  test('flush persists rowSetSignature from signatureProvider', async () => {
+    const initialState: DBState = {
+      instances: [
+        {
+          clientGroupID: 'abc123',
+          version: '1aa',
+          replicaVersion: '120',
+          lastActive: Date.UTC(2024, 3, 23),
+          ttlClock: ttlClockFromNumber(Date.UTC(2024, 3, 23)),
+          clientSchema: null,
+        },
+      ],
+      clients: [{clientGroupID: 'abc123', clientID: 'fooClient'}],
+      queries: [
+        {
+          clientGroupID: 'abc123',
+          queryHash: 'oneHash',
+          clientAST: {table: 'issues'},
+          queryArgs: null,
+          queryName: null,
+          transformationHash: 'serverOneHash',
+          transformationVersion: '1aa',
+          patchVersion: '1aa:01',
+          internal: null,
+          deleted: null,
+        },
+      ],
+      desires: [
+        {
+          clientGroupID: 'abc123',
+          clientID: 'fooClient',
+          queryHash: 'oneHash',
+          patchVersion: '1a9:01',
+          deleted: null,
+          inactivatedAt: null,
+          ttl: DEFAULT_TTL_MS,
+        },
+      ],
+      rows: [],
+    };
+
+    await setInitialState(cvrDb, initialState);
+    const cvrStore = new CVRStore(
+      lc,
+      cvrDb,
+      SHARD,
+      'my-task',
+      'abc123',
+      ON_FAILURE,
+    );
+    const cvr = await cvrStore.load(lc, LAST_CONNECT);
+    const providedSig = 0xdeadbeefn;
+    const updater = new CVRQueryDrivenUpdater(
+      cvrStore,
+      cvr,
+      '1ba',
+      '120',
+      queryID => (queryID === 'oneHash' ? providedSig : undefined),
+    );
+    const {cvr: updated} = await updater.flush(
+      lc,
+      LAST_CONNECT,
+      Date.UTC(2024, 3, 23, 1),
+      ttlClockFromNumber(Date.UTC(2024, 3, 23, 1)),
+    );
+    expect(updated.queries.oneHash.rowSetSignature).toEqual(
+      formatSignature(providedSig),
+    );
+
+    // Reload and verify round trip.
+    const reloadStore = new CVRStore(
+      lc,
+      cvrDb,
+      SHARD,
+      'my-task',
+      'abc123',
+      ON_FAILURE,
+    );
+    const reloaded = await reloadStore.load(lc, LAST_CONNECT);
+    expect(reloaded.queries.oneHash.rowSetSignature).toEqual(
+      formatSignature(providedSig),
+    );
+  });
+
   describe('markDesiredQueryAsInactive', () => {
     test('no ttl', async () => {
       const now = Date.UTC(2025, 2, 18);
@@ -5252,7 +5568,7 @@ describe('view-syncer/cvr', () => {
         now,
         ttlClock,
       );
-      expect(updated).toEqual({
+      expect(stripRowSetSignatures(updated)).toEqual({
         clients: {
           fooClient: {
             desiredQueryIDs: [],
@@ -5586,7 +5902,7 @@ describe('view-syncer/cvr', () => {
         now,
         ttlClock,
       );
-      expect(updated).toEqual({
+      expect(stripRowSetSignatures(updated)).toEqual({
         clients: {
           fooClient: {
             desiredQueryIDs: [],
@@ -6030,6 +6346,7 @@ describe('view-syncer/cvr', () => {
             "queryArgs": null,
             "queryHash": "oneHash",
             "queryName": null,
+            "rowSetSignature": null,
             "transformationHash": null,
             "transformationVersion": null,
           },

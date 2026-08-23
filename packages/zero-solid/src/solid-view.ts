@@ -1,5 +1,7 @@
 import {produce, reconcile, type SetStoreFunction} from 'solid-js/store';
 import {emptyArray} from '../../shared/src/sentinels.ts';
+import {ChangeIndex} from '../../zql/src/ivm/change-index.ts';
+import {ChangeType} from '../../zql/src/ivm/change-type.ts';
 import {
   applyChange,
   idSymbol,
@@ -28,6 +30,48 @@ export type State = [Entry, QueryResultDetails];
 export const COMPLETE: QueryResultDetails = Object.freeze({type: 'complete'});
 export const UNKNOWN: QueryResultDetails = Object.freeze({type: 'unknown'});
 
+/**
+ * SolidView bridges Zero's incremental view updates with Solid's reactive
+ * store.
+ *
+ * The challenge: Zero pushes individual row changes (add/remove/edit) as they
+ * arrive, but updating Solid's store on each push is expensive. We batch
+ * changes until transaction commit, then apply them all at once.
+ *
+ * Two code paths optimize for different scenarios:
+ *
+ *   1. BULK INSERT (builderRoot path): When building from empty, we skip
+ *      Solid's reactive tracking entirely and build a plain JS object. This is
+ *      5x faster for large initial loads. Uses reconcile() to diff the final
+ *      result into Solid.
+ *
+ *   2. INCREMENTAL UPDATE (#pendingChanges path): For existing views, we queue
+ *      changes and apply them in-place within a produce() draft. produce()
+ *      creates a mutable draft, applyChange mutates it directly, then produce()
+ *      handles diffing and reactivity.
+ *
+ *
+ *   push(change)
+ *       │
+ *       ▼
+ *   ┌─────────────────────────────────┐
+ *   │ builderRoot defined?            │
+ *   │ (building from empty)           │
+ *   └─────────────────────────────────┘
+ *       │yes                │no
+ *       ▼                   ▼
+ *   Build plain JS      Queue in
+ *   object (fast)       #pendingChanges
+ *       │                   │
+ *       └───────┬───────────┘
+ *               ▼
+ *         onTransactionCommit()
+ *               │
+ *       ┌───────┴──────────┐
+ *       │                  │
+ *   builderRoot      produce(draft =>
+ *   → reconcile()      applyChange(draft, ..., mutate: true))
+ */
 export class SolidView implements Output {
   readonly #input: Input;
   readonly #format: Format;
@@ -136,7 +180,6 @@ export class SolidView implements Output {
             key: idSymbol as unknown as string,
           }),
         );
-        this.#setState(prev => [builderRoot, prev[1]]);
         this.#builderRoot = undefined;
       }
     } else {
@@ -156,7 +199,10 @@ export class SolidView implements Output {
     // using produce at the end of the transaction but read the relationships
     // now as they are only valid to read when the push is received.
     if (this.#builderRoot) {
-      this.#applyChangeToRoot(change, this.#builderRoot);
+      this.#applyChangeToRoot(
+        materializeRelationships(change),
+        this.#builderRoot,
+      );
     } else {
       this.#pendingChanges.push(materializeRelationships(change));
     }
@@ -192,6 +238,7 @@ export class SolidView implements Output {
       '',
       this.#format,
       true /* withIDs */,
+      true /* mutate */,
     );
   }
 
@@ -207,25 +254,33 @@ export class SolidView implements Output {
 }
 
 function materializeRelationships(change: Change): ViewChange {
-  switch (change.type) {
-    case 'add':
-      return {type: 'add', node: materializeNodeRelationships(change.node)};
-    case 'remove':
-      return {type: 'remove', node: materializeNodeRelationships(change.node)};
-    case 'child':
+  switch (change[ChangeIndex.TYPE]) {
+    case ChangeType.ADD:
+      return {
+        type: 'add',
+        node: materializeNodeRelationships(change[ChangeIndex.NODE]),
+      };
+    case ChangeType.REMOVE:
+      return {
+        type: 'remove',
+        node: materializeNodeRelationships(change[ChangeIndex.NODE]),
+      };
+    case ChangeType.CHILD:
       return {
         type: 'child',
-        node: {row: change.node.row},
+        node: {row: change[ChangeIndex.NODE].row},
         child: {
-          relationshipName: change.child.relationshipName,
-          change: materializeRelationships(change.child.change),
+          relationshipName: change[ChangeIndex.CHILD_DATA].relationshipName,
+          change: materializeRelationships(
+            change[ChangeIndex.CHILD_DATA].change,
+          ),
         },
       };
-    case 'edit':
+    case ChangeType.EDIT:
       return {
         type: 'edit',
-        node: {row: change.node.row},
-        oldNode: {row: change.oldNode.row},
+        node: {row: change[ChangeIndex.NODE].row},
+        oldNode: {row: change[ChangeIndex.OLD_NODE].row},
       };
   }
 }

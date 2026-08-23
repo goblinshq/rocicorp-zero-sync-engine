@@ -2,6 +2,7 @@
 import {
   afterAll,
   afterEach,
+  assert,
   beforeEach,
   describe,
   expect,
@@ -25,11 +26,11 @@ vi.mock('../server/anonymous-otel-start.ts', () => ({
   setActiveClientGroupsGetter: vi.fn(),
 }));
 
-import {LogContext} from '@rocicorp/logger';
-import {resolver} from '@rocicorp/resolver';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {LogContext} from '@rocicorp/logger';
+import {resolver} from '@rocicorp/resolver';
 import {type WebSocket} from 'ws';
 import {
   createSilentLogContext,
@@ -40,7 +41,7 @@ import {
   DatabaseStorage,
 } from '../../../zqlite/src/database-storage.ts';
 import {Database} from '../../../zqlite/src/db.ts';
-import {AuthSessionImpl, type ValidateLegacyJWT} from '../auth/auth.ts';
+import type {ValidateLegacyJWT} from '../auth/auth.ts';
 import * as jwt from '../auth/jwt.ts';
 import type {ZeroConfig} from '../config/zero-config.ts';
 import {
@@ -51,9 +52,17 @@ import {MutagenService} from '../services/mutagen/mutagen.ts';
 import {PusherService} from '../services/mutagen/pusher.ts';
 import {CREATE_TABLE_METADATA_TABLE} from '../services/replicator/schema/table-metadata.ts';
 import type {ActivityBasedService} from '../services/service.ts';
+import type {ConnectionContextManager} from '../services/view-syncer/connection-context-manager.ts';
+import {ConnectionContextManagerImpl} from '../services/view-syncer/connection-context-manager.ts';
 import type {ViewSyncer} from '../services/view-syncer/view-syncer.ts';
 import type {WebSocketReceiver} from '../types/websocket-handoff.ts';
-import {Syncer} from './syncer.ts';
+import {
+  computeMaxServingLagMs,
+  computePipelineDedupStats,
+  computeServingLagStatsMs,
+  MAX_REPLICA_READY_STATES,
+  Syncer,
+} from './syncer.ts';
 
 const lc = createSilentLogContext();
 const tempDir = await fs.mkdtemp(
@@ -81,6 +90,7 @@ function makeFactories(
   lc: LogContext,
   mutagensOut: MutagenService[],
   pushersOut: PusherService[],
+  contextManagersOut: Map<string, ConnectionContextManagerImpl>,
 ) {
   const storageDb = new Database(lc, ':memory:');
   storageDb.prepare(CREATE_STORAGE_TABLE).run();
@@ -92,27 +102,27 @@ function makeFactories(
       id: string,
       _sub: unknown,
       _drainCoordinator: unknown,
-      validateLegacyJWT: ValidateLegacyJWT | undefined,
     ) =>
       (() => {
         const stopped = resolver<void>();
-        const authSession = new AuthSessionImpl(lc, id, validateLegacyJWT);
+        const connContextManager = new ConnectionContextManagerImpl(lc);
+        contextManagersOut.set(id, connContextManager);
         return {
           id,
-          get auth() {
-            return authSession.auth;
-          },
-          clearAuth: vi.fn(() => authSession.clear()),
-          initAuthSession: vi.fn(
-            (userID: string, wireAuth: string | undefined) =>
-              authSession.update(userID, wireAuth),
-          ),
+          connContextManager,
           initConnection: vi.fn(),
           changeDesiredQueries: vi.fn(),
           deleteClients: vi.fn(),
           inspect: vi.fn(),
           updateAuth: vi.fn(),
           keepalive: () => true,
+          queryCount: 0,
+          rowCount: 0,
+          createdAtMs: Date.now(),
+          servedVersion: null,
+          servingLagEligible: true,
+          pipelineHashes: () => [],
+          clientSchemaKey: undefined,
           stop() {
             stopped.resolve();
             return stopped.promise;
@@ -137,12 +147,18 @@ function makeFactories(
       mutagensOut.push(ret);
       return ret;
     },
-    pusherFactory: (id: string) => {
+    pusherFactory: (
+      id: string,
+      connContextManager: ConnectionContextManager,
+    ) => {
       const ret = new PusherService(
-        {} as ZeroConfig,
-        {url: ['http://example.com'], forwardCookies: false},
+        {
+          app: {id: 'test-app'},
+          shard: {num: 0},
+        } as ZeroConfig,
         lc,
         id,
+        connContextManager,
       );
       pushersOut.push(ret);
       return ret;
@@ -153,11 +169,28 @@ function makeFactories(
 function setupSyncer(lc: LogContext, config: ZeroConfig) {
   const mutagens: MutagenService[] = [];
   const pushers: PusherService[] = [];
+  const contextManagers = new Map<string, ConnectionContextManagerImpl>();
   const {viewSyncerFactory, mutagenFactory, pusherFactory} = makeFactories(
     lc,
     mutagens,
     pushers,
+    contextManagers,
   );
+  const validateLegacyJWT: ValidateLegacyJWT | undefined =
+    jwt.tokenConfigOptions(config.auth ?? {}).length === 1
+      ? async (token, {userID}) => {
+          if (!userID) {
+            throw new Error('UserID is required for JWT validation.');
+          }
+          return {
+            type: 'jwt',
+            raw: token,
+            decoded: await jwt.verifyToken(config.auth, token, {
+              subject: userID,
+            }),
+          };
+        }
+      : undefined;
   const syncer = new Syncer(
     lc,
     config,
@@ -165,16 +198,282 @@ function setupSyncer(lc: LogContext, config: ZeroConfig) {
     mutagenFactory,
     pusherFactory,
     TEST_PARENT,
+    validateLegacyJWT,
   );
-  return {syncer, mutagens, pushers};
+  return {syncer, mutagens, pushers, contextManagers};
 }
 
 const baseParams = {
   clientGroupID: '1',
-  userID: 'anon',
   wsID: '1',
   protocolVersion: 30,
 };
+
+describe('computeMaxServingLagMs', () => {
+  test('returns zero with no active view syncers', () => {
+    const states = [{watermark: '02', replicaReadyTimeMs: 100}];
+    expect(computeMaxServingLagMs(200, states, [])).toBe(0);
+    expect(states).toEqual([]);
+  });
+
+  test('uses oldest unserved replica-ready state across active view syncers', () => {
+    const states = [
+      {watermark: '02', replicaReadyTimeMs: 100},
+      {watermark: '03', replicaReadyTimeMs: 150},
+      {watermark: '04', replicaReadyTimeMs: 175},
+    ];
+
+    expect(
+      computeMaxServingLagMs(300, states, [
+        {createdAtMs: 0, servedVersion: '03', servingLagEligible: true},
+        {createdAtMs: 0, servedVersion: '02', servingLagEligible: true},
+      ]),
+    ).toBe(150);
+
+    expect(states).toEqual([
+      {watermark: '03', replicaReadyTimeMs: 150},
+      {watermark: '04', replicaReadyTimeMs: 175},
+    ]);
+  });
+
+  test('ignores replica states from before a view syncer was created', () => {
+    const states = [
+      {watermark: '02', replicaReadyTimeMs: 100},
+      {watermark: '03', replicaReadyTimeMs: 150},
+    ];
+
+    expect(
+      computeMaxServingLagMs(300, states, [
+        {createdAtMs: 125, servedVersion: null, servingLagEligible: true},
+      ]),
+    ).toBe(150);
+
+    expect(states).toEqual([{watermark: '03', replicaReadyTimeMs: 150}]);
+  });
+
+  test('uses the later of creation time and served version as the first unserved state', () => {
+    const states = [
+      {watermark: '02', replicaReadyTimeMs: 100},
+      {watermark: '03', replicaReadyTimeMs: 150},
+      {watermark: '04', replicaReadyTimeMs: 200},
+      {watermark: '05', replicaReadyTimeMs: 250},
+    ];
+
+    expect(
+      computeMaxServingLagMs(300, states, [
+        {createdAtMs: 175, servedVersion: '02', servingLagEligible: true},
+        {createdAtMs: 0, servedVersion: '04', servingLagEligible: true},
+      ]),
+    ).toBe(100);
+
+    expect(states).toEqual([
+      {watermark: '04', replicaReadyTimeMs: 200},
+      {watermark: '05', replicaReadyTimeMs: 250},
+    ]);
+  });
+
+  test('bounds retained states even when a client group is behind', () => {
+    const states = Array.from(
+      {length: MAX_REPLICA_READY_STATES + 1},
+      (_, i) => ({
+        watermark: String(i).padStart(5, '0'),
+        replicaReadyTimeMs: i,
+      }),
+    );
+
+    expect(
+      computeMaxServingLagMs(20_000, states, [
+        {createdAtMs: 0, servedVersion: null, servingLagEligible: true},
+      ]),
+    ).toBe(20_000);
+
+    expect(states).toHaveLength(MAX_REPLICA_READY_STATES);
+    expect(states[0]).toEqual({watermark: '00001', replicaReadyTimeMs: 1});
+  });
+});
+
+describe('computeServingLagStatsMs', () => {
+  test('returns distribution across active view syncers including zero-lag groups', () => {
+    const states = [
+      {watermark: '02', replicaReadyTimeMs: 100},
+      {watermark: '03', replicaReadyTimeMs: 150},
+      {watermark: '04', replicaReadyTimeMs: 200},
+      {watermark: '05', replicaReadyTimeMs: 250},
+    ];
+
+    expect(
+      computeServingLagStatsMs(300, states, [
+        {createdAtMs: 0, servedVersion: '05', servingLagEligible: true},
+        {createdAtMs: 0, servedVersion: '03', servingLagEligible: true},
+        {createdAtMs: 0, servedVersion: '04', servingLagEligible: true},
+        {createdAtMs: 225, servedVersion: null, servingLagEligible: true},
+      ]),
+    ).toEqual({
+      activeClientGroups: 4,
+      laggingClientGroups: 3,
+      minMs: 0,
+      p50Ms: 50,
+      p75Ms: 50,
+      p99Ms: 100,
+      maxMs: 100,
+    });
+
+    expect(states).toEqual([
+      {watermark: '04', replicaReadyTimeMs: 200},
+      {watermark: '05', replicaReadyTimeMs: 250},
+    ]);
+  });
+
+  test('returns zero stats with no active view syncers', () => {
+    const states = [{watermark: '02', replicaReadyTimeMs: 100}];
+
+    expect(computeServingLagStatsMs(300, states, [])).toEqual({
+      activeClientGroups: 0,
+      laggingClientGroups: 0,
+      minMs: 0,
+      p50Ms: 0,
+      p75Ms: 0,
+      p99Ms: 0,
+      maxMs: 0,
+    });
+    expect(states).toEqual([]);
+  });
+
+  test('ignores view syncers without active validated clients', () => {
+    const states = [
+      {watermark: '02', replicaReadyTimeMs: 100},
+      {watermark: '03', replicaReadyTimeMs: 150},
+      {watermark: '04', replicaReadyTimeMs: 200},
+    ];
+
+    expect(
+      computeServingLagStatsMs(300, states, [
+        {createdAtMs: 0, servedVersion: null, servingLagEligible: false},
+        {createdAtMs: 0, servedVersion: '03', servingLagEligible: true},
+      ]),
+    ).toEqual({
+      activeClientGroups: 1,
+      laggingClientGroups: 1,
+      minMs: 100,
+      p50Ms: 100,
+      p75Ms: 100,
+      p99Ms: 100,
+      maxMs: 100,
+    });
+
+    expect(states).toEqual([{watermark: '04', replicaReadyTimeMs: 200}]);
+  });
+
+  test('clears retained replica-ready states when no view syncer is eligible', () => {
+    const states = [{watermark: '02', replicaReadyTimeMs: 100}];
+
+    expect(
+      computeServingLagStatsMs(300, states, [
+        {createdAtMs: 0, servedVersion: null, servingLagEligible: false},
+      ]),
+    ).toEqual({
+      activeClientGroups: 0,
+      laggingClientGroups: 0,
+      minMs: 0,
+      p50Ms: 0,
+      p75Ms: 0,
+      p99Ms: 0,
+      maxMs: 0,
+    });
+    expect(states).toEqual([]);
+  });
+});
+
+describe('computePipelineDedupStats', () => {
+  test('empty', () => {
+    const stats = computePipelineDedupStats([]);
+    expect(stats.clientTotal).toBe(0);
+    expect(stats.internalTotal).toBe(0);
+    expect(stats.clientHashes.size).toBe(0);
+    expect(stats.internalUnique).toBe(0);
+    expect(stats.clientSchemas).toBe(0);
+  });
+
+  test('counts duplicates across client groups by (schemaKey, hash)', () => {
+    const stats = computePipelineDedupStats([
+      {
+        clientSchemaKey: 'schema1',
+        pipelineHashes: () => [
+          {transformationHash: 'aaa', internal: false, queryName: 'issues'},
+          {transformationHash: 'bbb', internal: false, queryName: undefined},
+          {transformationHash: 'lmids', internal: true, queryName: undefined},
+        ],
+      },
+      {
+        clientSchemaKey: 'schema1',
+        pipelineHashes: () => [
+          {transformationHash: 'aaa', internal: false, queryName: 'issues'},
+          {transformationHash: 'lmids', internal: true, queryName: undefined},
+        ],
+      },
+      // Same transformationHash but different clientSchema: not shareable,
+      // so it counts as a distinct unique pipeline.
+      {
+        clientSchemaKey: 'schema2',
+        pipelineHashes: () => [
+          {transformationHash: 'aaa', internal: false, queryName: 'issues'},
+        ],
+      },
+      // Not yet initialized: contributes nothing.
+      {
+        clientSchemaKey: undefined,
+        pipelineHashes: () => [],
+      },
+    ]);
+
+    expect(stats.clientTotal).toBe(4);
+    expect(stats.internalTotal).toBe(2);
+    expect(stats.clientHashes.size).toBe(3);
+    expect(stats.clientHashes.get('schema1/aaa')).toEqual({
+      count: 2,
+      queryName: 'issues',
+    });
+    expect(stats.clientHashes.get('schema1/bbb')).toEqual({
+      count: 1,
+      queryName: undefined,
+    });
+    expect(stats.clientHashes.get('schema2/aaa')).toEqual({
+      count: 1,
+      queryName: 'issues',
+    });
+    // The internal (lmids) hash collides across CGs of the same schema in
+    // this synthetic input, but real internal queries embed the
+    // clientGroupID in their AST and would never collide; the stat exists
+    // to keep them segmented out of the client dedup factor.
+    expect(stats.internalUnique).toBe(1);
+    expect(stats.clientSchemas).toBe(2);
+  });
+
+  test('schema-less pipelines are not deduplicated across view-syncers', () => {
+    // A view-syncer with no client schema yet (clientSchemaKey undefined) has
+    // an unknown dedup identity. Two such view-syncers running the same
+    // transformationHash must not collapse into one unique pipeline, which
+    // would overstate the available deduplication.
+    const stats = computePipelineDedupStats([
+      {
+        clientSchemaKey: undefined,
+        pipelineHashes: () => [
+          {transformationHash: 'aaa', internal: false, queryName: 'issues'},
+        ],
+      },
+      {
+        clientSchemaKey: undefined,
+        pipelineHashes: () => [
+          {transformationHash: 'aaa', internal: false, queryName: 'issues'},
+        ],
+      },
+    ]);
+
+    expect(stats.clientTotal).toBe(2);
+    expect(stats.clientHashes.size).toBe(2);
+    expect(stats.clientSchemas).toBe(0);
+  });
+});
 
 function makeParams(clientID: number, params: any = {}) {
   return {
@@ -355,7 +654,7 @@ describe('jwt auth validation', () => {
         {
           clientGroupID: '1',
           clientID: `1`,
-          userID: 'anon',
+          userID: 'user-1',
           wsID: '1',
           protocolVersion: 21,
           auth: 'dummy-token',
@@ -410,7 +709,7 @@ describe('jwt auth without options', () => {
       {
         clientGroupID: '1',
         clientID: '1',
-        userID: 'anon',
+        userID: 'user-1',
         wsID: '1',
         protocolVersion: 30,
         auth: 'dummy-token',
@@ -432,6 +731,38 @@ describe('jwt auth without options', () => {
     // Services should be instantiated for successful connection
     expect(mutagens.length).toBe(1);
     expect(pushers.length).toBe(1);
+  });
+
+  test('allows logged-out connections to omit userID', async () => {
+    const ws = await openConnection(1, {userID: undefined});
+
+    expect((ws as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.OPEN,
+    );
+    expect(mutagens.length).toBe(1);
+    expect(pushers.length).toBe(1);
+  });
+
+  test('rejects authenticated connections that omit userID', async () => {
+    const ws = new MockWebSocket() as unknown as WebSocket;
+    await receiver(
+      ws,
+      {
+        clientGroupID: '1',
+        clientID: '1',
+        userID: undefined,
+        wsID: '1',
+        protocolVersion: 30,
+        auth: 'dummy-token',
+      },
+      {} as any,
+    );
+
+    expect((ws as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.CLOSED,
+    );
+    expect(mutagens.length).toBe(0);
+    expect(pushers.length).toBe(0);
   });
 });
 
@@ -476,7 +807,7 @@ describe('jwt auth missing options and missing endpoints', () => {
         {
           clientGroupID: '1',
           clientID: `1`,
-          userID: 'anon',
+          userID: 'user-1',
           wsID: '1',
           auth: 'dummy-token',
         },
@@ -494,6 +825,7 @@ describe('jwt auth missing options and missing endpoints', () => {
 
 describe('connection hijacking prevention', () => {
   let syncer: Syncer;
+  let contextManagers: Map<string, ConnectionContextManagerImpl>;
   let verifySpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -506,6 +838,7 @@ describe('connection hijacking prevention', () => {
       },
     } as ZeroConfig);
     syncer = env.syncer;
+    contextManagers = env.contextManagers;
   });
 
   afterEach(async () => {
@@ -603,7 +936,50 @@ describe('connection hijacking prevention', () => {
     );
   });
 
-  test('rejects missing auth on reconnect for authenticated client group', async () => {
+  test('mismatched validated user does not replace existing connection', async () => {
+    const existingWs = new MockWebSocket() as unknown as WebSocket;
+    await receiver(
+      existingWs,
+      {
+        clientGroupID: '1',
+        clientID: 'target-client',
+        userID: 'user-1',
+        wsID: 'ws-1',
+        protocolVersion: 30,
+      },
+      {} as any,
+    );
+
+    const connContextManager = contextManagers.get('1');
+    assert(connContextManager);
+    connContextManager.validateConnection(
+      {clientID: 'target-client', wsID: 'ws-1'},
+      0,
+      {kind: 'client-fallback'},
+    );
+
+    const attackerWs = new MockWebSocket() as unknown as WebSocket;
+    await receiver(
+      attackerWs,
+      {
+        clientGroupID: '1',
+        clientID: 'target-client',
+        userID: 'user-2',
+        wsID: 'ws-2',
+        protocolVersion: 30,
+      },
+      {} as any,
+    );
+
+    expect((existingWs as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.OPEN,
+    );
+    expect((attackerWs as unknown as MockWebSocket).readyState).toBe(
+      MockWebSocket.CLOSED,
+    );
+  });
+
+  test('admits a second clientID without reusing another connection auth state', async () => {
     verifySpy.mockResolvedValueOnce({sub: 'user-1'});
     const firstWs = new MockWebSocket() as unknown as WebSocket;
     await receiver(
@@ -636,14 +1012,14 @@ describe('connection hijacking prevention', () => {
     );
 
     expect((reconnectWs as unknown as MockWebSocket).readyState).toBe(
-      MockWebSocket.CLOSED,
+      MockWebSocket.OPEN,
     );
     expect((firstWs as unknown as MockWebSocket).readyState).toBe(
       MockWebSocket.OPEN,
     );
   });
 
-  test('retains user binding until view syncer expires', async () => {
+  test('admits a later connection after an earlier authenticated connection closes', async () => {
     verifySpy.mockResolvedValueOnce({sub: 'user-1'});
     const firstWs = new MockWebSocket() as unknown as WebSocket;
     await receiver(
@@ -674,7 +1050,7 @@ describe('connection hijacking prevention', () => {
     );
 
     expect((reconnectWs as unknown as MockWebSocket).readyState).toBe(
-      MockWebSocket.CLOSED,
+      MockWebSocket.OPEN,
     );
   });
 });

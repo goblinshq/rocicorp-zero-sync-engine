@@ -1,14 +1,50 @@
+import {resolver, type Resolver} from '@rocicorp/resolver';
 import {assert} from '../../../../shared/src/asserts.ts';
+import {BigIntJSON} from '../../../../shared/src/bigint-json.ts';
 import type {Enum} from '../../../../shared/src/enum.ts';
 import {must} from '../../../../shared/src/must.ts';
+import {promiseVoid} from '../../../../shared/src/resolved-promises.ts';
+import {RingBuffer} from '../../../../shared/src/ring-buffer.ts';
 import {max} from '../../types/lexi-version.ts';
 import type {Subscription} from '../../types/subscription.ts';
-import type {ChangeStreamData} from '../change-source/protocol/current.ts';
-import type {WatermarkedChange} from './change-streamer-service.ts';
-import {type Downstream} from './change-streamer.ts';
-import * as ErrorType from './error-type-enum.ts';
+import type {
+  ChangeTag,
+  Downstream,
+  Status,
+  WatermarkedChange,
+} from './change-streamer.ts';
+import type * as ErrorType from './error-type-enum.ts';
 
 type ErrorType = Enum<typeof ErrorType>;
+
+const DEFAULT_BACKLOG_HIGH_WATER_BYTES = 16 * 1024 * 1024;
+const DEFAULT_BACKLOG_LOW_WATER_RATIO = 0.8;
+
+export type SubscriberOptions = {
+  backlogHighWaterBytes?: number | undefined;
+  backlogLowWaterRatio?: number | undefined;
+
+  /**
+   * Called whenever the subscriber's acked watermark advances, i.e. when it
+   * has confirmed that a commit was durably applied to its replica. The ACK
+   * therefore lags the subscriber's replica rather than leading it.
+   */
+  onAck?: ((watermark: string) => void) | undefined;
+};
+
+export type BacklogFullWait = {
+  readonly promise: Promise<void>;
+  cancel(): void;
+};
+
+export type SubscriberStats = {
+  processRate: number;
+  pending: number;
+  backlog: number;
+  backlogBytes: number;
+  totalBufferedBytes: number;
+  missedLastTimeout: boolean;
+};
 
 /**
  * Encapsulates a subscriber to changes. All subscribers start in a
@@ -20,23 +56,41 @@ type ErrorType = Enum<typeof ErrorType>;
 export class Subscriber {
   readonly #protocolVersion: number;
   readonly id: string;
-  readonly #downstream: Subscription<Downstream>;
+  readonly #downstream: Subscription<string>;
+  readonly #latestStatus: () => Status;
   #watermark: string;
   #acked: string;
-  #backlog: WatermarkedChange[] | null;
+  #backlog: RingBuffer<WatermarkedChange> | null;
+  // While catchup is running, live changes are buffered here instead of being
+  // pushed downstream. RingBuffer lets drainBacklog consume that backlog without
+  // shifting an array, which matters when a subscriber is far behind.
+  #backlogBytes = 0;
+  #backlogInFlightBytes = 0;
+  #backlogDrain: Promise<void> | null = null;
+  readonly #backlogBackpressure: ByteBackpressureGate;
+  readonly #backlogFullWaiters = new Set<Resolver<void>>();
+  readonly #onAck: ((watermark: string) => void) | undefined;
 
   constructor(
     protocolVersion: number,
     id: string,
     watermark: string,
-    downstream: Subscription<Downstream>,
+    downstream: Subscription<string>,
+    latestStatus: () => Status,
+    options: SubscriberOptions = {},
   ) {
     this.#protocolVersion = protocolVersion;
     this.id = id;
     this.#downstream = downstream;
+    this.#latestStatus = latestStatus;
     this.#watermark = watermark;
     this.#acked = watermark;
-    this.#backlog = [];
+    this.#backlog = new RingBuffer();
+    this.#backlogBackpressure = new ByteBackpressureGate(
+      options.backlogHighWaterBytes ?? DEFAULT_BACKLOG_HIGH_WATER_BYTES,
+      options.backlogLowWaterRatio ?? DEFAULT_BACKLOG_LOW_WATER_RATIO,
+    );
+    this.#onAck = options.onAck;
   }
 
   get watermark() {
@@ -47,29 +101,75 @@ export class Subscriber {
     return this.#acked;
   }
 
-  async send(change: WatermarkedChange) {
+  /**
+   * Whether the backlog of live changes buffered during catchup has reached the
+   * point at which {@link send()} stops resolving. Past it the subscriber is no
+   * longer free: it holds up every subsequent flush, and with no other
+   * subscriber to form a majority it stalls replication outright.
+   */
+  get backlogFull() {
+    return (
+      this.#bufferedBacklogBytes >= this.#backlogBackpressure.highWaterBytes
+    );
+  }
+
+  /**
+   * Resolves the first time {@link backlogFull} becomes true, so that a caller
+   * holding the subscriber in catchup can give up at the moment the subscriber
+   * starts costing replication rather than on a timer. Call cancel() when the
+   * wait is no longer needed so the subscriber does not retain it.
+   */
+  whenBacklogFull(): BacklogFullWait {
+    if (this.backlogFull) {
+      return {promise: promiseVoid, cancel() {}};
+    }
+    const r = resolver<void>();
+    this.#backlogFullWaiters.add(r);
+    return {
+      promise: r.promise,
+      cancel: () => {
+        this.#backlogFullWaiters.delete(r);
+      },
+    };
+  }
+
+  send(change: WatermarkedChange): Promise<void> {
     const [watermark] = change;
     if (watermark > this.#watermark) {
       if (this.#backlog) {
-        this.#backlog.push(change);
-      } else {
-        await this.#sendChange(change);
+        // During catchup, buffer live changes behind the durable catchup stream.
+        // The returned promise applies backpressure if the buffered bytes cross
+        // the high water mark.
+        this.#pushBacklog(change);
+        return this.#maybeWaitForBacklogSpace();
       }
+      return this.#sendChange(change);
+    }
+    return promiseVoid;
+  }
+
+  #initialized = false;
+
+  /**
+   * Called once the subscriber's watermark has been validated in the initial
+   * catchup process.
+   */
+  #initialize() {
+    if (!this.#initialized) {
+      this.#initialized = true;
+      this.sendStatus(this.#latestStatus());
     }
   }
 
-  #initialStatusSent = false;
-
-  #ensureInitialStatusSent() {
-    if (this.#protocolVersion >= 2 && !this.#initialStatusSent) {
-      void this.#sendDownstream(['status', {tag: 'status'}]);
-      this.#initialStatusSent = true;
+  sendStatus(status: Status) {
+    if (this.#initialized) {
+      void this.#sendDownstream(['status', status]);
     }
   }
 
   /** catchup() is called on ChangeEntries loaded from the store. */
   async catchup(change: WatermarkedChange) {
-    this.#ensureInitialStatusSent();
+    this.#initialize();
     await this.#sendChange(change);
   }
 
@@ -77,46 +177,60 @@ export class Subscriber {
    * Marks the Subscribe as "caught up" and flushes any backlog of
    * entries that were received during the catchup.
    */
-  setCaughtUp() {
-    this.#ensureInitialStatusSent();
-    assert(
-      this.#backlog,
-      'setCaughtUp() called but subscriber is not in catchup mode',
-    );
-    // Note that this method must be asynchronous in order for send() to
-    // interpret the #backlog variable correctly. This is the only place
-    // where I/O flow control is not heeded. However, it will be awaited
-    // by the next caller to send().
-    for (const change of this.#backlog) {
-      void this.#sendChange(change);
+  setCaughtUp(): Promise<void> {
+    this.#initialize();
+    if (!this.#backlog) {
+      return this.#backlogDrain ?? promiseVoid;
     }
-    this.#backlog = null;
+    if (!this.#backlogDrain) {
+      // Keep #backlog non-null while queued entries are being handed to
+      // downstream. That preserves ordering for sends that race with
+      // setCaughtUp(): they append to the same backlog instead of bypassing
+      // older buffered changes.
+      this.#backlogDrain = this.#drainBacklog();
+      void this.#backlogDrain.catch(e => this.fail(e));
+    }
+    return this.#backlogDrain;
   }
 
   async #sendChange(change: WatermarkedChange) {
-    const [watermark, downstream] = change;
+    const [watermark, tag, json] = change;
     if (watermark <= this.watermark) {
       return;
     }
-    if (!this.supportsMessage(downstream[1])) {
+    if (!this.supportsMessage(tag)) {
       return;
     }
-    if (downstream[0] === 'commit') {
+    if (tag === 'commit') {
       this.#watermark = watermark;
     }
-    const result = await this.#sendDownstream(downstream);
-    if (downstream[0] === 'commit' && result === 'consumed') {
-      this.#acked = max(this.#acked, watermark);
+    const result = await this.#sendStringifiedDownstream(json);
+    if (tag === 'commit' && result === 'consumed') {
+      // Sends can complete out of order (e.g. the bounded window in
+      // #drainBacklog), so the ack only advances monotonically, and listeners
+      // are only notified when it does.
+      const acked = max(this.#acked, watermark);
+      if (acked !== this.#acked) {
+        this.#acked = acked;
+        this.#onAck?.(acked);
+      }
     }
   }
 
-  async #sendDownstream(downstream: Downstream) {
+  #sendDownstream(downstream: Downstream) {
+    return this.#sendStringifiedDownstream(BigIntJSON.stringify(downstream));
+  }
+
+  async #sendStringifiedDownstream(json: string) {
+    const size = json.length;
     this.#pending++;
-    const {result} = this.#downstream.push(downstream);
+    this.#pendingBytes += size;
+    const {result} = this.#downstream.push(json);
     try {
       return await result;
     } finally {
       this.#pending--;
+      this.#pendingBytes -= size;
       this.#processed++;
     }
   }
@@ -130,6 +244,7 @@ export class Subscriber {
   // debugging, forensics, and potential improvements to the algorithm.
 
   #pending = 0;
+  #pendingBytes = 0;
   #processed = 0;
   #samples: {processed: number; timestamp: number}[] = [
     {processed: 0, timestamp: performance.now()},
@@ -139,7 +254,7 @@ export class Subscriber {
    * The number of downstream messages that have yet to be acked.
    */
   get numPending() {
-    return this.#pending;
+    return this.#pending + this.#backlogCount;
   }
 
   /**
@@ -162,21 +277,69 @@ export class Subscriber {
     return this;
   }
 
-  getStats(): {processRate: number; pending: number} {
-    const pending = this.#pending;
+  getStats(): SubscriberStats {
+    const pending = this.numPending;
     if (this.#samples.length < 2) {
-      return {processRate: 0, pending};
+      return {
+        processRate: 0,
+        pending,
+        backlog: this.#backlogCount,
+        backlogBytes: this.#bufferedBacklogBytes,
+        totalBufferedBytes: this.#totalBufferedBytes,
+        missedLastTimeout: this.#missedLastTimeout,
+      };
     }
     const from = this.#samples[0];
     const to = must(this.#samples.at(-1));
     const processed = to.processed - from.processed;
     const seconds = (to.timestamp - from.timestamp) / 1000;
     const processRate = seconds === 0 ? 0 : processed / seconds;
-    return {processRate, pending};
+    return {
+      processRate,
+      pending,
+      backlog: this.#backlogCount,
+      backlogBytes: this.#bufferedBacklogBytes,
+      totalBufferedBytes: this.#totalBufferedBytes,
+      missedLastTimeout: this.#missedLastTimeout,
+    };
   }
 
-  supportsMessage(change: ChangeStreamData[1]) {
-    switch (change.tag) {
+  #missedLastTimeout = false;
+  #laggingSinceMs: number | undefined;
+
+  trackResponseResult(result: 'on-time' | 'timed-out') {
+    this.#missedLastTimeout = result === 'timed-out';
+    if (result === 'on-time') {
+      this.#laggingSinceMs = undefined;
+    }
+  }
+
+  /**
+   * Reports the change rate of a slow subscriber (i.e. that missed the last
+   * timeout) compared to the change rate of the (slowest) subscriber that
+   * responded on time.
+   *
+   * * `lagging` indicates that this subscriber is slower
+   * * `catching-up` indicates that it is faster
+   *
+   * Returns the total duration in which subscriber has been continuously
+   * reported as `lagging`.
+   */
+  reportChangeRate(now: number, status: 'lagging' | 'catching-up') {
+    assert(
+      this.#missedLastTimeout,
+      `reportChangeRate should only be called for slow subscribers`,
+    );
+    if (status === 'catching-up') {
+      this.#laggingSinceMs = undefined;
+      return 0;
+    }
+    this.#laggingSinceMs ??= now;
+    return now - this.#laggingSinceMs;
+  }
+
+  supportsMessage(tag: ChangeTag) {
+    switch (tag) {
       case 'update-table-metadata':
         // update-table-row-key is only understood by subscribers >= protocol v5
         return this.#protocolVersion >= 5;
@@ -184,17 +347,170 @@ export class Subscriber {
     return true;
   }
 
-  fail(err?: unknown) {
-    this.close(ErrorType.Unknown, String(err));
+  /**
+   * Ends the subscription without sending a downstream `['error', ...]`.
+   *
+   * This is deliberate, and not the same as reporting the failure to the
+   * subscriber: `IncrementalSyncer` treats any `['error', ...]` as terminal and
+   * shuts down to restore a fresh replica from litestream, whereas a clean end
+   * backs off and re-subscribes. The failures routed here -- storer catchup
+   * errors, backlog drain errors, backup-monitor errors -- are transient, so a
+   * reconnect is the proportionate response and a fleet-wide restore is not.
+   *
+   * Callers are responsible for logging `err`; it is not carried downstream.
+   */
+  fail(_err?: unknown) {
+    this.close();
   }
 
   close(error?: ErrorType, message?: string) {
-    if (error) {
-      const {result} = this.#downstream.push(['error', {type: error, message}]);
+    // Closing the subscriber must also release producers that are blocked on
+    // backlog capacity; there is no future drain that could wake them.
+    this.#backlog = null;
+    this.#backlogBytes = 0;
+    this.#backlogBackpressure.releaseAll();
+    // The backlog can no longer grow, so nothing would ever resolve these.
+    // Waiters re-check backlogFull, which is now false, and see the close.
+    this.#resolveBacklogFullWaiters();
+
+    if (error !== undefined) {
       // Wait for the ACK of the error message before closing the connection.
-      void result.then(() => this.#downstream.cancel());
+      void this.#sendDownstream(['error', {type: error, message}]).finally(() =>
+        this.#downstream.cancel(),
+      );
     } else {
       this.#downstream.cancel();
+    }
+  }
+
+  get #backlogCount() {
+    return this.#backlog?.size ?? 0;
+  }
+
+  get #bufferedBacklogBytes() {
+    // Include entries already handed to downstream but not yet consumed. Without
+    // this, setCaughtUp() could move bytes out of #backlog faster than the
+    // downstream Subscription can process them and release producers too early.
+    return this.#backlogBytes + this.#backlogInFlightBytes;
+  }
+
+  get #totalBufferedBytes() {
+    return this.#bufferedBacklogBytes + this.#pendingBytes;
+  }
+
+  #pushBacklog(change: WatermarkedChange) {
+    assert(this.#backlog, 'cannot push to backlog after catchup completed');
+    this.#backlog.push(change);
+    this.#backlogBytes += change[2].length;
+    if (this.backlogFull) {
+      this.#resolveBacklogFullWaiters();
+    }
+  }
+
+  #resolveBacklogFullWaiters() {
+    const waiters = [...this.#backlogFullWaiters];
+    this.#backlogFullWaiters.clear();
+    for (const waiter of waiters) {
+      waiter.resolve();
+    }
+  }
+
+  #maybeWaitForBacklogSpace(): Promise<void> {
+    return this.#backlogBackpressure.waitForSpace(this.#bufferedBacklogBytes);
+  }
+
+  async #drainBacklog() {
+    const inFlight: {promise: Promise<void>; bytes: number}[] = [];
+    let inFlightBytes = 0;
+
+    try {
+      for (;;) {
+        const change = this.#backlog?.shift();
+        if (!change) {
+          this.#backlog = null;
+          this.#backlogBytes = 0;
+          this.#backlogBackpressure.releaseIfUnderLowWater(
+            this.#bufferedBacklogBytes,
+          );
+          break;
+        }
+
+        const bytes = change[2].length;
+        this.#backlogBytes -= bytes;
+        this.#backlogInFlightBytes += bytes;
+        this.#backlogBackpressure.releaseIfUnderLowWater(
+          this.#bufferedBacklogBytes,
+        );
+
+        // Send backlog entries in order, but keep only a bounded byte window in
+        // flight. This avoids replacing one unbounded buffer with another inside
+        // the downstream Subscription during catchup completion.
+        const promise = this.#sendChange(change).finally(() => {
+          this.#backlogInFlightBytes -= bytes;
+          this.#backlogBackpressure.releaseIfUnderLowWater(
+            this.#bufferedBacklogBytes,
+          );
+        });
+        inFlight.push({promise, bytes});
+        inFlightBytes += bytes;
+
+        while (inFlightBytes >= this.#backlogBackpressure.highWaterBytes) {
+          const next = must(inFlight.shift());
+          await next.promise;
+          inFlightBytes -= next.bytes;
+        }
+      }
+
+      for (const {promise} of inFlight) {
+        await promise;
+      }
+    } finally {
+      this.#backlogDrain = null;
+      this.#backlogBackpressure.releaseIfUnderLowWater(
+        this.#bufferedBacklogBytes,
+      );
+    }
+  }
+}
+
+class ByteBackpressureGate {
+  readonly highWaterBytes: number;
+  readonly #lowWaterBytes: number;
+  readonly #waiters: Resolver<void>[] = [];
+
+  constructor(highWaterBytes: number, lowWaterRatio: number) {
+    this.highWaterBytes = Math.max(1, highWaterBytes);
+    this.#lowWaterBytes =
+      this.highWaterBytes * Math.min(1, Math.max(0, lowWaterRatio));
+  }
+
+  waitForSpace(bufferedBytes: number): Promise<void> {
+    if (bufferedBytes < this.highWaterBytes) {
+      return promiseVoid;
+    }
+
+    // One waiter represents one send() call that has already appended its
+    // change. The producer is released when the backlog falls back below the low
+    // water mark or the subscriber closes.
+    const r = resolver<void>();
+    this.#waiters.push(r);
+    return r.promise;
+  }
+
+  releaseIfUnderLowWater(bufferedBytes: number) {
+    if (this.#waiters.length === 0 || bufferedBytes > this.#lowWaterBytes) {
+      return;
+    }
+
+    // Use a low water mark so waiting producers are released in batches instead
+    // of waking one at a time around the high water boundary.
+    this.releaseAll();
+  }
+
+  releaseAll() {
+    const waiters = this.#waiters.splice(0);
+    for (const waiter of waiters) {
+      waiter.resolve();
     }
   }
 }

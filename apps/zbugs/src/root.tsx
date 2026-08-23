@@ -79,8 +79,8 @@ function DemoLoadedPill({
   const [fading, setFading] = useState(false);
 
   useEffect(() => {
-    const fadeTimer = setTimeout(() => setFading(true), 8000);
-    const hideTimer = setTimeout(() => setVisible(false), 8500);
+    const fadeTimer = setTimeout(setFading, 8000, true);
+    const hideTimer = setTimeout(setVisible, 8500, false);
     return () => {
       clearTimeout(fadeTimer);
       clearTimeout(hideTimer);
@@ -91,6 +91,7 @@ function DemoLoadedPill({
     return null;
   }
 
+  const dismiss = () => setVisible(false);
   const seconds = (loadTimeMs / 1000).toFixed(1);
 
   return (
@@ -106,6 +107,9 @@ function DemoLoadedPill({
           queries and offline support.
         </p>
       )}
+      <button className="demo-loaded-pill-ok" type="button" onClick={dismiss}>
+        OK
+      </button>
     </div>
   );
 }
@@ -146,6 +150,8 @@ export function Root() {
     }
   }, [contentReady, isDemoMode, isDemoVideo, spinnerStay, demoLoadTime]);
 
+  const showContent = contentReady && !spinnerStay;
+
   return (
     <ListContextProvider>
       {(!contentReady || spinnerStay) && (
@@ -157,7 +163,8 @@ export function Root() {
       <div
         className="app-container flex p-8"
         style={{
-          visibility: contentReady && !spinnerStay ? 'visible' : 'hidden',
+          opacity: showContent ? 1 : 0,
+          pointerEvents: showContent ? undefined : 'none',
         }}
       >
         <Switch>
@@ -180,7 +187,7 @@ export function Root() {
                 <ListPage onReady={() => setContentReady(true)} />
               </Route>
               <Route path="/issue/:id">
-                {params => (
+                {(params: {id: string}) => (
                   <IssuePage
                     key={params.id}
                     onReady={() => setContentReady(true)}

@@ -6,15 +6,19 @@
   "scripts": {
     "check-types": "tsc",
     "check-types:watch": "tsc --watch",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/",
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts src/",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "devDependencies": {
-    "shared": "0.0.0",
-    "typescript": "~5.9.3",
-    "vitest": "4.0.15"
-  }
+    "oxfmt": "^0.45.0",
+    "shared": "workspace:*",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.6"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

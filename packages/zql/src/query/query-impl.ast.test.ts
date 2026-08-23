@@ -742,7 +742,9 @@ test('where expressions', () => {
 // mutate the AST itself.
 test('where to dnf', () => {
   const issueQuery = newQuery(schema, 'issue');
-  let flatten = issueQuery.where('id', '=', '1').where('closed', true);
+  let flatten: AnyQuery = issueQuery
+    .where('id', '=', '1')
+    .where('closed', true);
   expect(ast(flatten).where).toMatchInlineSnapshot(`
     {
       "conditions": [
@@ -2107,52 +2109,83 @@ test('one in schema should not imply limit 1 in the ast -- the user needs to get
   });
 });
 
-test('scalar option throws on two-hop relationship', () => {
+test('scalar option on two-hop relationship applies to inner condition', () => {
   const issueQuery = newQuery(schema, 'issue');
 
-  expect(() => issueQuery.whereExists('labels', {scalar: true})).toThrow(
-    'scalar option only supports one-hop relationships',
-  );
+  expect(
+    ast(
+      issueQuery.whereExists('labels', q => q.where('id', '=', 'l1'), {
+        scalar: true,
+        flip: true,
+      }),
+    ),
+  ).toMatchInlineSnapshot(`
+    {
+      "table": "issue",
+      "where": {
+        "flip": true,
+        "op": "EXISTS",
+        "related": {
+          "correlation": {
+            "childField": [
+              "issueId",
+            ],
+            "parentField": [
+              "id",
+            ],
+          },
+          "subquery": {
+            "alias": "zsubq_labels",
+            "table": "issueLabel",
+            "where": {
+              "flip": true,
+              "op": "EXISTS",
+              "related": {
+                "correlation": {
+                  "childField": [
+                    "id",
+                  ],
+                  "parentField": [
+                    "labelId",
+                  ],
+                },
+                "subquery": {
+                  "alias": "zsubq_zhidden_labels",
+                  "table": "label",
+                  "where": {
+                    "left": {
+                      "name": "id",
+                      "type": "column",
+                    },
+                    "op": "=",
+                    "right": {
+                      "type": "literal",
+                      "value": "l1",
+                    },
+                    "type": "simple",
+                  },
+                },
+                "system": "client",
+              },
+              "scalar": true,
+              "type": "correlatedSubquery",
+            },
+          },
+          "system": "client",
+        },
+        "type": "correlatedSubquery",
+      },
+    }
+  `);
 });
 
 describe('whereExists with scalar option', () => {
   test('basic scalar exists', () => {
     const issueQuery = newQuery(schema, 'issue');
 
-    expect(ast(issueQuery.whereExists('owner', {scalar: true})))
-      .toMatchInlineSnapshot(`
-      {
-        "table": "issue",
-        "where": {
-          "op": "EXISTS",
-          "related": {
-            "correlation": {
-              "childField": [
-                "id",
-              ],
-              "parentField": [
-                "ownerId",
-              ],
-            },
-            "subquery": {
-              "alias": "zsubq_owner",
-              "table": "user",
-            },
-            "system": "client",
-          },
-          "scalar": true,
-          "type": "correlatedSubquery",
-        },
-      }
-    `);
-  });
-
-  test('scalar with where condition on subquery', () => {
-    const issueQuery = newQuery(schema, 'issue');
-
     expect(
       ast(
-        issueQuery.whereExists('owner', q => q.where('name', 'Alice'), {
+        issueQuery.whereExists('owner', q => q.where('id', '=', 'u1'), {
           scalar: true,
         }),
       ),
@@ -2175,13 +2208,61 @@ describe('whereExists with scalar option', () => {
               "table": "user",
               "where": {
                 "left": {
-                  "name": "name",
+                  "name": "id",
                   "type": "column",
                 },
                 "op": "=",
                 "right": {
                   "type": "literal",
-                  "value": "Alice",
+                  "value": "u1",
+                },
+                "type": "simple",
+              },
+            },
+            "system": "client",
+          },
+          "scalar": true,
+          "type": "correlatedSubquery",
+        },
+      }
+    `);
+  });
+
+  test('scalar with where condition on subquery', () => {
+    const issueQuery = newQuery(schema, 'issue');
+
+    expect(
+      ast(
+        issueQuery.whereExists('owner', q => q.where('id', '=', 'u1'), {
+          scalar: true,
+        }),
+      ),
+    ).toMatchInlineSnapshot(`
+      {
+        "table": "issue",
+        "where": {
+          "op": "EXISTS",
+          "related": {
+            "correlation": {
+              "childField": [
+                "id",
+              ],
+              "parentField": [
+                "ownerId",
+              ],
+            },
+            "subquery": {
+              "alias": "zsubq_owner",
+              "table": "user",
+              "where": {
+                "left": {
+                  "name": "id",
+                  "type": "column",
+                },
+                "op": "=",
+                "right": {
+                  "type": "literal",
+                  "value": "u1",
                 },
                 "type": "simple",
               },
@@ -2201,7 +2282,7 @@ describe('whereExists with scalar option', () => {
     expect(
       ast(
         issueQuery
-          .whereExists('owner', q => q.where('name', 'Alice'), {scalar: true})
+          .whereExists('owner', q => q.where('id', '=', 'u1'), {scalar: true})
           .where('title', 'LIKE', '%bug%'),
       ).where,
     ).toMatchObject({
@@ -2272,7 +2353,7 @@ describe('whereExists with scalar option', () => {
     const issueQuery = newQuery(schema, 'issue');
 
     const q = issueQuery
-      .whereExists('owner', q => q.where('name', 'Alice'), {scalar: true})
+      .whereExists('owner', q => q.where('id', '=', 'u1'), {scalar: true})
       .where('closed', false);
 
     expect(ast(q).where).toMatchObject({

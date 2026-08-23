@@ -1,9 +1,23 @@
+import {Socket} from 'node:net';
+import {
+  PG_CONFIGURATION_LIMIT_EXCEEDED,
+  PG_CONNECTION_DOES_NOT_EXIST,
+  PG_CONNECTION_EXCEPTION,
+  PG_CONNECTION_FAILURE,
+  PG_INSUFFICIENT_PRIVILEGE,
+  PG_INVALID_AUTHORIZATION_SPECIFICATION,
+  PG_INVALID_CATALOG_NAME,
+  PG_INVALID_PASSWORD,
+  PG_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+  PG_TOO_MANY_CONNECTIONS,
+} from '@drdgvhbh/postgres-error-codes';
 import {PreciseDate} from '@google-cloud/precise-date';
 import {OID} from '@postgresql-typed/oids';
 import type {LogContext} from '@rocicorp/logger';
 import postgres, {type Notice, type PostgresType} from 'postgres';
 import {BigIntJSON, type JSONValue} from '../../../shared/src/bigint-json.ts';
 import {randInt} from '../../../shared/src/rand.ts';
+import {ConfigurationError} from './configuration-error.ts';
 import {
   DATE,
   JSON,
@@ -15,38 +29,56 @@ import {
   TIMETZ,
 } from './pg-types.ts';
 
+// Matches: YEAR-MM-DD HH:MM:SS[.fraction][+-TZ[:MM]][ BC]
+const pgTimestampRe =
+  /^(\d+)-(\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d+)?)([+-]\d{1,2}(?::\d{2})?)?(?: BC)?$/;
+
 // exported for testing.
 export function timestampToFpMillis(timestamp: string): number {
-  // Convert from PG's time string, e.g. "1999-01-08 12:05:06+00" to "Z"
-  // format expected by PreciseDate.
-  timestamp = timestamp.replace(' ', 'T');
-  const positiveOffset = timestamp.includes('+');
-  const tzSplitIndex = positiveOffset
-    ? timestamp.lastIndexOf('+')
-    : timestamp.indexOf('-', timestamp.indexOf('T'));
-  const timezoneOffset =
-    tzSplitIndex === -1 ? undefined : timestamp.substring(tzSplitIndex);
-  const tsWithoutTimezone =
-    (tzSplitIndex === -1 ? timestamp : timestamp.substring(0, tzSplitIndex)) +
-    'Z';
+  if (timestamp === 'infinity') return Infinity;
+  if (timestamp === '-infinity') return -Infinity;
+  const match = timestamp.match(pgTimestampRe);
+  if (!match) {
+    throw new Error(`Error parsing ${timestamp}`);
+  }
+
+  const [, yearStr, monthDay, time, tz] = match;
+  const bc = timestamp.endsWith(' BC');
+
+  let year = Number(yearStr);
+  if (bc) {
+    // Postgres: 1 BC = JS year 0, 2 BC = JS year -1, N BC = -(N-1)
+    year = -(year - 1);
+  }
+
+  // Format year as ISO 8601 expanded year if needed.
+  // https://tc39.es/ecma262/#sec-expanded-years
+  let isoYear: string;
+  if (year >= 0 && year <= 9999) {
+    isoYear = String(year).padStart(4, '0');
+  } else if (year >= 0) {
+    isoYear = '+' + String(year).padStart(6, '0');
+  } else {
+    isoYear = '-' + String(Math.abs(year)).padStart(6, '0');
+  }
+
+  // Build a UTC ISO string so PreciseDate returns microsecond precision.
+  const utcString = `${isoYear}-${monthDay}T${time}Z`;
 
   try {
-    // PreciseDate does not return microsecond precision unless the provided
-    // timestamp is in UTC time so we need to add the timezone offset back in.
-    const fullTime = new PreciseDate(tsWithoutTimezone).getFullTime();
+    const fullTime = new PreciseDate(utcString).getFullTime();
     const millis = Number(fullTime / 1_000_000n);
     const nanos = Number(fullTime % 1_000_000n);
     const ret = millis + nanos * 1e-6; // floating point milliseconds
 
-    // add back in the timezone offset
-    if (timezoneOffset) {
-      const [hours, minutes] = timezoneOffset.split(':');
+    // Add back in the timezone offset. We passed local time as UTC,
+    // so a positive offset means we need to subtract, and vice versa.
+    if (tz) {
+      const positiveOffset = tz.startsWith('+');
+      const [hours, minutes] = tz.split(':');
       const offset =
         Math.abs(Number(hours)) * 60 + (minutes ? Number(minutes) : 0);
       const offsetMillis = offset * 60 * 1_000;
-      // If it is a positive offset, we subtract the offset from the UTC
-      // because we passed in the "local time" as if it was UTC.
-      // The opposite is true for negative offsets.
       return positiveOffset ? ret - offsetMillis : ret + offsetMillis;
     }
     return ret;
@@ -81,6 +113,17 @@ function serializeTimestamp(val: unknown): string {
 }
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function serializeTime(x: unknown, type: 'time' | 'timetz'): string {
+  switch (typeof x) {
+    case 'string':
+      return x; // Let Postgres parse it
+    case 'number':
+      return millisecondsToPostgresTime(x);
+  }
+  throw new Error(`Unsupported type "${typeof x}" for ${type}: ${x}`);
+}
+
 export function millisecondsToPostgresTime(milliseconds: number): string {
   if (milliseconds < 0) {
     throw new Error('Milliseconds cannot be negative');
@@ -103,16 +146,17 @@ export function millisecondsToPostgresTime(milliseconds: number): string {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}+00`;
 }
 
+// Regular expression to match HH:MM:SS, HH:MM:SS.mmm, or HH:MM:SS+00 / HH:MM:SS.mmm+00
+// Supports optional timezone offset
+const timeRegex =
+  /^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/;
+
 export function postgresTimeToMilliseconds(timeString: string): number {
   // Validate basic format
   if (!timeString || typeof timeString !== 'string') {
     throw new Error('Invalid time string: must be a non-empty string');
   }
 
-  // Regular expression to match HH:MM:SS, HH:MM:SS.mmm, or HH:MM:SS+00 / HH:MM:SS.mmm+00
-  // Supports optional timezone offset
-  const timeRegex =
-    /^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/;
   const match = timeString.match(timeRegex);
 
   if (!match) {
@@ -188,6 +232,8 @@ export function postgresTimeToMilliseconds(timeString: string): number {
 }
 
 function dateToUTCMidnight(date: string): number {
+  if (date === 'infinity') return Infinity;
+  if (date === '-infinity') return -Infinity;
   const d = new Date(date);
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 }
@@ -243,18 +289,17 @@ export const postgresTypeConfig = ({sendStringAsJson}: TypeOptions = {}) => ({
     time: {
       to: TIME,
       from: [TIME, TIMETZ],
-      serialize: (x: unknown) => {
-        switch (typeof x) {
-          case 'string':
-            return x; // Let Postgres parse it
-          case 'number':
-            return millisecondsToPostgresTime(x);
-        }
-
-        throw new Error(`Unsupported type "${typeof x}" for time: ${x}`);
-      },
+      serialize: (x: unknown) => serializeTime(x, 'time'),
       parse: postgresTimeToMilliseconds,
     },
+
+    timetz: {
+      to: TIMETZ,
+      from: [TIME, TIMETZ],
+      serialize: (x: unknown) => serializeTime(x, 'timetz'),
+      parse: postgresTimeToMilliseconds,
+    },
+
     // The DATE type is stored directly as the PG normalized date string.
     date: {
       to: DATE,
@@ -285,31 +330,143 @@ export type PostgresTransaction = postgres.TransactionSql<{
   json: JSONValue;
 }>;
 
+// Guards against half-open TCP connections, which otherwise hang the pool
+// indefinitely: a proxy can keep the client-facing socket alive (ACKing TCP
+// keepalives) after its backend is gone, so no 'close' or 'error' event ever
+// fires and statements like BEGIN / COMMIT — which are not covered by the
+// TransactionPool's statementResponseTimeout — await forever.
+// See https://github.com/porsager/postgres/issues/1089.
+//
+// If no bytes are read or written for this long, the socket is reset, which
+// rejects all in-flight queries and lets the pool recover. Wire activity
+// resets the timer, so streaming operations (e.g. COPY) are safe, but
+// statements that legitimately compute silently for longer (e.g. index
+// builds in migrations) must raise this. Settable as an emergency measure
+// (0 disables); deliberately not exposed as a server option.
+const SOCKET_INACTIVITY_TIMEOUT_MS = parseInt(
+  process.env.ZERO_PG_SOCKET_INACTIVITY_TIMEOUT ?? '120000',
+);
+
+type SocketFactoryOptions = {
+  host: string[];
+  port: number[];
+  path?: string | false;
+};
+
+/**
+ * Creates the custom socket factory passed to postgres.js via its (untyped)
+ * `socket` option. postgres.js does not call `connect()` on custom sockets,
+ * and its TLS upgrade reads `socket.host` for the SNI servername, so the
+ * factory must handle both itself.
+ *
+ * Note: unlike postgres.js's internal socket, reconnects do not rotate
+ * through multiple hosts; multi-host URIs are not used by the zero-cache.
+ *
+ * Exported for testing.
+ */
+export function inactivityTimeoutSocket(
+  lc: LogContext,
+  timeoutMs = SOCKET_INACTIVITY_TIMEOUT_MS,
+) {
+  return (options: SocketFactoryOptions): Socket => {
+    const socket = new Socket();
+    const target = options.path
+      ? options.path
+      : `${options.host[0]}:${options.port[0]}`;
+    if (timeoutMs > 0) {
+      // socket.setTimeout() cannot be used here: it registers its callback
+      // as a 'timeout' event listener, and postgres.js removes all listeners
+      // from the raw socket when upgrading it to TLS (removeAllListeners()
+      // in secure()), which would silently disarm the watchdog on every TLS
+      // connection. An interval is not a socket listener, so it survives the
+      // upgrade, and encrypted traffic still flows through this raw socket,
+      // advancing its byte counters.
+      //
+      // The counters are sampled once per timeout period, so a half-open
+      // socket is reset after one to two timeout periods of inactivity.
+      let lastActivity = -1;
+      const watchdog = setInterval(() => {
+        if (socket.destroyed) {
+          clearInterval(watchdog);
+          return;
+        }
+        const activity = socket.bytesRead + socket.bytesWritten;
+        if (activity === lastActivity) {
+          lc.warn?.(
+            `resetting connection to ${target} after ${timeoutMs} ms of inactivity ` +
+              `(likely half-open); in-flight queries will be rejected`,
+          );
+          clearInterval(watchdog);
+          socket.resetAndDestroy();
+        } else {
+          lastActivity = activity;
+        }
+      }, timeoutMs);
+      watchdog.unref();
+      // Best-effort cleanup; removed on TLS upgrade, in which case the
+      // destroyed check above clears the (unref'ed) interval instead.
+      socket.once('close', () => clearInterval(watchdog));
+    }
+    if (options.path) {
+      socket.connect(options.path);
+    } else {
+      const [host] = options.host;
+      const [port] = options.port;
+      socket.connect(port, host);
+      // Read by postgres.js for the TLS SNI servername.
+      Object.assign(socket, {host, port});
+    }
+    return socket;
+  };
+}
+
 export function pgClient(
   lc: LogContext,
   connectionURI: string,
+  // A descriptive name for the code that is making the connection, so that we
+  // can debug things like deadlocks.
+  applicationName: string,
   options?: postgres.Options<{
     bigint: PostgresType<bigint>;
     json: PostgresType<JSONValue>;
   }>,
   opts?: TypeOptions,
 ): PostgresDB {
+  applicationName = `zero-${applicationName}`;
+
+  // Postgres carries row values in the `detail`, `hint`, `where` and
+  // `internal_query` fields -- e.g. a unique violation reports
+  // `Key (email)=(someone@example.com) already exists` in `detail`. Forward
+  // only the severity, SQLSTATE and schema location; never the Notice itself.
+  const safeNotice = (n: Notice) => ({
+    severity: n.severity,
+    code: n.code,
+    message: n.message,
+    schema: n.schema_name,
+    table: n.table_name,
+    column: n.column_name,
+    constraint: n.constraint_name,
+    routine: n.routine,
+  });
+
   const onnotice = (n: Notice) => {
     // https://www.postgresql.org/docs/current/plpgsql-errors-and-messages.html#PLPGSQL-STATEMENTS-RAISE
     switch (n.severity) {
       case 'NOTICE':
         return; // silenced
       case 'DEBUG':
-        lc.debug?.(n);
+        lc.debug?.('pg notice', safeNotice(n));
         return;
       case 'WARNING':
+        lc.warn?.('pg notice', safeNotice(n));
+        return;
       case 'EXCEPTION':
-        lc.error?.(n);
+        lc.error?.('pg notice', safeNotice(n));
         return;
       case 'LOG':
       case 'INFO':
       default:
-        lc.info?.(n);
+        lc.info?.('pg notice', safeNotice(n));
     }
   };
   const url = new URL(connectionURI);
@@ -327,14 +484,48 @@ export function pgClient(
 
   // Set connections to expire between 5 and 10 minutes to free up state on PG.
   const maxLifetimeSeconds = randInt(5 * 60, 10 * 60);
+  const providedConnection = options?.connection ?? {};
+
+  // postgres.js supports a custom socket factory via the `socket` option,
+  // but it is missing from its type declarations, hence the untyped spread.
+  const socketFactory = {
+    socket: inactivityTimeoutSocket(lc.withContext('appName', applicationName)),
+  };
 
   return postgres(connectionURI, {
     ...postgresTypeConfig(opts),
     onnotice,
     ['max_lifetime']: maxLifetimeSeconds,
+    // Close idle connections cleanly before the socket inactivity timer
+    // (which cannot distinguish an idle pool connection from a hung query)
+    // resets them.
+    ['idle_timeout']: 60,
     ssl,
+    ...socketFactory,
     ...options,
+    connection: {
+      ...providedConnection,
+      ['application_name']: applicationName,
+    },
   });
+}
+
+export async function connectPgClient(
+  ...args: Parameters<typeof pgClient>
+): Promise<PostgresDB> {
+  const db = pgClient(...args);
+  try {
+    await db`SELECT 1`.simple().execute();
+    return db;
+  } catch (e) {
+    if (isPostgresConfigError(e)) {
+      throw new ConfigurationError(
+        'Unable to connect to Postgres. Check your database configuration.',
+        {cause: e},
+      );
+    }
+    throw e;
+  }
 }
 
 /**
@@ -349,7 +540,7 @@ export function pgClient(
  * these operations from timing out.
  */
 export function disableStatementTimeout(sql: PostgresTransaction) {
-  void sql`SET LOCAL statement_timeout = 0;`.execute();
+  void sql`SET LOCAL statement_timeout = 0;`.execute().catch(() => {});
 }
 
 export const typeNameByOID: Record<number, string> = Object.freeze(
@@ -360,3 +551,54 @@ export const typeNameByOID: Record<number, string> = Object.freeze(
     ]),
   ),
 );
+
+export function isPostgresError(e: unknown, ...codes: [string, ...string[]]) {
+  return e instanceof postgres.PostgresError && codes.includes(e.code);
+}
+
+function isPostgresStartupConnectionError(e: unknown) {
+  if (!(e instanceof Error) || !('code' in e)) {
+    return false;
+  }
+  const {code} = e;
+  // postgres.js throws plain Error instances for connection failures that
+  // happen before Postgres can return a SQLSTATE. These are still startup
+  // configuration problems for Zero: wrong host/port, unreachable DB, DNS,
+  // TLS certificate mismatch, etc.
+  return (
+    typeof code === 'string' &&
+    [
+      'CONNECT_TIMEOUT',
+      'ECONNREFUSED',
+      'ECONNRESET',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'ENOTFOUND',
+      'EAI_AGAIN',
+      'ETIMEDOUT',
+      'ERR_TLS_CERT_ALTNAME_INVALID',
+      'SELF_SIGNED_CERT_IN_CHAIN',
+      'DEPTH_ZERO_SELF_SIGNED_CERT',
+      'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+    ].includes(code)
+  );
+}
+
+export function isPostgresConfigError(e: unknown) {
+  return (
+    isPostgresStartupConnectionError(e) ||
+    isPostgresError(
+      e,
+      PG_CONNECTION_EXCEPTION,
+      PG_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+      PG_CONNECTION_DOES_NOT_EXIST,
+      PG_CONNECTION_FAILURE,
+      PG_INVALID_AUTHORIZATION_SPECIFICATION,
+      PG_INVALID_PASSWORD,
+      PG_INVALID_CATALOG_NAME,
+      PG_INSUFFICIENT_PRIVILEGE,
+      PG_TOO_MANY_CONNECTIONS,
+      PG_CONFIGURATION_LIMIT_EXCEEDED,
+    )
+  );
+}

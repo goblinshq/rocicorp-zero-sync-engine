@@ -22,6 +22,11 @@ import {MemorySource} from '../../../zql/src/ivm/memory-source.ts';
 import {consume} from '../../../zql/src/ivm/stream.ts';
 import {ENTITIES_KEY_PREFIX, sourceNameFromKey} from './keys.ts';
 
+import {
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from '../../../zql/src/ivm/source.ts';
 /**
  * Replicache needs to rebase mutations onto different
  * commits of it's b-tree. These mutations can have reads
@@ -41,6 +46,7 @@ import {ENTITIES_KEY_PREFIX, sourceNameFromKey} from './keys.ts';
 export class IVMSourceBranch {
   readonly #sources: Map<string, MemorySource | undefined>;
   readonly #tables: Record<string, TableSchema>;
+  #advanceError: unknown;
   hash: Hash | undefined;
 
   constructor(
@@ -54,6 +60,8 @@ export class IVMSourceBranch {
   }
 
   getSource(name: string): MemorySource | undefined {
+    this.#throwIfInvalid();
+
     if (this.#sources.has(name)) {
       return this.#sources.get(name);
     }
@@ -70,19 +78,33 @@ export class IVMSourceBranch {
     this.#sources.clear();
   }
 
+  #throwIfInvalid() {
+    if (this.#advanceError) {
+      throw this.#advanceError;
+    }
+  }
+
   /**
    * Mutates the current branch, advancing it to the new head
    * by applying the given diffs.
    */
   advance(expectedHead: Hash | undefined, newHead: Hash, diffs: NoIndexDiff) {
+    this.#throwIfInvalid();
+
     assert(
       this.hash === expectedHead,
       () =>
         `Expected head must match the main head. Got: ${this.hash}, expected: ${expectedHead}`,
     );
 
-    applyDiffs(diffs, this);
-    this.hash = newHead;
+    try {
+      applyDiffs(diffs, this);
+      this.hash = newHead;
+    } catch (e) {
+      this.#advanceError = e;
+      this.clear();
+      throw e;
+    }
   }
 
   /**
@@ -93,6 +115,8 @@ export class IVMSourceBranch {
     desiredHead: Hash,
     readOptions?: ZeroReadOptions,
   ): Promise<IVMSourceBranch> {
+    this.#throwIfInvalid();
+
     const fork = this.fork();
 
     if (fork.hash === desiredHead) {
@@ -113,6 +137,8 @@ export class IVMSourceBranch {
    * The mutations modify the fork rather than original branch.
    */
   fork() {
+    this.#throwIfInvalid();
+
     return new IVMSourceBranch(
       this.#tables,
       this.hash,
@@ -214,28 +240,16 @@ function applyDiffs(diffs: NoIndexDiff, branch: IVMSourceBranch) {
     const source = must(branch.getSource(name));
     switch (diff.op) {
       case 'del':
-        consume(
-          source.push({
-            type: 'remove',
-            row: diff.oldValue as Row,
-          }),
-        );
+        consume(source.push(makeSourceChangeRemove(diff.oldValue as Row)));
         break;
       case 'add':
-        consume(
-          source.push({
-            type: 'add',
-            row: diff.newValue as Row,
-          }),
-        );
+        consume(source.push(makeSourceChangeAdd(diff.newValue as Row)));
         break;
       case 'change':
         consume(
-          source.push({
-            type: 'edit',
-            row: diff.newValue as Row,
-            oldRow: diff.oldValue as Row,
-          }),
+          source.push(
+            makeSourceChangeEdit(diff.newValue as Row, diff.oldValue as Row),
+          ),
         );
         break;
     }

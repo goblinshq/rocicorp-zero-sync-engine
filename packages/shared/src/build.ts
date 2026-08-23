@@ -1,3 +1,4 @@
+// oxlint-disable e18e/prefer-static-regex
 import {readFileSync} from 'node:fs';
 
 const external = [
@@ -49,7 +50,7 @@ export function makeDefine(
     ),
     ['process.env.ZERO_VERSION']: JSON.stringify(getVersion('zero')),
     ['process.env.DISABLE_MUTATION_RECOVERY']: 'false',
-    ['TESTING']: 'false',
+    ['process.env.DISABLE_REPLICACHE_INDEXES']: 'false',
   };
   if (mode === 'unknown') {
     return define;

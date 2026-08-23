@@ -1,4 +1,5 @@
 import type {SQLQuery} from '@databases/sql';
+import {assert} from '../../shared/src/asserts.ts';
 import type {
   Condition,
   Ordering,
@@ -9,9 +10,9 @@ import type {
   SchemaValue,
   ValueType,
 } from '../../zero-schema/src/table-schema.ts';
-import {sql} from './internal/sql.ts';
 import type {Constraint} from '../../zql/src/ivm/constraint.ts';
-import type {Start} from '../../zql/src/ivm/operator.ts';
+import type {MultiConstraint, Start} from '../../zql/src/ivm/operator.ts';
+import {sql} from './internal/sql.ts';
 
 /**
  * Condition type without correlated subqueries.
@@ -27,9 +28,10 @@ export function buildSelectQuery(
   columns: Record<string, SchemaValue>,
   constraint: Constraint | undefined,
   filters: NoSubqueryCondition | undefined,
-  order: Ordering,
+  order: Ordering | undefined,
   reverse: boolean | undefined,
   start: Start | undefined,
+  multiConstraints?: readonly MultiConstraint[] | undefined,
 ) {
   let query = sql`SELECT ${sql.join(
     Object.keys(columns).map(c => sql.ident(c)),
@@ -37,7 +39,16 @@ export function buildSelectQuery(
   )} FROM ${sql.ident(tableName)}`;
   const constraints: SQLQuery[] = constraintsToSQL(constraint, columns);
 
+  if (multiConstraints) {
+    for (const mc of multiConstraints) {
+      if (mc.length > 0) {
+        constraints.push(multiConstraintToSQL(mc, columns));
+      }
+    }
+  }
+
   if (start) {
+    assert(order !== undefined, 'start requires ordering');
     constraints.push(gatherStartConstraints(start, reverse, order, columns));
   }
 
@@ -49,7 +60,10 @@ export function buildSelectQuery(
     query = sql`${query} WHERE ${sql.join(constraints, sql` AND `)}`;
   }
 
-  return sql`${query} ${orderByToSQL(order, !!reverse)}`;
+  if (order && order.length > 0) {
+    return sql`${query} ${orderByToSQL(order, !!reverse)}`;
+  }
+  return query;
 }
 
 export function constraintsToSQL(
@@ -68,6 +82,63 @@ export function constraintsToSQL(
   }
 
   return constraints;
+}
+
+/**
+ * Builds a single batched IN clause from a `MultiConstraint`. All entries
+ * are assumed to share the same shape (the keys of the first entry);
+ * FlippedJoin derives them from the same parentKey for all children.
+ *
+ * Single-column form: `col IN (?, ?, ?)`
+ * Compound form:      `(a, b) IN (VALUES (?, ?), (?, ?), …)`
+ *
+ * NOTE: SQLite optimizes `col IN (literal-list)` using the column's index;
+ * verified via EXPLAIN QUERY PLAN — see query-builder.test.ts.
+ */
+export function multiConstraintToSQL(
+  multiConstraint: MultiConstraint,
+  columns: Record<string, SchemaValue>,
+): SQLQuery {
+  assert(multiConstraint.length > 0, 'multiConstraint must be non-empty');
+  // All entries share the same keys; pull the column list from the first.
+  const keys = Object.keys(multiConstraint[0]);
+  assert(keys.length > 0, 'multiConstraint entries must have at least one key');
+  // Subsequent entries must share the first entry's shape — the SQL form
+  // is `(col_a, col_b, …) IN VALUES (…)`, with one binding per key per
+  // entry. Heterogeneous keys would silently produce incorrect bindings.
+  for (let i = 1; i < multiConstraint.length; i++) {
+    const entry = multiConstraint[i];
+    assert(
+      Object.keys(entry).length === keys.length && keys.every(k => k in entry),
+      () =>
+        `multiConstraint entries must share the same keys (entry 0: [${keys.join(
+          ',',
+        )}], entry ${i}: [${Object.keys(entry).join(',')}])`,
+    );
+  }
+
+  if (keys.length === 1) {
+    const key = keys[0];
+    const colType = columns[key].type;
+    return sql`${sql.ident(key)} IN (${sql.join(
+      multiConstraint.map(c => sql`${toSQLiteType(c[key], colType)}`),
+      sql`,`,
+    )})`;
+  }
+
+  // Compound: `(col_a, col_b, …) IN (VALUES (?, ?, …), …)`
+  const colList = sql`(${sql.join(
+    keys.map(k => sql.ident(k)),
+    sql`,`,
+  )})`;
+  const rows = multiConstraint.map(
+    c =>
+      sql`(${sql.join(
+        keys.map(k => sql`${toSQLiteType(c[k], columns[k].type)}`),
+        sql`,`,
+      )})`,
+  );
+  return sql`${colList} IN (VALUES ${sql.join(rows, sql`,`)})`;
 }
 
 export function orderByToSQL(order: Ordering, reverse: boolean): SQLQuery {
@@ -138,15 +209,44 @@ function simpleConditionToSQL(filter: SimpleCondition): SQLQuery {
         );
     }
   }
+  if (
+    op === 'LIKE' ||
+    op === 'NOT LIKE' ||
+    op === 'ILIKE' ||
+    op === 'NOT ILIKE'
+  ) {
+    return likeConditionToSQL(filter);
+  }
+
   return sql`${valuePositionToSQL(filter.left)} ${sql.__dangerous__rawValue(
-    // SQLite's LIKE operator is case-insensitive by default, so we
-    // convert ILIKE to LIKE and NOT ILIKE to NOT LIKE.
-    filter.op === 'ILIKE'
-      ? 'LIKE'
-      : filter.op === 'NOT ILIKE'
-        ? 'NOT LIKE'
-        : filter.op,
+    filter.op,
   )} ${valuePositionToSQL(filter.right)}`;
+}
+
+function likeConditionToSQL(filter: SimpleCondition): SQLQuery {
+  const {op} = filter;
+  // Mirror Postgres pattern-matching semantics:
+  //  * LIKE is case-sensitive. The replica connection runs with
+  //    `PRAGMA case_sensitive_like = ON` (see db.ts), so the bare LIKE
+  //    operator is case-sensitive.
+  //  * ILIKE is case-insensitive. We lower() both operands using the
+  //    Unicode-aware lower() that @rocicorp/zero-sqlite3 provides via ICU,
+  //    mirroring the toLowerCase() used by the in-memory IVM matcher
+  //    (see zql/src/builder/like.ts).
+  //  * Backslash is the default escape character in Postgres and in the IVM
+  //    matcher, but SQLite has no default, so we specify `ESCAPE '\'`
+  //    explicitly. The SQL literal '\' is a single backslash (SQLite does not
+  //    process backslash escapes inside string literals).
+  const caseInsensitive = op === 'ILIKE' || op === 'NOT ILIKE';
+  const negated = op === 'NOT LIKE' || op === 'NOT ILIKE';
+  const likeOp = sql.__dangerous__rawValue(negated ? 'NOT LIKE' : 'LIKE');
+
+  const left = valuePositionToSQL(filter.left);
+  const right = valuePositionToSQL(filter.right);
+  if (caseInsensitive) {
+    return sql`lower(${left}) ${likeOp} lower(${right}) ESCAPE '\\'`;
+  }
+  return sql`${left} ${likeOp} ${right} ESCAPE '\\'`;
 }
 
 function valuePositionToSQL(value: ValuePosition): SQLQuery {
@@ -188,6 +288,76 @@ export function toSQLiteType(v: unknown, type: ValueType): unknown {
   }
 }
 
+function nullableAwareEquality(
+  field: string,
+  value: unknown,
+  columnType: SchemaValue,
+): SQLQuery {
+  if (value === null) {
+    // A NULL bound value proves the column is nullable regardless of the
+    // column metadata, and `=` never matches NULL — `IS` selects the NULL
+    // tie-break group a cursor anchored on a NULL value needs.
+    return sql`${sql.ident(field)} IS ${value}`;
+  }
+  // Use = instead of IS for non-nullable columns to enable better
+  // index usage in SQLite.
+  return columnType.optional === true
+    ? sql`${sql.ident(field)} IS ${value}`
+    : sql`${sql.ident(field)} = ${value}`;
+}
+
+function nullableAwareRangeComparison(
+  field: string,
+  value: unknown,
+  operator: '>' | '<',
+  columnType: SchemaValue,
+): SQLQuery {
+  if (value === null) {
+    return operator === '>' ? sql`${sql.ident(field)} IS NOT NULL` : sql`FALSE`;
+  }
+
+  // For non-nullable columns, skip IS NULL checks to avoid breaking
+  // SQLite's MULTI-INDEX OR optimization, which falls back to a full
+  // table scan when any OR branch involves NULL.
+  // See: https://github.com/rocicorp/mono/pull/5542
+  const comparison = sql`${sql.ident(field)} ${sql.__dangerous__rawValue(
+    operator,
+  )} ${value}`;
+  if (columnType.optional !== true) {
+    return comparison;
+  }
+
+  // The bound is non-NULL here. NULLs sort before every non-NULL value, so
+  // `>` already excludes them and needs no guard, while `<` must admit the
+  // NULL group explicitly — a bare `col < ?` would silently drop NULL rows
+  // from a backward walk.
+  return operator === '>'
+    ? comparison
+    : sql`(${sql.ident(field)} IS NULL OR ${comparison})`;
+}
+
+function sargableLeadingStartBound(
+  field: string,
+  value: unknown,
+  operator: '>' | '<',
+  columnType: SchemaValue,
+): SQLQuery | undefined {
+  // A NULL bound value proves the column is nullable regardless of the
+  // column metadata, and a bare range bound is not sound there: `col >= NULL`
+  // is never true, so instead of being redundant it would annihilate the
+  // whole start constraint. A nullable column also cannot use a `<` bound,
+  // because the start constraint must retain the NULL group. For `>`, NULLs
+  // sort before the non-NULL bound, so `col >= value` remains sound.
+  if (value === null || (columnType.optional === true && operator === '<')) {
+    return undefined;
+  }
+
+  const inclusiveOperator = operator === '>' ? '>=' : '<=';
+  return sql`${sql.ident(field)} ${sql.__dangerous__rawValue(
+    inclusiveOperator,
+  )} ${value}`;
+}
+
 /**
  * The ordering could be complex such as:
  * `ORDER BY a ASC, b DESC, c ASC`
@@ -212,48 +382,41 @@ function gatherStartConstraints(
 ): SQLQuery {
   const constraints: SQLQuery[] = [];
   const {row: from, basis} = start;
+  let leadingBound: SQLQuery | undefined;
 
   for (let i = 0; i < order.length; i++) {
     const group: SQLQuery[] = [];
     const [iField, iDirection] = order[i];
     for (let j = 0; j <= i; j++) {
       if (j === i) {
+        const columnType = columnTypes[iField];
         const constraintValue = toSQLiteType(
-          from[iField],
-          columnTypes[iField].type,
+          from[iField] ?? null,
+          columnType.type,
         );
-        if (iDirection === 'asc') {
-          if (!reverse) {
-            group.push(
-              sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`,
-            );
-          } else {
-            reverse satisfies true;
-            group.push(
-              sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`,
-            );
-          }
-        } else {
-          iDirection satisfies 'desc';
-          if (!reverse) {
-            group.push(
-              sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`,
-            );
-          } else {
-            reverse satisfies true;
-            group.push(
-              sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`,
-            );
-          }
+        const operator =
+          iDirection === 'asc' ? (reverse ? '<' : '>') : reverse ? '>' : '<';
+        if (i === 0) {
+          leadingBound = sargableLeadingStartBound(
+            iField,
+            constraintValue,
+            operator,
+            columnType,
+          );
         }
+        group.push(
+          nullableAwareRangeComparison(
+            iField,
+            constraintValue,
+            operator,
+            columnType,
+          ),
+        );
       } else {
         const [jField] = order[j];
-        group.push(
-          sql`${sql.ident(jField)} IS ${toSQLiteType(
-            from[jField],
-            columnTypes[jField].type,
-          )}`,
-        );
+        const columnType = columnTypes[jField];
+        const value = toSQLiteType(from[jField] ?? null, columnType.type);
+        group.push(nullableAwareEquality(jField, value, columnType));
       }
     }
     constraints.push(sql`(${sql.join(group, sql` AND `)})`);
@@ -262,17 +425,18 @@ function gatherStartConstraints(
   if (basis === 'at') {
     constraints.push(
       sql`(${sql.join(
-        order.map(
-          s =>
-            sql`${sql.ident(s[0])} IS ${toSQLiteType(
-              from[s[0]],
-              columnTypes[s[0]].type,
-            )}`,
-        ),
+        order.map(([field]) => {
+          const columnType = columnTypes[field];
+          const value = toSQLiteType(from[field] ?? null, columnType.type);
+          return nullableAwareEquality(field, value, columnType);
+        }),
         sql` AND `,
       )})`,
     );
   }
 
-  return sql`(${sql.join(constraints, sql` OR `)})`;
+  const lexicographicStart = sql`(${sql.join(constraints, sql` OR `)})`;
+  return leadingBound === undefined
+    ? lexicographicStart
+    : sql`(${leadingBound} AND ${lexicographicStart})`;
 }

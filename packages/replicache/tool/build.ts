@@ -1,9 +1,9 @@
-import * as esbuild from 'esbuild';
 import {writeFile} from 'node:fs/promises';
 import {builtinModules} from 'node:module';
 import * as path from 'node:path';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
+import * as esbuild from 'esbuild';
 import {makeDefine, sharedOptions} from '../../shared/src/build.ts';
 
 const forBundleSizeDashboard = process.argv.includes('--bundle-sizes');
@@ -27,7 +27,10 @@ function basePath(...parts: string[]): string {
 }
 
 async function buildReplicache(options: BuildOptions) {
-  const define = makeDefine(options.mode);
+  const define = {
+    ...makeDefine(options.mode),
+    ...(forBundleSizeDashboard ? {'import.meta.env': 'undefined'} : {}),
+  };
   const {ext, mode, external, ...restOfOptions} = options;
   const outfile = basePath('out', 'replicache.' + ext);
   const entryPoints = {

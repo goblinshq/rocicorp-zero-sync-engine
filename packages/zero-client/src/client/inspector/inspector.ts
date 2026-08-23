@@ -1,7 +1,9 @@
+import type {ReadonlyJSONValue} from '../../../../shared/src/json.ts';
 import type {
   AnalyzeQueryResult,
   PlanDebugEventJSON,
 } from '../../../../zero-protocol/src/analyze-query-result.ts';
+import type {AST} from '../../../../zero-protocol/src/ast.ts';
 import type {AnalyzeQueryOptions} from '../../../../zero-protocol/src/inspect-up.ts';
 import {formatPlannerEvents} from '../../../../zql/src/planner/planner-debug.ts';
 import type {QueryDelegate} from '../../../../zql/src/query/query-delegate.ts';
@@ -12,6 +14,7 @@ import type {
   ExtendedInspectorDelegate,
   InspectorDelegate,
   Metrics,
+  QueryClientMetrics,
   Rep,
 } from './lazy-inspector.ts';
 
@@ -22,6 +25,10 @@ export type Lazy = typeof import('./lazy-inspector.ts');
 
 export class Inspector {
   readonly #delegate: ExtendedInspectorDelegate;
+  readonly #deletedQueries = new Map<
+    string,
+    {readonly ast: AST; readonly metrics: QueryClientMetrics}
+  >();
   readonly client: Client;
   readonly clientGroup: ClientGroup;
 
@@ -31,15 +38,28 @@ export class Inspector {
     queryDelegate: QueryDelegate,
     getSocket: () => Promise<WebSocket>,
   ) {
+    const deletedQueries = this.#deletedQueries;
+    inspectorDelegate.setQueryEvictedCallback((hash, ast, metrics) => {
+      deletedQueries.set(hash, {ast, metrics});
+    });
     this.#delegate = {
-      getQueryMetrics:
-        inspectorDelegate.getQueryMetrics.bind(inspectorDelegate),
-      getAST: inspectorDelegate.getAST.bind(inspectorDelegate),
+      getQueryMetrics(hash) {
+        return (
+          inspectorDelegate.getQueryMetrics(hash) ??
+          deletedQueries.get(hash)?.metrics
+        );
+      },
+      getAST(queryID) {
+        return (
+          inspectorDelegate.getAST(queryID) ?? deletedQueries.get(queryID)?.ast
+        );
+      },
       mapClientASTToServer:
         inspectorDelegate.mapClientASTToServer.bind(inspectorDelegate),
       get metrics() {
         return inspectorDelegate.metrics;
       },
+      setQueryEvictedCallback() {},
       queryDelegate,
       rep,
       getSocket,
@@ -77,6 +97,53 @@ export class Inspector {
       query,
       options,
     );
+  }
+
+  /**
+   * Analyze a query specified by a server-side AST. Unlike {@link analyzeQuery}
+   * the AST is sent to the server verbatim with no client-to-server name
+   * mapping; callers should provide an AST already in the server shape.
+   */
+  async analyzeServerAST(
+    ast: AST,
+    options?: AnalyzeQueryOptions,
+  ): Promise<AnalyzeQueryResult> {
+    return (await this.#delegate.lazy).analyzeServerAST(
+      this.#delegate,
+      ast,
+      options,
+    );
+  }
+
+  /**
+   * Analyze a server-registered named (custom) query. The server resolves
+   * the name and args to an AST using its registered custom-query handler.
+   */
+  async analyzeNamedQuery(
+    name: string,
+    args: ReadonlyArray<ReadonlyJSONValue>,
+    options?: AnalyzeQueryOptions,
+  ): Promise<AnalyzeQueryResult> {
+    return (await this.#delegate.lazy).analyzeNamedQuery(
+      this.#delegate,
+      name,
+      args,
+      options,
+    );
+  }
+
+  /**
+   * Authenticate with the server's admin password. Other inspector RPCs
+   * (e.g. {@link analyzeQuery}) fall back to an interactive HTML password
+   * prompt when authentication is needed, which is unavailable in non-DOM
+   * environments. Call this first from Node contexts to establish the
+   * session.
+   *
+   * Returns `true` if the password is accepted (or the server runs in a
+   * development mode that bypasses the check), `false` otherwise.
+   */
+  async authenticate(password: string): Promise<boolean> {
+    return (await this.#delegate.lazy).authenticate(this.#delegate, password);
   }
 
   /**

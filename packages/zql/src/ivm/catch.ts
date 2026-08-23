@@ -1,6 +1,9 @@
 import {unreachable} from '../../../shared/src/asserts.ts';
+import {mapValues} from '../../../shared/src/objects.ts';
 import {emptyArray} from '../../../shared/src/sentinels.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
+import {ChangeIndex} from './change-index.ts';
+import {ChangeType} from './change-type.ts';
 import type {Change} from './change.ts';
 import type {Node} from './data.ts';
 import {type FetchRequest, type Input, type Output} from './operator.ts';
@@ -60,12 +63,12 @@ export class Catch implements Output {
   }
 
   fetch(req: FetchRequest = {}) {
-    return [...this.#input.fetch(req)].map(expandNode);
+    return Array.from(this.#input.fetch(req), expandNode);
   }
 
   push(change: Change) {
     const fetch = this.#fetchOnPush
-      ? [...this.#input.fetch({})].map(expandNode)
+      ? Array.from(this.#input.fetch({}), expandNode)
       : [];
     const expandedChange = expandChange(change);
     if (this.#fetchOnPush) {
@@ -88,26 +91,30 @@ export class Catch implements Output {
 }
 
 export function expandChange(change: Change): CaughtChange {
-  switch (change.type) {
-    case 'add':
-    case 'remove':
+  switch (change[ChangeIndex.TYPE]) {
+    case ChangeType.ADD:
       return {
-        ...change,
-        node: expandNode(change.node),
+        type: 'add',
+        node: expandNode(change[ChangeIndex.NODE]),
       };
-    case 'edit':
+    case ChangeType.REMOVE:
+      return {
+        type: 'remove',
+        node: expandNode(change[ChangeIndex.NODE]),
+      };
+    case ChangeType.EDIT:
       return {
         type: 'edit',
-        oldRow: change.oldNode.row,
-        row: change.node.row,
+        oldRow: change[ChangeIndex.OLD_NODE].row,
+        row: change[ChangeIndex.NODE].row,
       };
-    case 'child':
+    case ChangeType.CHILD:
       return {
         type: 'child',
-        row: change.node.row,
+        row: change[ChangeIndex.NODE].row,
         child: {
-          ...change.child,
-          change: expandChange(change.child.change),
+          ...change[ChangeIndex.CHILD_DATA],
+          change: expandChange(change[ChangeIndex.CHILD_DATA].change),
         },
       };
     default:
@@ -120,11 +127,12 @@ export function expandNode(node: Node | 'yield'): CaughtNode {
     ? node
     : {
         row: node.row,
-        relationships: Object.fromEntries(
-          Object.entries(node.relationships).map(([k, v]) => [
-            k,
-            [...v()].map(expandNode),
-          ]),
-        ),
+        relationships: mapValues(node.relationships, getChildren => {
+          const children: CaughtNode[] = [];
+          for (const child of getChildren()) {
+            children.push(expandNode(child));
+          }
+          return children;
+        }),
       };
 }

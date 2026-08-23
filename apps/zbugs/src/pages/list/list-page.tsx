@@ -1,14 +1,18 @@
-import {useZeroVirtualizer} from '@rocicorp/zero-virtual/react';
+import {
+  rowAttributes,
+  useZeroVirtualizer,
+  type VirtualRow,
+} from '@rocicorp/zero-virtual/react';
 import {useQuery, useZero} from '@rocicorp/zero/react';
 import classNames from 'classnames';
 import Cookies from 'js-cookie';
 import React, {
+  memo,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
   type KeyboardEvent,
 } from 'react';
 import {toast} from 'react-toastify';
@@ -17,6 +21,7 @@ import {useParams, useSearch} from 'wouter';
 import {must} from '../../../../../packages/shared/src/must.ts';
 import {
   queries,
+  type Issue,
   type IssueRowSort,
   type ListContext,
 } from '../../../shared/queries.ts';
@@ -32,7 +37,7 @@ import {useElementSize} from '../../hooks/use-element-size.ts';
 import {useHash} from '../../hooks/use-hash.ts';
 import {useKeypress} from '../../hooks/use-keypress.ts';
 import {useLogin} from '../../hooks/use-login.tsx';
-import {useWouterPermalinkState} from '../../hooks/use-wouter-permalink-state.ts';
+import {useWouterScrollState} from '../../hooks/use-wouter-scroll-state.ts';
 import {appendParam, navigate, removeParam, setParam} from '../../navigate.ts';
 import {recordPageLoad} from '../../page-load-stats.ts';
 import {mark} from '../../perf-log.ts';
@@ -43,7 +48,91 @@ import {getIDFromString} from '../issue/get-id.tsx';
 import {ToastContainer, ToastContent} from '../issue/toast-content.tsx';
 
 let firstRowRendered = false;
+function markFirstRowRendered() {
+  if (firstRowRendered === false) {
+    mark('first issue row rendered');
+    firstRowRendered = true;
+  }
+}
+
 export const ITEM_SIZE = 56;
+
+type RowProps = {
+  item: VirtualRow<Issue>;
+  sortField: 'created' | 'modified';
+  permalinkID: string | null;
+  projectName: string;
+  listContext: ListContext;
+  isLoggedIn: boolean;
+};
+
+// Hoisted to module scope (not defined inside `ListPage`) so its component
+// identity is stable across `ListPage` renders. A component defined during
+// render has a new function identity each render, which makes React remount
+// the entire row subtree — churning DOM that the virtualizer measures and
+// anchors. `memo` additionally skips re-rendering rows whose props are
+// unchanged.
+const Row = memo(function Row({
+  item,
+  sortField,
+  permalinkID,
+  projectName,
+  listContext,
+  isLoggedIn,
+}: RowProps) {
+  const {index, key, row: issue} = item;
+  if (issue === undefined) {
+    return (
+      <div
+        className={classNames('row', 'skeleton-shimmer')}
+        {...rowAttributes(index, key)}
+      ></div>
+    );
+  }
+
+  markFirstRowRendered();
+
+  const timestamp = sortField === 'modified' ? issue.modified : issue.created;
+  return (
+    <div
+      className={classNames(
+        'row',
+        issue.modified > (issue.viewState?.viewed ?? 0) && isLoggedIn
+          ? 'unread'
+          : null,
+        {
+          // TODO(arv): Extract into something cleaner
+          permalink:
+            issue.id === permalinkID || String(issue.shortID) === permalinkID,
+        },
+      )}
+      {...rowAttributes(index, key)}
+    >
+      <IssueLink
+        className={classNames('issue-title', {'issue-closed': !issue.open})}
+        issue={{projectName, id: issue.id, shortID: issue.shortID}}
+        title={issue.title}
+        listContext={listContext}
+      >
+        {issue.title}
+      </IssueLink>
+      <div className="issue-taglist">
+        {issue.labels.map(label => (
+          <Link
+            key={label.id}
+            className="pill label"
+            href={`?label=${label.name}`}
+          >
+            {label.name}
+          </Link>
+        ))}
+      </div>
+      <div className="issue-timestamp">
+        <RelativeTime timestamp={timestamp} />
+      </div>
+    </div>
+  );
+});
 
 export function ListPage({onReady}: {onReady: () => void}) {
   const login = useLogin();
@@ -152,7 +241,7 @@ export function ListPage({onReady}: {onReady: () => void}) {
     document.title =
       `Zero Bugs → ${listContext.title}` +
       (permalinkID ? ` → Issue ${permalinkID}` : '');
-  }, [listContext]);
+  }, [listContext, permalinkID, setListContext]);
 
   const listRef = useRef<HTMLDivElement>(null);
   const tableWrapperRef = useRef<HTMLDivElement>(null);
@@ -163,18 +252,20 @@ export function ListPage({onReady}: {onReady: () => void}) {
     navigate(`#issue-${id}`);
   };
 
-  const [permalinkState, setPermalinkState] =
-    useWouterPermalinkState<IssueRowSort>();
+  const [scrollState, setScrollState] = useWouterScrollState<IssueRowSort>();
+
+  const queryOptions = textFilterQuery === textFilter ? CACHE_NAV : CACHE_NONE;
 
   const {
-    virtualizer,
-    rowAt,
+    items,
+    spaceBefore,
+    spaceAfter,
     complete,
     rowsEmpty,
     permalinkNotFound,
     estimatedTotal,
     total,
-  } = useZeroVirtualizer({
+  } = useZeroVirtualizer<typeof listContextParams, Issue, IssueRowSort>({
     estimateSize: () => ITEM_SIZE,
     getScrollElement: () => listRef.current,
     getRowKey: row => row.id,
@@ -182,28 +273,28 @@ export function ListPage({onReady}: {onReady: () => void}) {
     listContextParams,
     permalinkID,
 
-    getPageQuery: (
-      limit: number,
-      start: IssueRowSort | null,
-      dir: 'forward' | 'backward',
-    ) =>
-      queries.issueListV2({
+    getPageQuery: ({limit, start, dir}) => ({
+      query: queries.issueListV2({
         listContext: listContextParams,
-        userID: z.userID,
         limit,
         start,
         dir,
         inclusive: start === null,
       }),
+      options: queryOptions,
+    }),
 
-    getSingleQuery: (id: string) => {
+    getSingleQuery: ({id}) => {
       // Allow short ID too.
       const {idField, idValue} = getIDFromString(id);
-      return queries.listIssueByID({
-        idField,
-        idValue,
-        listContext: listContextParams,
-      });
+      return {
+        query: queries.listIssueByID({
+          idField,
+          idValue,
+          listContext: listContextParams,
+        }),
+        options: queryOptions,
+      };
     },
 
     toStartRow: row => ({
@@ -212,10 +303,8 @@ export function ListPage({onReady}: {onReady: () => void}) {
       created: row.created,
     }),
 
-    options: textFilterQuery === textFilter ? CACHE_NAV : CACHE_NONE,
-
-    permalinkState,
-    onPermalinkStateChange: setPermalinkState,
+    scrollState,
+    onScrollStateChange: setScrollState,
   });
 
   useEffect(() => {
@@ -294,70 +383,6 @@ export function ListPage({onReady}: {onReady: () => void}) {
       setForceSearchMode(false);
       navigate(removeParam(qs, 'q'));
     }
-  };
-
-  const Row = ({index, style}: {index: number; style: CSSProperties}) => {
-    const issue = rowAt(index);
-    if (issue === undefined) {
-      return (
-        <div
-          className={classNames('row', 'skeleton-shimmer')}
-          style={{
-            ...style,
-          }}
-        ></div>
-      );
-    }
-
-    if (firstRowRendered === false) {
-      mark('first issue row rendered');
-      firstRowRendered = true;
-    }
-
-    const timestamp = sortField === 'modified' ? issue.modified : issue.created;
-    return (
-      <div
-        key={issue.id}
-        className={classNames(
-          'row',
-          issue.modified > (issue.viewState?.viewed ?? 0) &&
-            login.loginState !== undefined
-            ? 'unread'
-            : null,
-          {
-            // TODO(arv): Extract into something cleaner
-            permalink:
-              issue.id === permalinkID || String(issue.shortID) === permalinkID,
-          },
-        )}
-        style={{
-          ...style,
-        }}
-      >
-        <IssueLink
-          className={classNames('issue-title', {'issue-closed': !issue.open})}
-          issue={{projectName, id: issue.id, shortID: issue.shortID}}
-          title={issue.title}
-          listContext={listContext}
-        >
-          {issue.title}
-        </IssueLink>
-        <div className="issue-taglist">
-          {issue.labels.map(label => (
-            <Link
-              key={label.id}
-              className="pill label"
-              href={`?label=${label.name}`}
-            >
-              {label.name}
-            </Link>
-          ))}
-        </div>
-        <div className="issue-timestamp">
-          <RelativeTime timestamp={timestamp} />
-        </div>
-      </div>
-    );
   };
 
   const [forceSearchMode, setForceSearchMode] = useState(false);
@@ -465,7 +490,7 @@ export function ListPage({onReady}: {onReady: () => void}) {
       <div className="list-view-filter-container">
         <span className="filter-label">Filtered by:</span>
         <div className="set-filter-container">
-          {[...qs.entries()].map(([key, val]) => {
+          {Array.from(qs.entries(), ([key, val]) => {
             if (key === 'label' || key === 'creator' || key === 'assignee') {
               return (
                 <span
@@ -514,17 +539,16 @@ export function ListPage({onReady}: {onReady: () => void}) {
             }}
             ref={listRef}
           >
-            <div
-              className="virtual-list"
-              style={{height: virtualizer.getTotalSize()}}
-            >
-              {virtualizer.getVirtualItems().map(virtualRow => (
+            <div style={{paddingTop: spaceBefore, paddingBottom: spaceAfter}}>
+              {items.map(item => (
                 <Row
-                  key={virtualRow.key + ''}
-                  index={virtualRow.index}
-                  style={{
-                    transform: `translateY(${virtualRow.start}px)`,
-                  }}
+                  key={item.key}
+                  item={item}
+                  sortField={sortField}
+                  permalinkID={permalinkID}
+                  projectName={projectName}
+                  listContext={listContext}
+                  isLoggedIn={login.loginState !== undefined}
                 />
               ))}
             </div>

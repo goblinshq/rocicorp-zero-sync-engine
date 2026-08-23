@@ -1,11 +1,11 @@
-import commandLineArgs from 'command-line-args';
-import commandLineUsage from 'command-line-usage';
-import getPort from 'get-port';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
+import commandLineArgs from 'command-line-args';
+import commandLineUsage from 'command-line-usage';
+import getPort from 'get-port';
 import * as playwright from 'playwright';
 import {createServer} from 'vite';
 import {assert} from '../../shared/src/asserts.ts';
@@ -241,7 +241,7 @@ async function main() {
       await Promise.race([context.close(), wait(1000)]);
     } else {
       await new Promise(resolve => {
-        setTimeout(() => resolve(undefined), 2 ** 31 - 1);
+        setTimeout(resolve, 2 ** 31 - 1, undefined);
       }); // Don't let the dev server stop!
     }
   }
@@ -324,12 +324,6 @@ async function runInBrowser(
     if (data[0] === 'result') {
       const result = data[1];
 
-      if (options.format === 'json') {
-        jsonEntries.push(result);
-      } else if (options.format === 'bmf') {
-        bmf = {...bmf, ...toBencherMetricFormat(result)};
-      }
-
       switch (options.format) {
         case 'json':
           jsonEntries.push(...createGithubActionBenchmarkJSONEntries(result));
@@ -349,9 +343,9 @@ async function runInBrowser(
     await waitForBenchmarks();
   }
   if (options.format === 'json') {
-    process.stdout.write(JSON.stringify(jsonEntries, undefined, 2) + '\n');
+    process.stdout.write(JSON.stringify(jsonEntries, jsonReplacer, 2) + '\n');
   } else if (options.format === 'bmf') {
-    process.stdout.write(JSON.stringify(bmf, undefined, 2) + '\n');
+    process.stdout.write(JSON.stringify(bmf, jsonReplacer, 2) + '\n');
   }
 }
 
@@ -365,6 +359,15 @@ function logLine(s: string, options: commandLineArgs.CommandLineOptions) {
   if (options.format !== 'json' && options.format !== 'bmf') {
     process.stdout.write(s + '\n');
   }
+}
+
+function jsonReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    throw new Error(
+      `Non-finite number in benchmark output: ${value}. This indicates a bug in the benchmark runner.`,
+    );
+  }
+  return value;
 }
 
 function wait(n: number) {

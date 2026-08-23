@@ -12,6 +12,8 @@ export function getLikePredicate(
   };
 }
 
+const likePatternRe = /_|%|\\/;
+
 function getLikeOp(pattern: string, flags: 'i' | ''): (lhs: string) => boolean {
   // if lhs does not contain '%' or '_' then it is a simple string comparison.
   // if it does contain '%' or '_' then it is a regex comparison.
@@ -19,7 +21,7 @@ function getLikeOp(pattern: string, flags: 'i' | ''): (lhs: string) => boolean {
   // '_' is a wildcard for a single character
   // Postgres SQL allows escaping using `\`.
 
-  if (!/_|%|\\/.test(pattern)) {
+  if (!likePatternRe.test(pattern)) {
     if (flags === 'i') {
       const rhsLower = pattern.toLowerCase();
       return (lhs: string) => lhs.toLowerCase() === rhsLower;
@@ -67,5 +69,10 @@ function patternToRegExp(source: string, flags: '' | 'i' = ''): RegExp {
         break;
     }
   }
-  return new RegExp(pattern + '$', flags + 'm');
+  // Use the `s` (dotall) flag so `.` (from `_`) and `.*` (from `%`) match
+  // newlines, and keep `^`/`$` anchored to the whole string. The `m` (multiline)
+  // flag was wrong on both counts: it let `^`/`$` match interior line boundaries
+  // (false positives, e.g. 'fooa\nbar' LIKE 'foo_') while the wildcards still
+  // skipped newlines (false negatives, e.g. 'a\nb' NOT LIKE 'a%b').
+  return new RegExp(pattern + '$', flags + 's');
 }

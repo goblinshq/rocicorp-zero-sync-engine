@@ -46,10 +46,13 @@ export async function analyzeQuery(
     fullTables,
   );
 
-  const planDebugger = joinPlans ? new AccumulatorDebugger() : undefined;
-  const costModel = joinPlans
+  // Mirror production: the planner runs iff ZERO_ENABLE_QUERY_PLANNER is set
+  // on the server, so the analysis reflects what actually executes. Diagnostic
+  // event collection is orthogonal and opt-in via `joinPlans`.
+  const costModel = config.enableQueryPlanner
     ? createSQLiteCostModel(db, tableSpecs)
     : undefined;
+  const planDebugger = joinPlans ? new AccumulatorDebugger() : undefined;
   const timer = await new TimeSliceTimer(lc).start();
   const shouldYield = () => timer.elapsedLap() > TIME_SLICE_LAP_THRESHOLD_MS;
   const yieldProcess = () => timer.yieldProcess();
@@ -103,7 +106,17 @@ export async function analyzeQuery(
     yieldProcess,
   );
 
-  result.sqlitePlans = explainQueries(result.readRowCountsByQuery ?? {}, db);
+  // Fill in plans for any queries SQLite did not actually execute (and thus
+  // did not populate scanStatus EXPLAIN for) using the substituted-binding
+  // fallback. Plans captured at execution time use the real bindings and win.
+  const fallback = explainQueries(result.readRowCountsByQuery ?? {}, db);
+  const captured = result.sqlitePlans ?? {};
+  for (const [query, plan] of Object.entries(fallback)) {
+    if (!captured[query]) {
+      captured[query] = plan;
+    }
+  }
+  result.sqlitePlans = captured;
 
   if (planDebugger) {
     result.joinPlans = serializePlanDebugEvents(planDebugger.events);

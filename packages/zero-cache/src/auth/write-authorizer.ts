@@ -7,17 +7,17 @@ import type {JSONValue, ReadonlyJSONValue} from '../../../shared/src/json.ts';
 import {must} from '../../../shared/src/must.ts';
 import * as v from '../../../shared/src/valita.ts';
 import type {Condition} from '../../../zero-protocol/src/ast.ts';
-import {
-  primaryKeyValueSchema,
-  type PrimaryKeyValue,
-} from '../../../zero-protocol/src/primary-key.ts';
 import type {
   CRUDOp,
   DeleteOp,
   InsertOp,
   UpdateOp,
   UpsertOp,
-} from '../../../zero-protocol/src/push.ts';
+} from '../../../zero-protocol/src/mutation.ts';
+import {
+  primaryKeyValueSchema,
+  type PrimaryKeyValue,
+} from '../../../zero-protocol/src/primary-key.ts';
 import type {Policy} from '../../../zero-schema/src/compiled-permissions.ts';
 import type {Schema} from '../../../zero-types/src/schema.ts';
 import type {BuilderDelegate} from '../../../zql/src/builder/builder.ts';
@@ -25,6 +25,11 @@ import {
   bindStaticParameters,
   buildPipeline,
 } from '../../../zql/src/builder/builder.ts';
+import {
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from '../../../zql/src/ivm/source.ts';
 import {consume} from '../../../zql/src/ivm/stream.ts';
 import {simplifyCondition} from '../../../zql/src/query/expression.ts';
 import {asQueryInternals} from '../../../zql/src/query/query-internals.ts';
@@ -160,17 +165,13 @@ export class WriteAuthorizerImpl implements WriteAuthorizer {
     ops: Exclude<CRUDOp, UpsertOp>[],
   ) {
     this.#statementRunner.beginConcurrent();
+    let opError: unknown;
     try {
       for (const op of ops) {
         const source = this.#getSource(op.tableName);
         switch (op.op) {
           case 'insert': {
-            consume(
-              source.push({
-                type: 'add',
-                row: op.value,
-              }),
-            );
+            consume(source.push(makeSourceChangeAdd(op.value)));
             break;
           }
           // TODO(mlaw): what if someone updates the same thing twice?
@@ -180,20 +181,17 @@ export class WriteAuthorizerImpl implements WriteAuthorizer {
           // pushed in.
           case 'update': {
             consume(
-              source.push({
-                type: 'edit',
-                oldRow: this.#requirePreMutationRow(op),
-                row: op.value,
-              }),
+              source.push(
+                makeSourceChangeEdit(op.value, this.#requirePreMutationRow(op)),
+              ),
             );
             break;
           }
           case 'delete': {
             consume(
-              source.push({
-                type: 'remove',
-                row: this.#requirePreMutationRow(op),
-              }),
+              source.push(
+                makeSourceChangeRemove(this.#requirePreMutationRow(op)),
+              ),
             );
             break;
           }
@@ -217,8 +215,22 @@ export class WriteAuthorizerImpl implements WriteAuthorizer {
             break;
         }
       }
+    } catch (e) {
+      opError = e;
+      throw e;
     } finally {
-      this.#statementRunner.rollback();
+      try {
+        this.#statementRunner.rollback();
+      } catch (rollbackError) {
+        if (opError !== undefined) {
+          const combinedError = new Error(
+            `canPostMutation failed and rollback also failed: operation error = ${String(opError)}; rollback error = ${String(rollbackError)}`,
+          );
+          combinedError.cause = opError;
+          throw combinedError;
+        }
+        throw rollbackError;
+      }
     }
 
     return true;
@@ -443,15 +455,17 @@ export class WriteAuthorizerImpl implements WriteAuthorizer {
         rowQuery,
       ))
     ) {
-      this.#lc.warn?.(
-        `Permission check failed for ${JSON.stringify(
-          op,
-        )}, action ${action}, phase ${phase}, authData: ${JSON.stringify(
-          authData,
-        )}, rowPolicies: ${JSON.stringify(
-          applicableRowPolicy,
-        )}, cellPolicies: ${JSON.stringify(applicableCellPolicies)}`,
-      );
+      // `op.value` is the row being written and `authData` is the decoded
+      // JWT payload, so neither can go into the log. Column names and policy
+      // counts are enough to debug a failed permission check.
+      this.#lc.warn?.('Permission check failed', {
+        action,
+        phase,
+        tableName: op.tableName,
+        columns: Object.keys(op.value),
+        rowPolicy: applicableRowPolicy !== undefined,
+        cellPolicyCount: applicableCellPolicies.length,
+      });
       return false;
     }
 

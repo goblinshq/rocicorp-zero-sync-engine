@@ -15,6 +15,7 @@ import {
   setDeletedClients,
   type DeletedClients,
 } from '../../../replicache/src/deleted-clients.ts';
+import {hasMemStore} from '../../../replicache/src/kv/mem-store.ts';
 import {makeClientV6} from '../../../replicache/src/persist/clients-test-helpers.ts';
 import {
   getClients,
@@ -32,7 +33,6 @@ import {
   clearBrowserOverrides,
   overrideBrowserGlobal,
 } from '../../../shared/src/browser-env.ts';
-import {findLast} from '../../../shared/src/find-last.ts';
 import {TestLogSink} from '../../../shared/src/logging-test-utils.ts';
 import * as valita from '../../../shared/src/valita.ts';
 import {changeDesiredQueriesMessageSchema} from '../../../zero-protocol/src/change-desired-queries.ts';
@@ -47,12 +47,12 @@ import {ErrorKind} from '../../../zero-protocol/src/error-kind.ts';
 import {ErrorOrigin} from '../../../zero-protocol/src/error-origin.ts';
 import {ErrorReason} from '../../../zero-protocol/src/error-reason.ts';
 import * as MutationType from '../../../zero-protocol/src/mutation-type-enum.ts';
-import {PROTOCOL_VERSION} from '../../../zero-protocol/src/protocol-version.ts';
 import {
-  pushMessageSchema,
   type CRUDOp,
   type Mutation,
-} from '../../../zero-protocol/src/push.ts';
+} from '../../../zero-protocol/src/mutation.ts';
+import {PROTOCOL_VERSION} from '../../../zero-protocol/src/protocol-version.ts';
+import {pushMessageSchema} from '../../../zero-protocol/src/push.ts';
 import type {NullableVersion} from '../../../zero-protocol/src/version.ts';
 import {createSchema} from '../../../zero-schema/src/builder/schema-builder.ts';
 import {
@@ -73,6 +73,7 @@ import {
 import {createBuilder} from '../../../zql/src/query/create-builder.ts';
 import type {Row} from '../../../zql/src/query/query.ts';
 import {nanoid} from '../util/nanoid.ts';
+import {ActiveClientsManager} from './active-clients-manager.ts';
 import {ClientErrorKind} from './client-error-kind.ts';
 import {ConnectionStatus} from './connection-status.ts';
 import type {ConnectionState} from './connection.ts';
@@ -330,8 +331,7 @@ describe('onOnlineChange callback', () => {
     // And followed by a reconnect with the longer BACKOFF_MS.
     await tickAFewTimes(vi, BACKOFF_MS);
     await z.triggerConnected();
-    const connectMsg = findLast(
-      z.testLogSink.messages,
+    const connectMsg = z.testLogSink.messages.findLast(
       ([level, _context, args]) =>
         level === 'info' && args.find(arg => /Connecting to/.test(String(arg))),
     );
@@ -656,6 +656,17 @@ describe('createSocket', () => {
       expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&userID=userID&baseCookie=&ts=0&lmid=0&wsid=wsidx&profileID=${mockProfileID}`,
     },
     {
+      socketURL: 'ws://example.com/' as WSString,
+      baseCookie: null,
+      clientID: 'clientID',
+      userID: undefined,
+      auth: '',
+      lmid: 0,
+      debugPerf: false,
+      now: 0,
+      expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&baseCookie=&ts=0&lmid=0&wsid=wsidx&profileID=${mockProfileID}`,
+    },
+    {
       socketURL: 'ws://example.com/prefix' as WSString,
       baseCookie: null,
       clientID: 'clientID',
@@ -758,12 +769,12 @@ describe('createSocket', () => {
       socketURL: 'ws://example.com/' as WSString,
       baseCookie: null,
       clientID: 'clientID',
-      userID: 'userID',
+      userID: undefined,
       auth: '',
       lmid: 0,
       debugPerf: false,
       now: 456,
-      expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&userID=userID&baseCookie=&ts=456&lmid=0&wsid=wsidx&profileID=${mockProfileID}&reason=rehome&backoff=100&lastTask=foo%2Fbar%26baz`,
+      expectedURL: `ws://example.com/sync/v${PROTOCOL_VERSION}/connect?clientID=clientID&clientGroupID=testClientGroupID&baseCookie=&ts=456&lmid=0&wsid=wsidx&profileID=${mockProfileID}&reason=rehome&backoff=100&lastTask=foo%2Fbar%26baz`,
       additionalConnectParams: {
         reason: 'rehome',
         backoff: '100',
@@ -775,7 +786,7 @@ describe('createSocket', () => {
     socketURL: WSString;
     baseCookie: NullableVersion;
     clientID: string;
-    userID: string;
+    userID: string | undefined;
     auth: string | undefined;
     lmid: number;
     debugPerf: boolean;
@@ -1738,6 +1749,127 @@ test('pusher sends one mutation per push message', async () => {
   ]);
 });
 
+const pushMutation = (clientID: string, id: number): Mutation => ({
+  type: MutationType.Custom,
+  clientID,
+  id,
+  name: 'mut1',
+  args: [{}],
+  timestamp: id,
+});
+
+// Pushes the given mutations as if they were the client group's pending
+// mutations and returns what actually went out on the socket, as
+// "clientID:mutationID" strings.
+const pushAndReadSocket = async (
+  z: TestZero<Schema>,
+  mutations: Mutation[],
+) => {
+  const mockSocket = await z.socket;
+  mockSocket.messages.length = 0;
+  await z.pusher(
+    {
+      profileID: 'p1',
+      clientGroupID: await z.clientGroupID,
+      pushVersion: 1,
+      schemaVersion: '1',
+      mutations,
+    },
+    'test-request-id',
+  );
+  return mockSocket.messages.map(raw => {
+    const [, {mutations}] = valita.parse(JSON.parse(raw), pushMessageSchema);
+    return `${mutations[0].clientID}:${mutations[0].id}`;
+  });
+};
+
+test('pusher does not skip mutations when the pending list is reordered', async () => {
+  // A client pushes the whole client group's commit chain, so the mutations it
+  // sends include ones made by the other tabs in the group. The order of that
+  // chain changes from one push to the next: when this tab persists its own
+  // mutations they move to the end of the chain, behind whatever the other tabs
+  // persisted in the meantime. So a mutation from another tab can show up in
+  // front of one we already sent. We still have to send it, and we must never
+  // leave a hole in a client's run of mutation IDs, because the server rejects
+  // a hole as an invalid push.
+  const z = zeroForTest();
+  await z.triggerConnected();
+
+  // Our own mutations are the ones that get moved to the end of the chain, so
+  // use this client's real ID for them.
+  const self = z.clientID;
+  const other = 'other-tab';
+  const push = (mutations: Mutation[]) => pushAndReadSocket(z, mutations);
+
+  expect(await push([pushMutation(other, 1), pushMutation(self, 1)])).toEqual([
+    `${other}:1`,
+    `${self}:1`,
+  ]);
+
+  // The other tab's second mutation now sits in front of our own, which was the
+  // last mutation we sent.
+  expect(
+    await push([
+      pushMutation(other, 1),
+      pushMutation(other, 2),
+      pushMutation(self, 1),
+    ]),
+  ).toEqual([`${other}:2`]);
+
+  // The other tab's third mutation must not go out unless its second one
+  // already did.
+  expect(
+    await push([
+      pushMutation(other, 1),
+      pushMutation(other, 2),
+      pushMutation(self, 1),
+      pushMutation(other, 3),
+    ]),
+  ).toEqual([`${other}:3`]);
+});
+
+test('pusher resends every pending mutation after a reconnect', async () => {
+  // We track what we have sent per connection. On a new connection we don't
+  // know how much of what we sent on the old socket actually got there, so we
+  // send everything still pending again and let the server ignore the ones it
+  // has already applied.
+  const z = zeroForTest();
+  await z.triggerConnected();
+
+  const self = z.clientID;
+  const other = 'other-tab';
+  const push = (mutations: Mutation[]) => pushAndReadSocket(z, mutations);
+
+  expect(await push([pushMutation(other, 1), pushMutation(self, 1)])).toEqual([
+    `${other}:1`,
+    `${self}:1`,
+  ]);
+
+  // Still on the same connection, so only the mutations we haven't sent go out.
+  expect(
+    await push([
+      pushMutation(other, 1),
+      pushMutation(other, 2),
+      pushMutation(other, 3),
+      pushMutation(self, 1),
+    ]),
+  ).toEqual([`${other}:2`, `${other}:3`]);
+
+  await z.triggerClose();
+  await z.waitForConnectionStatus(ConnectionStatus.Connecting);
+  await vi.advanceTimersByTimeAsync(RUN_LOOP_INTERVAL_MS);
+  await z.triggerConnected();
+
+  expect(
+    await push([
+      pushMutation(other, 1),
+      pushMutation(other, 2),
+      pushMutation(other, 3),
+      pushMutation(self, 1),
+    ]),
+  ).toEqual([`${other}:1`, `${other}:2`, `${other}:3`, `${self}:1`]);
+});
+
 test('pusher maps CRUD mutation names', async () => {
   const t = async (
     pushes: {
@@ -2141,7 +2273,7 @@ test.each([
   expect(calls.length).eq(0);
 });
 
-test.skip('passing cacheURL null allows queries without WS connection', async () => {
+test('passing cacheURL null allows queries without WS connection', async () => {
   const schema = createSchema({
     tables: [
       table('tasks')
@@ -2342,58 +2474,6 @@ test(ErrorKind.AuthInvalidated, async () => {
   expect(decodeSecProtocols(reconnectingSocket.protocol).authToken).toBe(
     'auth-token-2',
   );
-});
-
-test('connect() with null auth clears authentication', async () => {
-  const z = zeroForTest({auth: 'initial-token'});
-
-  await z.triggerConnected();
-  let currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(
-    'initial-token',
-  );
-
-  // Trigger auth error
-  await z.triggerError({
-    kind: ErrorKind.Unauthorized,
-    message: 'auth error',
-    origin: ErrorOrigin.ZeroCache,
-  });
-  await z.waitForConnectionStatus(ConnectionStatus.NeedsAuth);
-  await vi.advanceTimersByTimeAsync(0);
-
-  // Reconnect with null auth - should clear auth token (empty string is used for no auth)
-  await z.connection.connect({auth: null});
-  currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(undefined);
-  await z.triggerConnected();
-  await z.waitForConnectionStatus(ConnectionStatus.Connected);
-});
-
-test('connect() with undefined auth clears authentication', async () => {
-  const z = zeroForTest({auth: 'initial-token'});
-
-  await z.triggerConnected();
-  let currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(
-    'initial-token',
-  );
-
-  // Trigger auth error
-  await z.triggerError({
-    kind: ErrorKind.Unauthorized,
-    message: 'auth error',
-    origin: ErrorOrigin.ZeroCache,
-  });
-  await z.waitForConnectionStatus(ConnectionStatus.NeedsAuth);
-  await vi.advanceTimersByTimeAsync(0);
-
-  // Reconnect with undefined auth - should clear auth token (empty string is used for no auth)
-  await z.connection.connect({auth: undefined});
-  currentSocket = await z.socket;
-  expect(decodeSecProtocols(currentSocket.protocol).authToken).toBe(undefined);
-  await z.triggerConnected();
-  await z.waitForConnectionStatus(ConnectionStatus.Connected);
 });
 
 test('connect() without opts preserves existing auth', async () => {
@@ -2645,7 +2725,7 @@ test('Runtime pingTimeoutMs configuration', async () => {
   expect(z.connectionStatus).toBe(ConnectionStatus.Connecting);
 });
 
-const connectTimeoutMessage = 'Rejecting connect resolver due to timeout';
+const connectTimeoutMessage = 'Connection attempt timed out';
 
 function expectLogMessages(z: TestZero<Schema>) {
   return expect(
@@ -2653,6 +2733,26 @@ function expectLogMessages(z: TestZero<Schema>) {
       level === 'debug' ? msg : [],
     ),
   );
+}
+
+function connectTimeoutErrors(z: TestZero<Schema>): ClientError[] {
+  return z.testLogSink.messages
+    .flatMap(([_level, _context, messages]) => messages)
+    .filter(
+      (message): message is ClientError =>
+        message instanceof ClientError &&
+        message.kind === ClientErrorKind.ConnectTimeout,
+    );
+}
+
+function connectEvents(
+  error: ClientError | undefined,
+): [date: string, event: string][] {
+  assert(error);
+  const marker = 'Connect events: ';
+  const markerIndex = error.message.indexOf(marker);
+  assert(markerIndex >= 0, 'Expected timeout error to contain connect events');
+  return JSON.parse(error.message.slice(markerIndex + marker.length));
 }
 
 test('Connect timeout', async () => {
@@ -2685,6 +2785,21 @@ test('Connect timeout', async () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(z.connectionStatus).toBe(ConnectionStatus.Connecting);
     expectLogMessages(z).contain(connectTimeoutMessage);
+    const events = connectEvents(connectTimeoutErrors(z).at(-1));
+    expect(events.map(([_date, event]) => event)).toEqual([
+      'starting the connection',
+      'reading the cookie',
+      'reading the client group ID',
+      'initializing active clients',
+      'reading the profile ID',
+      'reading deleted clients',
+      'reading desired queries',
+      'creating the WebSocket',
+      'waiting for the server acknowledgement',
+    ]);
+    expect(events.every(([date]) => !Number.isNaN(Date.parse(date)))).toBe(
+      true,
+    );
     const nextSocketPromise = z.socket;
 
     // We stay in connecting state and sleep for RUN_LOOP_INTERVAL_MS before trying again
@@ -2726,6 +2841,58 @@ test('Connect timeout', async () => {
   ]);
 
   connectionStatusCleanup();
+});
+
+test('connect timeout during setup retries without an unhandled rejection', async () => {
+  const unhandledRejections: PromiseRejectionEvent[] = [];
+  const onUnhandled = (event: PromiseRejectionEvent) => {
+    unhandledRejections.push(event);
+    event.preventDefault();
+  };
+  window.addEventListener('unhandledrejection', onUnhandled);
+
+  vi.spyOn(ActiveClientsManager, 'create').mockReturnValue(
+    new Promise(() => {}),
+  );
+
+  try {
+    const z = zeroForTest({logLevel: 'debug'});
+    const connectAttempts = () =>
+      z.testLogSink.messages.filter(
+        ([level, _context, messages]) =>
+          level === 'info' && messages.includes('Connecting...'),
+      ).length;
+
+    await z.waitForConnectionStatus(ConnectionStatus.Connecting);
+    await tickAFewTimes(vi, 0);
+    expect(connectAttempts()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 1);
+    await tickAFewTimes(vi);
+
+    expect(
+      unhandledRejections.filter(
+        event =>
+          event.reason instanceof ClientError &&
+          event.reason.kind === ClientErrorKind.ConnectTimeout,
+      ),
+    ).toEqual([]);
+    expect(
+      connectEvents(connectTimeoutErrors(z).at(-1)).map(
+        ([_date, event]) => event,
+      ),
+    ).toEqual([
+      'starting the connection',
+      'reading the cookie',
+      'reading the client group ID',
+      'initializing active clients',
+    ]);
+
+    await tickAFewTimes(vi, RUN_LOOP_INTERVAL_MS);
+    expect(connectAttempts()).toBe(2);
+  } finally {
+    window.removeEventListener('unhandledrejection', onUnhandled);
+  }
 });
 
 test('socketOrigin', async () => {
@@ -2968,70 +3135,194 @@ test('SchemaVersionNotSupported custom onUpdateNeeded handler', async () => {
   });
 });
 
-test('ClientNotFound default handler', async () => {
-  const storage: Record<string, string> = {};
-  vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(() =>
-    storageMock(storage),
-  );
-  const {promise, resolve} = resolver();
-  const fake = vi.fn(resolve);
-  const z = zeroForTest(undefined, false);
-  z.reload = fake;
-
-  await z.triggerError({
+const clientStateNotFoundErrorCases = [
+  {
     kind: ErrorKind.ClientNotFound,
     message: 'server test message',
-    origin: ErrorOrigin.ZeroCache,
-  });
-  await vi.advanceTimersToNextTimerAsync();
-  await promise;
-  expect(z.connectionStatus).toBe(ConnectionStatus.Error);
-
-  expect(fake).toBeCalledTimes(1);
-
-  expect(storage[RELOAD_REASON_STORAGE_KEY]).toBe(
-    `["ClientNotFound","Server could not find state needed to synchronize this client. server test message"]`,
-  );
-});
-
-test('ClientNotFound custom onClientStateNotFound handler', async () => {
-  const {promise, resolve} = resolver();
-  const fake = vi.fn(() => {
-    resolve();
-  });
-  const z = zeroForTest({onClientStateNotFound: fake});
-  await z.triggerError({
-    kind: ErrorKind.ClientNotFound,
-    message: 'server test message',
-    origin: ErrorOrigin.ZeroCache,
-  });
-  await promise;
-  expect(z.connectionStatus).toBe(ConnectionStatus.Error);
-
-  expect(fake).toBeCalledTimes(1);
-});
-
-test('server ahead', async () => {
-  const {promise, resolve} = resolver();
-  const storage: Record<string, string> = {};
-  vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(() =>
-    storageMock(storage),
-  );
-  const z = zeroForTest();
-  z.reload = resolve;
-
-  await z.triggerError({
+    expectedReloadReason:
+      '["ClientNotFound","Server could not find state needed to synchronize this client. server test message"]',
+    dropsDatabase: false,
+  },
+  {
     kind: ErrorKind.InvalidConnectionRequestBaseCookie,
     message: 'unexpected BaseCookie',
-    origin: ErrorOrigin.ZeroCache,
-  });
+    expectedReloadReason:
+      '["InvalidConnectionRequestBaseCookie","Server reported that client is ahead of server. This probably happened because the server is in development mode and restarted. Currently when this happens, the dev server loses its state and on reconnect sees the client as ahead. If you see this in other cases, it may be a bug in Zero."]',
+    dropsDatabase: true,
+  },
+  {
+    kind: ErrorKind.InvalidConnectionRequestLastMutationID,
+    message: 'unexpected lastMutationID',
+    expectedReloadReason:
+      '["InvalidConnectionRequestLastMutationID","Server reported that client is ahead of server. This probably happened because the server is in development mode and restarted. Currently when this happens, the dev server loses its state and on reconnect sees the client as ahead. If you see this in other cases, it may be a bug in Zero."]',
+    dropsDatabase: true,
+  },
+] as const;
 
-  await vi.waitUntil(() => storage[RELOAD_REASON_STORAGE_KEY]);
+test.each(clientStateNotFoundErrorCases)(
+  '$kind default onClientStateNotFound handler',
+  async ({kind, message, expectedReloadReason, dropsDatabase}) => {
+    const storage: Record<string, string> = {};
+    vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(() =>
+      storageMock(storage),
+    );
+    const {promise, resolve} = resolver();
+    const reload = vi.fn(resolve);
+    const z = zeroForTest();
+    z.reload = reload;
 
+    expect(hasMemStore(z.idbName)).toBe(true);
+
+    await z.triggerError({
+      kind,
+      message,
+      origin: ErrorOrigin.ZeroCache,
+    });
+
+    await vi.waitUntil(() => storage[RELOAD_REASON_STORAGE_KEY] !== undefined);
+    await promise;
+
+    expect(z.connectionStatus).toBe(ConnectionStatus.Error);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(storage[RELOAD_REASON_STORAGE_KEY]).toBe(expectedReloadReason);
+    expect(hasMemStore(z.idbName)).toBe(!dropsDatabase);
+  },
+);
+
+test.each(clientStateNotFoundErrorCases)(
+  '$kind custom onClientStateNotFound handler',
+  async ({kind, message, dropsDatabase}) => {
+    const {promise, resolve} = resolver();
+    let z: TestZero<Schema>;
+    const fake = vi.fn(() => {
+      expect(hasMemStore(z.idbName)).toBe(!dropsDatabase);
+      resolve();
+    });
+    z = zeroForTest({onClientStateNotFound: fake});
+    const reload = vi.fn();
+    z.reload = reload;
+
+    expect(hasMemStore(z.idbName)).toBe(true);
+
+    await z.triggerError({
+      kind,
+      message,
+      origin: ErrorOrigin.ZeroCache,
+    });
+
+    await promise;
+
+    expect(z.connectionStatus).toBe(ConnectionStatus.Error);
+    expect(fake).toHaveBeenCalledTimes(1);
+    expect(fake).toHaveBeenCalledWith();
+    expect(reload).not.toHaveBeenCalled();
+    expect(hasMemStore(z.idbName)).toBe(!dropsDatabase);
+  },
+);
+
+test('local onClientStateNotFound default handler', async () => {
+  const storage: Record<string, string> = {};
+  vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(() =>
+    storageMock(storage),
+  );
+  const {promise, resolve} = resolver();
+  const reload = vi.fn(resolve);
+  const z = zeroForTest(undefined);
+  z.reload = reload;
+
+  getInternalReplicacheImplForTesting(z).onClientStateNotFound?.();
+
+  await vi.waitUntil(() => storage[RELOAD_REASON_STORAGE_KEY] !== undefined);
+  await vi.advanceTimersToNextTimerAsync();
   await promise;
 
-  expect(storage[RELOAD_REASON_STORAGE_KEY]).toEqual(
-    `["InvalidConnectionRequestBaseCookie","Server reported that client is ahead of server. This probably happened because the server is in development mode and restarted. Currently when this happens, the dev server loses its state and on reconnect sees the client as ahead. If you see this in other cases, it may be a bug in Zero."]`,
+  expect(reload).toHaveBeenCalledTimes(1);
+  expect(storage[RELOAD_REASON_STORAGE_KEY]).toBe(
+    '["ClientNotFound","The local persistent state needed to synchronize this client has been garbage collected."]',
+  );
+});
+
+test('close code 1009 (Message Too Big) disables client group and reloads', async () => {
+  const storage: Record<string, string> = {};
+  vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(() =>
+    storageMock(storage),
+  );
+  const {promise, resolve} = resolver();
+  const reload = vi.fn(resolve);
+  const z = zeroForTest(undefined, false);
+  z.reload = reload;
+
+  await z.triggerConnected();
+  expect(z.connectionStatus).toBe(ConnectionStatus.Connected);
+  expect(hasMemStore(z.idbName)).toBe(true);
+
+  // Send a push message directly to populate the recent sent messages buffer
+  await z.pusher(
+    {
+      profileID: 'p1',
+      clientGroupID: 'c1',
+      mutations: [
+        {
+          clientID: 'c1',
+          id: 1,
+          name: 'issues.insert',
+          args: {id: '1', value: 'a large payload'},
+          timestamp: 123,
+        },
+      ],
+      pushVersion: 1,
+      schemaVersion: '1',
+    },
+    'req-1',
+  );
+
+  await z.triggerClose(1009);
+
+  await vi.waitUntil(() => storage[RELOAD_REASON_STORAGE_KEY] !== undefined);
+  await vi.advanceTimersToNextTimerAsync();
+  await promise;
+
+  // Connection transitions to Error state (observable by customers)
+  expect(z.connectionStatus).toBe(ConnectionStatus.Error);
+  expect(reload).toHaveBeenCalledTimes(1);
+  // disableClientGroup does not drop the database, just the client group
+  expect(hasMemStore(z.idbName)).toBe(true);
+  expect(storage[RELOAD_REASON_STORAGE_KEY]).toContain('InvalidMessage');
+  expect(storage[RELOAD_REASON_STORAGE_KEY]).toContain(
+    'exceeded the server message size limit',
+  );
+  // Assert recent messages logic worked
+  expect(storage[RELOAD_REASON_STORAGE_KEY]).toContain('Recent sent messages:');
+  expect(storage[RELOAD_REASON_STORAGE_KEY]).toContain('push');
+  expect(storage[RELOAD_REASON_STORAGE_KEY]).toContain('a large payload');
+});
+
+test('close code 1009 with custom onClientStateNotFound defers reload', async () => {
+  const {promise, resolve} = resolver();
+  const fake = vi.fn(resolve);
+  const z = zeroForTest({onClientStateNotFound: fake}, false);
+  const reload = vi.fn();
+  z.reload = reload;
+
+  await z.triggerConnected();
+  expect(z.connectionStatus).toBe(ConnectionStatus.Connected);
+  expect(hasMemStore(z.idbName)).toBe(true);
+
+  await z.triggerClose(1009);
+  await promise;
+
+  // Custom handler is called instead of reload
+  expect(fake).toHaveBeenCalledTimes(1);
+  expect(reload).not.toHaveBeenCalled();
+
+  // Connection is in Error state with actionable details
+  expect(z.connectionStatus).toBe(ConnectionStatus.Error);
+  const state = z.connectionState;
+  assert(state.name === ConnectionStatus.Error);
+  expect(state.reason).toBeInstanceOf(ClientError);
+  expect(state.reason.kind).toBe(ClientErrorKind.InvalidMessage);
+  expect(state.reason.message).toContain(
+    'exceeded the server message size limit',
   );
 });
 
@@ -3703,7 +3994,7 @@ describe('CRUD', () => {
 
     // Optional fields can be set to null/undefined or left off completely.
     await setComment({id: 'c', issueID: '3'});
-    expect(view.data[view.data.length - 1]).toEqual({
+    expect(view.data.at(-1)).toEqual({
       id: 'c',
       issueID: '3',
       text: null,
@@ -3711,7 +4002,7 @@ describe('CRUD', () => {
     });
 
     await setComment({id: 'd', issueID: '4', text: undefined});
-    expect(view.data[view.data.length - 1]).toEqual({
+    expect(view.data.at(-1)).toEqual({
       id: 'd',
       issueID: '4',
       text: null,
@@ -3719,7 +4010,7 @@ describe('CRUD', () => {
     });
 
     await setComment({id: 'e', issueID: '5', text: undefined});
-    expect(view.data[view.data.length - 1]).toEqual({
+    expect(view.data.at(-1)).toEqual({
       id: 'e',
       issueID: '5',
       text: null,

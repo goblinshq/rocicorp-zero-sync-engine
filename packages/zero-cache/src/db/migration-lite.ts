@@ -1,4 +1,5 @@
 import type {LogContext} from '@rocicorp/logger';
+import {AbortError} from '../../../shared/src/abort-error.ts';
 import {assert} from '../../../shared/src/asserts.ts';
 import {randInt} from '../../../shared/src/rand.ts';
 import * as v from '../../../shared/src/valita.ts';
@@ -80,7 +81,8 @@ export async function runSchemaMigrations(
       versionMigrations[0][0] > 0,
       `Versions must be non-zero positive numbers`,
     );
-    const codeVersion = versionMigrations[versionMigrations.length - 1][0];
+    // oxlint-disable-next-line typescript/no-non-null-assertion
+    const codeVersion = versionMigrations.at(-1)![0];
     log.info?.(
       `Checking schema for compatibility with ${debugName} at schema v${codeVersion}`,
     );
@@ -101,7 +103,6 @@ export async function runSchemaMigrations(
       }
       return versions;
     });
-
     if (versions.dataVersion < codeVersion) {
       db.unsafeMode(true); // Enables journal_mode = OFF
       db.pragma('locking_mode = EXCLUSIVE');
@@ -153,9 +154,8 @@ export async function runSchemaMigrations(
       // similarly detected in the change-streamer, facilitating an eventual
       // recovery by resyncing the replica anew.
       db.pragma('optimize = 0x10002');
-
-      // TODO: Investigate running `integrity_check` or `quick_check` as well,
-      // provided that they are not inordinately expensive on large databases.
+      // Do not run `quick_check` here. It scans the full database and can
+      // dominate startup time for large replicas or slower disks.
     }
 
     db.pragma('synchronous = NORMAL');
@@ -172,7 +172,16 @@ export async function runSchemaMigrations(
       } ms)`,
     );
   } catch (e) {
-    log.error?.('Error in ensureSchemaMigrated', e);
+    if (e instanceof AbortError) {
+      // AbortErrors (e.g. AutoResetSignal) are not failures. They are the
+      // expected mechanism for signaling that the replica needs a reset (e.g.
+      // corruption or an incompatible schema version) so that the caller can
+      // resync anew. Logging them at `error` would trip error-based alerting
+      // for a normal, self-healing path.
+      log.warn?.('Replica requires reset; resync will follow', e);
+    } else {
+      log.error?.('Error in ensureSchemaMigrated', e);
+    }
     throw e;
   } finally {
     db.close();
@@ -334,8 +343,26 @@ async function runTransaction<T>(
     db.prepare('COMMIT').run();
     return result;
   } catch (e) {
-    log.error?.('Aborted transaction due to error', e);
-    db.prepare('ROLLBACK').run();
+    if (e instanceof AbortError) {
+      // AbortErrors (e.g. AutoResetSignal) are an expected, self-healing
+      // control-flow signal, not a failure. Log at `warn` so the rollback is
+      // still visible without tripping error-based alerting.
+      log.warn?.('Aborted transaction for reset signal', e);
+    } else {
+      log.error?.('Aborted transaction due to error', e);
+    }
+    try {
+      db.prepare('ROLLBACK').run();
+    } catch (rollbackError) {
+      log.error?.('Unable to rollback transaction', rollbackError);
+      const combinedError = new Error(
+        `Transaction failed and rollback also failed: operation error = ${String(
+          e,
+        )}; rollback error = ${String(rollbackError)}`,
+      );
+      combinedError.cause = e;
+      throw combinedError;
+    }
     throw e;
   }
 }

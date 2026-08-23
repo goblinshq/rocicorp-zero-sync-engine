@@ -1,21 +1,14 @@
+import {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
+import {afterEach, beforeEach, describe, expect, type Mock, vi} from 'vitest';
 import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  type Mock,
-  type MockedFunction,
-  vi,
-} from 'vitest';
-import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
+  createSilentLogContext,
+  TestLogSink,
+} from '../../../../shared/src/logging-test-utils.ts';
 import type {Queue} from '../../../../shared/src/queue.ts';
 import {sleep} from '../../../../shared/src/sleep.ts';
 import {type ClientSchema} from '../../../../zero-protocol/src/client-schema.ts';
-import type {
-  TransformResponseBody,
-  TransformResponseMessage,
-} from '../../../../zero-protocol/src/custom-queries.ts';
+import type {TransformResponseBody} from '../../../../zero-protocol/src/custom-queries.ts';
 import type {Downstream} from '../../../../zero-protocol/src/down.ts';
 import {ErrorKind} from '../../../../zero-protocol/src/error-kind.ts';
 import {ErrorOrigin} from '../../../../zero-protocol/src/error-origin.ts';
@@ -29,14 +22,19 @@ import type {
 } from '../../../../zero-protocol/src/poke.ts';
 import {PROTOCOL_VERSION} from '../../../../zero-protocol/src/protocol-version.ts';
 import type {UpQueriesPatch} from '../../../../zero-protocol/src/queries-patch.ts';
+import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
 import {DEFAULT_TTL_MS} from '../../../../zql/src/query/ttl.ts';
 import {type ClientGroupStorage} from '../../../../zqlite/src/database-storage.ts';
 import type {Database} from '../../../../zqlite/src/db.ts';
-import type {AuthSession, OpaqueAuth} from '../../auth/auth.ts';
-import type {CustomQueryTransformer} from '../../custom-queries/transform-query.ts';
+import type {OpaqueAuth} from '../../auth/auth.ts';
+import type {
+  CustomQueryTransformer,
+  HashedTransformResponse,
+} from '../../custom-queries/transform-query.ts';
 import {StatementRunner} from '../../db/statements.ts';
 import {type PgTest, test} from '../../test/db.ts';
 import type {DbFile} from '../../test/lite.ts';
+import type {ViewSyncerDownstream} from '../../types/downstream.ts';
 import type {PostgresDB} from '../../types/pg.ts';
 import {cvrSchema} from '../../types/shards.ts';
 import type {Source} from '../../types/streams.ts';
@@ -45,10 +43,13 @@ import type {ReplicaState} from '../replicator/replicator.ts';
 import {updateReplicationWatermark} from '../replicator/schema/replication-state.ts';
 import {type FakeReplicator} from '../replicator/test-utils.ts';
 import {ClientHandler} from './client-handler.ts';
+import type {ConnectionValidation} from './connection-context-manager.ts';
 import {CVRStore} from './cvr-store.ts';
 import {CVRQueryDrivenUpdater, CVRUpdater} from './cvr.ts';
 import type {DrainCoordinator} from './drain-coordinator.ts';
-import {PipelineDriver} from './pipeline-driver.ts';
+import {type RowChange, PipelineDriver} from './pipeline-driver.ts';
+import {formatSignature, rowIDSignatureUnit} from './row-set-signature.ts';
+import type {RowID} from './schema/types.ts';
 import {ttlClockFromNumber} from './ttl-clock.ts';
 import {
   app2Messages,
@@ -67,7 +68,9 @@ import {
   nextPokeParts,
   ON_FAILURE,
   permissionsAll,
+  type QueryFetchMock,
   REPLICA_VERSION,
+  restartViewSyncer,
   serviceID,
   setup,
   SHARD,
@@ -78,6 +81,22 @@ import type {ViewSyncerService} from './view-syncer.ts';
 import {type SyncContext} from './view-syncer.ts';
 
 describe('view-syncer/service', () => {
+  const clientFallback: ConnectionValidation = {kind: 'client-fallback'};
+
+  function transformAttempt(
+    result: HashedTransformResponse['result'],
+    cached = false,
+    validation: ConnectionValidation = clientFallback,
+  ): HashedTransformResponse {
+    if (Array.isArray(result)) {
+      return cached
+        ? {kind: 'success', result, cached: true}
+        : {kind: 'success', result, cached: false, validation};
+    }
+
+    return {kind: 'failed', result};
+  }
+
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -87,13 +106,13 @@ describe('view-syncer/service', () => {
   let replica: Database;
   let cvrDB: PostgresDB;
   let upstreamDb: PostgresDB;
-  const lc = createSilentLogContext();
+  let lc = createSilentLogContext();
+  let logSink: TestLogSink;
   let stateChanges: Subscription<ReplicaState>;
   let drainCoordinator: DrainCoordinator;
 
   let operatorStorage: ClientGroupStorage;
   let vs: ViewSyncerService;
-  let authSession: AuthSession;
   let viewSyncerDone: Promise<void>;
   let replicator: FakeReplicator;
   let connect: (
@@ -108,10 +127,14 @@ describe('view-syncer/service', () => {
     activeClients?: string[],
   ) => {
     queue: Queue<Downstream>;
-    source: Source<Downstream>;
+    source: Source<ViewSyncerDownstream>;
   };
   let setTimeoutFn: Mock<typeof setTimeout>;
   let customQueryTransformer: CustomQueryTransformer | undefined;
+  let clearMocks: () => void;
+  let queryFetch: QueryFetchMock;
+  let config: Awaited<ReturnType<typeof setup>>['config'];
+  let databaseStorage: Awaited<ReturnType<typeof setup>>['databaseStorage'];
 
   function callNextSetTimeout(delta: number) {
     // Sanity check that the system time is the mocked time.
@@ -131,9 +154,12 @@ describe('view-syncer/service', () => {
     httpCookie: undefined,
     origin: undefined,
     userID: 'user-1',
+    auth: undefined,
   };
 
   beforeEach<PgTest>(async ({testDBs}) => {
+    logSink = new TestLogSink();
+    lc = new LogContext('debug', undefined, logSink);
     ({
       storageDB,
       replicaDbFile,
@@ -144,17 +170,24 @@ describe('view-syncer/service', () => {
       drainCoordinator,
       operatorStorage,
       vs,
-      authSession,
       viewSyncerDone,
       replicator,
       connect,
       connectWithQueueAndSource,
       setTimeoutFn,
       customQueryTransformer,
-    } = await setup(testDBs, 'view_syncer_service_test', permissionsAll));
+      queryFetch,
+      clearMocks,
+      config,
+      databaseStorage,
+    } = await setup(testDBs, 'view_syncer_service_test', permissionsAll, {
+      lc,
+      queryFetchMode: 'empty-validation',
+    }));
 
     return async () => {
       vi.useRealTimers();
+      clearMocks();
       await vs.stop();
       await viewSyncerDone;
       await testDBs.drop(cvrDB, upstreamDb);
@@ -197,7 +230,9 @@ describe('view-syncer/service', () => {
         'query-hash1': {
           ast: ISSUES_QUERY,
           type: 'client',
-          clientState: {foo: {version: {stateVersion: '00', configVersion: 1}}},
+          clientState: {
+            foo: {version: {stateVersion: '00', configVersion: 1}},
+          },
           id: 'query-hash1',
         },
       },
@@ -538,61 +573,8 @@ describe('view-syncer/service', () => {
   });
 
   describe('custom queries', () => {
-    const mockFetch = vi.fn() as MockedFunction<typeof fetch>;
-    beforeEach(() => {
-      vi.stubGlobal('fetch', mockFetch);
-    });
-
-    afterEach(() => {
-      mockFetch.mockClear();
-      vi.unstubAllGlobals();
-    });
-
-    function mockFetchImpl(
-      queryResponses: TransformResponseBody | (() => Promise<Response>),
-    ) {
-      mockFetch.mockImplementation(url => {
-        if (
-          url ===
-          'http://my-pull-endpoint.dev/api/zero/pull?schema=this_app_2&appID=this_app'
-        ) {
-          if (typeof queryResponses === 'function') {
-            return queryResponses();
-          }
-          return Promise.resolve(
-            Response.json([
-              'transformed',
-              queryResponses,
-            ] satisfies TransformResponseMessage),
-          );
-        }
-        return Promise.reject(new Error('Unexpected fetch call ' + url));
-      });
-    }
-
-    function mockFetchImplWithHeaders(
-      queryResponses: TransformResponseBody,
-      expectedHeaders: Record<string, string>,
-    ) {
-      mockFetch.mockImplementation((url, init) => {
-        if (
-          url ===
-          'http://my-pull-endpoint.dev/api/zero/pull?schema=this_app_2&appID=this_app'
-        ) {
-          expect(init?.headers).toMatchObject(expectedHeaders);
-          return Promise.resolve(
-            Response.json([
-              'transformed',
-              queryResponses,
-            ] satisfies TransformResponseMessage),
-          );
-        }
-        return Promise.reject(new Error('Unexpected fetch call ' + url));
-      });
-    }
-
     test('initial hydration of a custom query', async () => {
-      mockFetchImpl([
+      queryFetch.respond([
         {
           ast: ISSUES_QUERY,
           id: 'custom-1',
@@ -795,21 +777,19 @@ describe('view-syncer/service', () => {
 
     test('custom query transform forwards opaque auth to fetch', async () => {
       const token = 'opaque-token';
-      await authSession.update('user-1', token);
-      mockFetchImplWithHeaders(
-        [
-          {
-            ast: ISSUES_QUERY,
-            id: 'custom-opaque',
-            name: 'named-query-opaque',
-          },
-        ],
+      const authContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        auth: {type: 'opaque', raw: token},
+      };
+      queryFetch.respond([
         {
-          Authorization: `Bearer ${token}`,
+          ast: ISSUES_QUERY,
+          id: 'custom-opaque',
+          name: 'named-query-opaque',
         },
-      );
+      ]);
 
-      const client = connect(SYNC_CONTEXT, [
+      const client = connect(authContext, [
         {
           op: 'put',
           hash: 'custom-opaque',
@@ -822,11 +802,15 @@ describe('view-syncer/service', () => {
       stateChanges.push({state: 'version-ready'});
       await nextPoke(client);
 
-      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(queryFetch.validationCalls).toHaveLength(1);
+      expect(queryFetch.transformCalls).toHaveLength(1);
+      expect(queryFetch.transformCalls[0]?.headers.get('Authorization')).toBe(
+        `Bearer ${token}`,
+      );
     });
 
     test('removing one of two queries with shared transformation hash does not remove pipeline', async () => {
-      mockFetchImpl([
+      queryFetch.respond([
         {
           ast: ISSUES_QUERY,
           id: 'custom-1',
@@ -1089,17 +1073,19 @@ describe('view-syncer/service', () => {
       `);
     });
 
-    test('patching desired only trasnforms added custom queries', async () => {
+    test('patching desired only transforms added custom queries', async () => {
       // Spy on transformer's transform method instead of mocking fetch
       using transformSpy = vi.spyOn(customQueryTransformer!, 'transform');
 
-      transformSpy.mockResolvedValue([
-        {
-          id: 'custom-1',
-          transformedAst: ISSUES_QUERY,
-          transformationHash: 'hash-1',
-        },
-      ]);
+      transformSpy.mockResolvedValue(
+        transformAttempt([
+          {
+            id: 'custom-1',
+            transformedAst: ISSUES_QUERY,
+            transformationHash: 'hash-1',
+          },
+        ]),
+      );
 
       const client = connect(SYNC_CONTEXT, [
         {
@@ -1303,12 +1289,43 @@ describe('view-syncer/service', () => {
       expect(transformSpy.mock.calls[0]).toMatchInlineSnapshot(`
         [
           {
-            "allowedClientHeaders": undefined,
-            "apiKey": undefined,
-            "cookie": undefined,
-            "customHeaders": undefined,
-            "origin": undefined,
-            "token": undefined,
+            "auth": undefined,
+            "baseCookie": null,
+            "clientID": "foo",
+            "insertionOrder": 1,
+            "mutateContext": {
+              "allowedUrlPatterns": undefined,
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": undefined,
+            },
+            "profileID": "p0000g00000003203",
+            "protocolVersion": 52,
+            "queryContext": {
+              "allowedUrlPatterns": [
+                URLPattern {},
+              ],
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": "http://my-pull-endpoint.dev/api/zero/pull",
+            },
+            "revalidateAt": undefined,
+            "revision": 1,
+            "state": "validated",
+            "user": {
+              "id": "user-1",
+            },
+            "wsID": "ws1",
           },
           [
             {
@@ -1330,17 +1347,18 @@ describe('view-syncer/service', () => {
               "type": "custom",
             },
           ],
-          undefined,
         ]
       `);
 
-      transformSpy.mockResolvedValue([
-        {
-          id: 'custom-2',
-          transformedAst: USERS_QUERY,
-          transformationHash: 'hash-2',
-        },
-      ]);
+      transformSpy.mockResolvedValue(
+        transformAttempt([
+          {
+            id: 'custom-2',
+            transformedAst: USERS_QUERY,
+            transformationHash: 'hash-2',
+          },
+        ]),
+      );
 
       await vs.changeDesiredQueries(SYNC_CONTEXT, [
         'changeDesiredQueries',
@@ -1561,12 +1579,43 @@ describe('view-syncer/service', () => {
       expect(transformSpy.mock.calls[1]).toMatchInlineSnapshot(`
         [
           {
-            "allowedClientHeaders": undefined,
-            "apiKey": undefined,
-            "cookie": undefined,
-            "customHeaders": undefined,
-            "origin": undefined,
-            "token": undefined,
+            "auth": undefined,
+            "baseCookie": null,
+            "clientID": "foo",
+            "insertionOrder": 1,
+            "mutateContext": {
+              "allowedUrlPatterns": undefined,
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": undefined,
+            },
+            "profileID": "p0000g00000003203",
+            "protocolVersion": 52,
+            "queryContext": {
+              "allowedUrlPatterns": [
+                URLPattern {},
+              ],
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": "http://my-pull-endpoint.dev/api/zero/pull",
+            },
+            "revalidateAt": undefined,
+            "revision": 1,
+            "state": "validated",
+            "user": {
+              "id": "user-1",
+            },
+            "wsID": "ws1",
           },
           [
             {
@@ -1588,13 +1637,12 @@ describe('view-syncer/service', () => {
               "type": "custom",
             },
           ],
-          undefined,
         ]
       `);
     });
 
     test('different custom queries end up with the same query after transformation', async () => {
-      mockFetchImpl([
+      queryFetch.respond([
         {
           ast: ISSUES_QUERY,
           id: 'custom-1',
@@ -1813,7 +1861,7 @@ describe('view-syncer/service', () => {
     });
 
     test('different custom queries in different put desired queries patches end up with the same query after transformation', async () => {
-      mockFetchImpl([
+      queryFetch.respond([
         {
           ast: ISSUES_QUERY,
           id: 'custom-1',
@@ -2180,18 +2228,20 @@ describe('view-syncer/service', () => {
       // Spy on transformer's transform method instead of mocking fetch
       using transformSpy = vi
         .spyOn(customQueryTransformer!, 'transform')
-        .mockResolvedValue([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-1',
-          },
-          {
-            id: 'custom-2',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-2',
-          },
-        ]);
+        .mockResolvedValue(
+          transformAttempt([
+            {
+              id: 'custom-1',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-1',
+            },
+            {
+              id: 'custom-2',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-2',
+            },
+          ]),
+        );
 
       const client = connect(SYNC_CONTEXT, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
@@ -2207,12 +2257,43 @@ describe('view-syncer/service', () => {
       expect(transformSpy.mock.calls[0]).toMatchInlineSnapshot(`
         [
           {
-            "allowedClientHeaders": undefined,
-            "apiKey": undefined,
-            "cookie": undefined,
-            "customHeaders": undefined,
-            "origin": undefined,
-            "token": undefined,
+            "auth": undefined,
+            "baseCookie": null,
+            "clientID": "foo",
+            "insertionOrder": 1,
+            "mutateContext": {
+              "allowedUrlPatterns": undefined,
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": undefined,
+            },
+            "profileID": "p0000g00000003203",
+            "protocolVersion": 52,
+            "queryContext": {
+              "allowedUrlPatterns": [
+                URLPattern {},
+              ],
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": "http://my-pull-endpoint.dev/api/zero/pull",
+            },
+            "revalidateAt": undefined,
+            "revision": 1,
+            "state": "validated",
+            "user": {
+              "id": "user-1",
+            },
+            "wsID": "ws1",
           },
           [
             {
@@ -2252,7 +2333,6 @@ describe('view-syncer/service', () => {
               "type": "custom",
             },
           ],
-          undefined,
         ]
       `);
 
@@ -2264,8 +2344,18 @@ describe('view-syncer/service', () => {
           wsID: 'cq-c2-wsid',
         },
         [
-          {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
-          {op: 'put', hash: 'custom-2', name: 'named-query-2', args: ['thing']},
+          {
+            op: 'put',
+            hash: 'custom-1',
+            name: 'named-query-1',
+            args: ['thing'],
+          },
+          {
+            op: 'put',
+            hash: 'custom-2',
+            name: 'named-query-2',
+            args: ['thing'],
+          },
         ],
       );
 
@@ -2386,12 +2476,43 @@ describe('view-syncer/service', () => {
       expect(transformSpy.mock.calls[1]).toMatchInlineSnapshot(`
         [
           {
-            "allowedClientHeaders": undefined,
-            "apiKey": undefined,
-            "cookie": undefined,
-            "customHeaders": undefined,
-            "origin": undefined,
-            "token": undefined,
+            "auth": undefined,
+            "baseCookie": null,
+            "clientID": "cq-c2-client",
+            "insertionOrder": 2,
+            "mutateContext": {
+              "allowedUrlPatterns": undefined,
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": undefined,
+            },
+            "profileID": "p0000g00000003203",
+            "protocolVersion": 52,
+            "queryContext": {
+              "allowedUrlPatterns": [
+                URLPattern {},
+              ],
+              "headerOptions": {
+                "apiKey": undefined,
+                "cookie": undefined,
+                "customHeaders": undefined,
+                "origin": undefined,
+                "requestHeaders": undefined,
+              },
+              "url": "http://my-pull-endpoint.dev/api/zero/pull",
+            },
+            "revalidateAt": undefined,
+            "revision": 1,
+            "state": "provisional",
+            "user": {
+              "id": "user-1",
+            },
+            "wsID": "cq-c2-wsid",
           },
           [
             {
@@ -2421,6 +2542,7 @@ describe('view-syncer/service', () => {
               "patchVersion": {
                 "stateVersion": "01",
               },
+              "rowSetSignature": "7b557aaf85ad1c06",
               "transformationHash": "hash-1",
               "transformationVersion": {
                 "stateVersion": "01",
@@ -2454,6 +2576,7 @@ describe('view-syncer/service', () => {
               "patchVersion": {
                 "stateVersion": "01",
               },
+              "rowSetSignature": "7b557aaf85ad1c06",
               "transformationHash": "hash-2",
               "transformationVersion": {
                 "stateVersion": "01",
@@ -2461,7 +2584,6 @@ describe('view-syncer/service', () => {
               "type": "custom",
             },
           ],
-          undefined,
         ]
       `);
     });
@@ -2469,20 +2591,24 @@ describe('view-syncer/service', () => {
     test('retransforms custom queries when opaque auth refreshes', async () => {
       using transformSpy = vi
         .spyOn(customQueryTransformer!, 'transform')
-        .mockResolvedValueOnce([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-1',
-          },
-        ])
-        .mockResolvedValueOnce([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-2',
-          },
-        ]);
+        .mockResolvedValueOnce(
+          transformAttempt([
+            {
+              id: 'custom-1',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-1',
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          transformAttempt([
+            {
+              id: 'custom-1',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-2',
+            },
+          ]),
+        );
 
       const token1: OpaqueAuth = {
         type: 'opaque',
@@ -2493,8 +2619,8 @@ describe('view-syncer/service', () => {
         raw: 'token-2',
       };
 
-      await authSession.update('user-1', token1.raw);
-      const client = connect(SYNC_CONTEXT, [
+      const token1Context: SyncContext = {...SYNC_CONTEXT, auth: token1};
+      const client = connect(token1Context, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
       ]);
 
@@ -2503,27 +2629,84 @@ describe('view-syncer/service', () => {
       await nextPoke(client);
 
       expect(transformSpy).toHaveBeenCalledTimes(1);
-      expect(transformSpy.mock.calls[0][0].token).toBe('token-1');
+      expect(transformSpy.mock.calls[0][0].auth?.raw).toBe('token-1');
+      expect(transformSpy.mock.calls[0][0].user).toEqual({id: 'user-1'});
 
-      await vs.updateAuth(SYNC_CONTEXT, ['updateAuth', {auth: token2.raw}]);
+      await vs.connContextManager.updateAuth(
+        {clientID: token1Context.clientID, wsID: token1Context.wsID},
+        {auth: token2.raw},
+      );
+      await vs.updateAuth(
+        {clientID: token1Context.clientID, wsID: token1Context.wsID},
+        ['updateAuth', {auth: token2.raw}],
+        true,
+      );
 
       expect(transformSpy).toHaveBeenCalledTimes(2);
-      expect(transformSpy.mock.calls[1][0].token).toBe('token-2');
+      expect(transformSpy.mock.calls[1][0].auth?.raw).toBe('token-2');
+      expect(transformSpy.mock.calls[1][0].user).toEqual({id: 'user-1'});
+    });
+
+    test('uses the originating connection auth for connection-triggered custom query transforms', async () => {
+      using transformSpy = vi
+        .spyOn(customQueryTransformer!, 'transform')
+        .mockResolvedValue(
+          transformAttempt([
+            {
+              id: 'custom-1',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-1',
+            },
+          ]),
+        );
+
+      const selectedContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        auth: {type: 'opaque', raw: 'token-selected'},
+      };
+      const selectedClient = connect(selectedContext, [
+        {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
+      ]);
+
+      await nextPoke(selectedClient);
+      stateChanges.push({state: 'version-ready'});
+      await nextPoke(selectedClient);
+
+      const originatingContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        clientID: 'bar',
+        wsID: 'ws2',
+        auth: {type: 'opaque', raw: 'token-origin'},
+      };
+      const originatingClient = connect(originatingContext, [
+        {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
+      ]);
+
+      await nextPoke(originatingClient);
+
+      expect(transformSpy).toHaveBeenCalledTimes(1);
+      expect(transformSpy.mock.calls[0][0].auth?.raw).toBe('token-origin');
+      expect(transformSpy.mock.calls[0][0].user).toEqual({id: 'user-1'});
     });
 
     test('does not retransform custom queries when opaque auth is unchanged after revision is synced', async () => {
       using transformSpy = vi
         .spyOn(customQueryTransformer!, 'transform')
-        .mockResolvedValue([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-1',
-          },
-        ]);
+        .mockResolvedValue(
+          transformAttempt([
+            {
+              id: 'custom-1',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-1',
+            },
+          ]),
+        );
 
-      await authSession.update('user-1', 'token-1');
-      const client = connect(SYNC_CONTEXT, [
+      const authContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        auth: {type: 'opaque', raw: 'token-1'},
+      };
+      const client = connect(authContext, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
       ]);
 
@@ -2533,75 +2716,115 @@ describe('view-syncer/service', () => {
 
       expect(transformSpy).toHaveBeenCalledTimes(1);
 
-      // update existing auth session state
-      await vs.updateAuth(SYNC_CONTEXT, ['updateAuth', {auth: 'token-1'}]);
-      expect(transformSpy).toHaveBeenCalledTimes(2);
-
-      // subsequent auth updates should be no-op
-      await vs.updateAuth(SYNC_CONTEXT, ['updateAuth', {auth: 'token-1'}]);
-
-      expect(transformSpy).toHaveBeenCalledTimes(2);
+      // subsequent auth updates with the same token should be no-op
+      await vs.updateAuth(
+        authContext,
+        ['updateAuth', {auth: 'token-1'}],
+        false,
+      );
+      expect(transformSpy).toHaveBeenCalledTimes(1);
     });
 
-    test('failed updateAuth keeps existing auth and does not retransform queries', async () => {
-      using transformSpy = vi
-        .spyOn(customQueryTransformer!, 'transform')
-        .mockResolvedValueOnce([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-1',
-          },
-        ])
-        .mockResolvedValueOnce([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-2',
-          },
-        ]);
-
-      await authSession.update('user-1', 'token-1');
-      const client = connect(SYNC_CONTEXT, [
-        {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
-      ]);
-
-      await nextPoke(client);
-      stateChanges.push({state: 'version-ready'});
-      await nextPoke(client);
-
-      expect(transformSpy).toHaveBeenCalledTimes(1);
-
-      await vs.updateAuth(SYNC_CONTEXT, ['updateAuth', {auth: ''}]);
-
-      expect(authSession.auth?.raw).toBe('token-1');
-      expect(transformSpy).toHaveBeenCalledTimes(1);
-
-      await expect(client.dequeue()).rejects.toThrow('No token provided');
-    });
-
-    test('transform 401 during updateAuth clears auth session', async () => {
-      using transformSpy = vi
-        .spyOn(customQueryTransformer!, 'transform')
-        .mockResolvedValueOnce([
-          {
-            id: 'custom-1',
-            transformedAst: ISSUES_QUERY,
-            transformationHash: 'hash-1',
-          },
-        ])
+    test('validation 401 during connect does not update CVR config', async () => {
+      using validateSpy = vi
+        .spyOn(customQueryTransformer!, 'validate')
         .mockResolvedValueOnce({
           kind: ErrorKind.TransformFailed,
           message: 'Fetch from API server returned non-OK status 401',
           origin: ErrorOrigin.ZeroCache,
-          queryIDs: ['custom-1'],
+          queryIDs: [],
           reason: ErrorReason.HTTP,
           status: 401,
           bodyPreview: '{ "error": "Unauthorized" }',
         });
 
-      await authSession.update('user-1', 'token-1');
-      const client = connect(SYNC_CONTEXT, [
+      const badContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        clientID: 'bad',
+        wsID: 'ws-bad',
+        userID: 'user-bad',
+        auth: {type: 'opaque', raw: 'token-bad'},
+      };
+      const badClient = connect(badContext, [
+        {op: 'put', hash: 'query-hash-bad', ast: ISSUES_QUERY},
+      ]);
+
+      await expect(badClient.dequeue()).rejects.toThrow(
+        'Fetch from API server returned non-OK status 401',
+      );
+      expect(validateSpy).toHaveBeenCalledTimes(1);
+
+      const cvrStore = new CVRStore(
+        lc,
+        cvrDB,
+        SHARD,
+        TASK_ID,
+        serviceID,
+        ON_FAILURE,
+      );
+      const cvr = await cvrStore.load(lc, Date.now());
+      expect(cvr.clients.bad).toBeUndefined();
+      expect(cvr.queries['query-hash-bad']).toBeUndefined();
+    });
+
+    test('validation userID mismatch during connect fails the connection', async () => {
+      using validateSpy = vi
+        .spyOn(customQueryTransformer!, 'validate')
+        .mockResolvedValueOnce({
+          kind: 'QueryResponse',
+          validation: {
+            kind: 'server-validated',
+            validatedUserID: 'user-server',
+          },
+          queries: [],
+        });
+
+      const badContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        clientID: 'bad',
+        wsID: 'ws-bad',
+        userID: 'user-bad',
+        auth: {type: 'opaque', raw: 'token-bad'},
+      };
+      const badClient = connect(badContext, [
+        {op: 'put', hash: 'query-hash-bad', ast: ISSUES_QUERY},
+      ]);
+
+      await expect(badClient.dequeue()).rejects.toThrow(
+        'Connection userID does not match validated server userID.',
+      );
+      expect(validateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('transform 401 during updateAuth disconnects the failing connection', async () => {
+      using transformSpy = vi
+        .spyOn(customQueryTransformer!, 'transform')
+        .mockResolvedValueOnce(
+          transformAttempt([
+            {
+              id: 'custom-1',
+              transformedAst: ISSUES_QUERY,
+              transformationHash: 'hash-1',
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          transformAttempt({
+            kind: ErrorKind.TransformFailed,
+            message: 'Fetch from API server returned non-OK status 401',
+            origin: ErrorOrigin.ZeroCache,
+            queryIDs: ['custom-1'],
+            reason: ErrorReason.HTTP,
+            status: 401,
+            bodyPreview: '{ "error": "Unauthorized" }',
+          }),
+        );
+
+      const authContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        auth: {type: 'opaque', raw: 'token-1'},
+      };
+      const client = connect(authContext, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
       ]);
 
@@ -2610,11 +2833,17 @@ describe('view-syncer/service', () => {
       await nextPoke(client);
 
       expect(transformSpy).toHaveBeenCalledTimes(1);
-      expect(authSession.auth?.raw).toBe('token-1');
 
-      await vs.updateAuth(SYNC_CONTEXT, ['updateAuth', {auth: 'token-2'}]);
+      await vs.connContextManager.updateAuth(
+        {clientID: authContext.clientID, wsID: authContext.wsID},
+        {auth: 'token-2'},
+      );
+      await vs.updateAuth(
+        {clientID: authContext.clientID, wsID: authContext.wsID},
+        ['updateAuth', {auth: 'token-2'}],
+        true,
+      );
 
-      expect(authSession.auth).toBeUndefined();
       expect(transformSpy).toHaveBeenCalledTimes(2);
 
       await expect(nextPoke(client)).rejects.toThrow(
@@ -2622,22 +2851,26 @@ describe('view-syncer/service', () => {
       );
     });
 
-    test('transform 401 clears auth session to prevent DoS', async () => {
+    test('transform 401 during connect fails only that connection', async () => {
       using transformSpy = vi
         .spyOn(customQueryTransformer!, 'transform')
-        .mockResolvedValueOnce({
-          kind: ErrorKind.TransformFailed,
-          message: 'Fetch from API server returned non-OK status 401',
-          origin: ErrorOrigin.ZeroCache,
-          queryIDs: ['custom-1'],
-          reason: ErrorReason.HTTP,
-          status: 401,
-          bodyPreview: '{ "error": "Unauthorized" }',
-        });
+        .mockResolvedValueOnce(
+          transformAttempt({
+            kind: ErrorKind.TransformFailed,
+            message: 'Fetch from API server returned non-OK status 401',
+            origin: ErrorOrigin.ZeroCache,
+            queryIDs: ['custom-1'],
+            reason: ErrorReason.HTTP,
+            status: 401,
+            bodyPreview: '{ "error": "Unauthorized" }',
+          }),
+        );
 
-      await authSession.update('user-bad', 'token-bad');
-
-      const badContext = {...SYNC_CONTEXT, userID: 'user-bad'};
+      const badContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        userID: 'user-bad',
+        auth: {type: 'opaque', raw: 'token-bad'},
+      };
       const badClient = connect(badContext, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
       ]);
@@ -2646,24 +2879,58 @@ describe('view-syncer/service', () => {
       stateChanges.push({state: 'version-ready'});
       await vi.waitFor(() => expect(transformSpy).toHaveBeenCalledTimes(1));
 
-      // 401 during transform clears session so the client group is not stuck.
-      expect(authSession.auth).toBeUndefined();
+      await expect(nextPoke(badClient)).rejects.toThrow(
+        'Fetch from API server returned non-OK status 401',
+      );
+    });
+
+    test('transform userID mismatch during connect fails only that connection', async () => {
+      using transformSpy = vi
+        .spyOn(customQueryTransformer!, 'transform')
+        .mockResolvedValueOnce(
+          transformAttempt(
+            [
+              {
+                id: 'custom-1',
+                transformedAst: ISSUES_QUERY,
+                transformationHash: 'hash-1',
+              },
+            ],
+            false,
+            {kind: 'server-validated', validatedUserID: 'user-server'},
+          ),
+        );
+
+      const badContext: SyncContext = {
+        ...SYNC_CONTEXT,
+        userID: 'user-bad',
+        auth: {type: 'opaque', raw: 'token-bad'},
+      };
+      const badClient = connect(badContext, [
+        {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
+      ]);
+
+      await nextPoke(badClient);
+      stateChanges.push({state: 'version-ready'});
+      await vi.waitFor(() => expect(transformSpy).toHaveBeenCalledTimes(1));
+
+      await expect(nextPoke(badClient)).rejects.toThrow(
+        'Connection userID does not match validated server userID.',
+      );
     });
 
     // test cases where custom query transforms fail
     test('http transform call fails', async () => {
-      mockFetchImpl(() =>
-        Promise.reject(
-          new ProtocolError({
-            kind: ErrorKind.TransformFailed,
-            message: 'Fetch from API server returned non-OK status 500',
-            origin: ErrorOrigin.ZeroCache,
-            queryIDs: ['custom-1', 'custom-2'],
-            reason: ErrorReason.HTTP,
-            status: 500,
-            bodyPreview: '{ "error": "Internal Server Error" }',
-          }),
-        ),
+      queryFetch.reject(
+        new ProtocolError({
+          kind: ErrorKind.TransformFailed,
+          message: 'Fetch from API server returned non-OK status 500',
+          origin: ErrorOrigin.ZeroCache,
+          queryIDs: ['custom-1', 'custom-2'],
+          reason: ErrorReason.HTTP,
+          status: 500,
+          bodyPreview: '{ "error": "Internal Server Error" }',
+        }),
       );
       const client = connect(SYNC_CONTEXT, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
@@ -2682,7 +2949,7 @@ describe('view-syncer/service', () => {
         status: 500,
         statusText: 'Internal Server Error',
       });
-      mockFetchImpl(() => Promise.resolve(r));
+      queryFetch.reply(r);
       const client = connect(SYNC_CONTEXT, [
         {op: 'put', hash: 'custom-1', name: 'named-query-1', args: ['thing']},
         {op: 'put', hash: 'custom-2', name: 'named-query-2', args: ['thing']},
@@ -2696,7 +2963,7 @@ describe('view-syncer/service', () => {
     });
 
     test('all individual queries fail', async () => {
-      mockFetchImpl([
+      queryFetch.respond([
         {
           error: 'app',
           id: 'custom-1',
@@ -2801,7 +3068,7 @@ describe('view-syncer/service', () => {
     });
 
     test('some individual queries fail', async () => {
-      mockFetchImpl([
+      queryFetch.respond([
         {
           error: 'app',
           id: 'custom-1',
@@ -2925,18 +3192,20 @@ describe('view-syncer/service', () => {
           // Use spy pattern to control mock behavior between connections
           using transformSpy = vi
             .spyOn(customQueryTransformer!, 'transform')
-            .mockResolvedValueOnce([
-              {
-                id: 'custom-1',
-                transformedAst: ast1,
-                transformationHash: hash1,
-              },
-              {
-                id: 'custom-2',
-                transformedAst: ast2,
-                transformationHash: hash2,
-              },
-            ]);
+            .mockResolvedValueOnce(
+              transformAttempt([
+                {
+                  id: 'custom-1',
+                  transformedAst: ast1,
+                  transformationHash: hash1,
+                },
+                {
+                  id: 'custom-2',
+                  transformedAst: ast2,
+                  transformationHash: hash2,
+                },
+              ]),
+            );
 
           const client1 = connect(SYNC_CONTEXT, [
             {
@@ -3000,19 +3269,21 @@ describe('view-syncer/service', () => {
           }
 
           // Second connection - custom-1 fails transformation, custom-2 succeeds
-          transformSpy.mockResolvedValueOnce([
-            {
-              error: 'app',
-              id: 'custom-1',
-              name: 'named-query-1',
-              message: 'Authorization failed',
-            },
-            {
-              id: 'custom-2',
-              transformedAst: ast2,
-              transformationHash: hash2,
-            },
-          ]);
+          transformSpy.mockResolvedValueOnce(
+            transformAttempt([
+              {
+                error: 'app',
+                id: 'custom-1',
+                name: 'named-query-1',
+                message: 'Authorization failed',
+              },
+              {
+                id: 'custom-2',
+                transformedAst: ast2,
+                transformationHash: hash2,
+              },
+            ]),
+          );
 
           const client2 = connect(
             {...SYNC_CONTEXT, clientID: 'bar', wsID: 'ws2'},
@@ -3045,7 +3316,10 @@ describe('view-syncer/service', () => {
           ];
           expect(pokePart).toBeTruthy();
           const gotQueriesPatch = pokePart[1].gotQueriesPatch;
-          expect(gotQueriesPatch).toContainEqual({hash: 'custom-1', op: 'del'});
+          expect(gotQueriesPatch).toContainEqual({
+            hash: 'custom-1',
+            op: 'del',
+          });
 
           if (expectRowsPresent) {
             // Verify rows are still present (pipeline not removed because custom-2 uses same hash)
@@ -3949,6 +4223,7 @@ describe('view-syncer/service', () => {
 
     // Perform an unrelated transaction that does not affect any queries.
     // This should not result in a poke.
+    await vi.waitFor(() => expect(vs.servedVersion).toBe('01'));
     replicator.processTransaction(
       '101',
       messages.insert('users', {
@@ -3958,6 +4233,12 @@ describe('view-syncer/service', () => {
     );
     stateChanges.push({state: 'version-ready'});
     await expectNoPokes(client);
+
+    // ... but the client group *is* current as of '101'. The CVR version does
+    // not move (nothing was written), so servedVersion has to track the replica
+    // version that was advanced to. Otherwise sync.serving_lag_stats and
+    // sync.e2e_serving_lag would report the growing time since '01' as lag.
+    await vi.waitFor(() => expect(vs.servedVersion).toBe('101'));
 
     // Then, a relevant change should bump the client from '01' directly to '123'.
     replicator.processTransaction(
@@ -4241,6 +4522,777 @@ describe('view-syncer/service', () => {
       `);
   });
 
+  const issueRowID = (id: string): RowID => ({
+    schema: '',
+    table: 'issues',
+    rowKey: {id},
+  });
+  const expectedIssuesSig = (...rows: RowID[]) =>
+    formatSignature(rows.reduce((s, r) => s ^ rowIDSignatureUnit(r), 0n));
+  const loadStoredSig = async (hash: string) => {
+    const [row] = await cvrDB<{rowSetSignature: string | null}[]>`
+      SELECT "rowSetSignature" FROM ${cvrDB(cvrSchema(SHARD))}.queries
+       WHERE "clientGroupID" = ${serviceID} AND "queryHash" = ${hash}
+    `;
+    return row?.rowSetSignature ?? null;
+  };
+
+  // ---- drift-test helpers ----
+
+  // Direct-SQL row mutations bypass the replicator so the replica stateVersion
+  // stays put — simulating how a non-deterministic operator (e.g. Cap) would
+  // produce a different row set on re-execution at the same stateVersion.
+  const pruneIssues = (...ids: readonly string[]) => {
+    if (ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(', ');
+    replica
+      .prepare(`DELETE FROM issues WHERE id IN (${placeholders})`)
+      .run(...ids);
+  };
+  const deleteIssue = (id: string) => {
+    replica.prepare(`DELETE FROM issues WHERE id = ?`).run(id);
+  };
+  const insertIssue = (
+    id: string,
+    opts: {
+      title?: string | undefined;
+      owner?: string | undefined;
+      version?: string | undefined;
+    } = {},
+  ) => {
+    replica
+      .prepare(
+        `INSERT INTO issues (id, title, owner, parent, big, _0_version)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        opts.title ?? `issue ${id}`,
+        opts.owner ?? '100',
+        null,
+        0,
+        opts.version ?? '01',
+      );
+  };
+
+  const cookieOf = (poke: Downstream[]): string | null => {
+    const end = poke.find(([c]) => c === 'pokeEnd') as
+      | [string, PokeEndBody]
+      | undefined;
+    return end?.[1].cookie ?? null;
+  };
+
+  // Drains pokes from `queue` until one carrying a non-empty rowsPatch is
+  // received. Returns `undefined` if the queue stays quiet for `quietMs` ms
+  // before producing such a poke — which is the expected signal for the
+  // no-drift and legacy-null-sig cases (the run loop never forces a re-execute,
+  // so no row-diff poke is ever emitted).
+  async function drainUntilRowsPatchOrQuiet(
+    queue: Queue<Downstream>,
+    quietMs = 250,
+  ): Promise<Downstream[] | undefined> {
+    const sentinel = Symbol('quiet') as unknown as Downstream;
+    let current: Downstream[] = [];
+    for (;;) {
+      const msg = await queue.dequeue(sentinel, quietMs);
+      if (msg === sentinel) return undefined;
+      current.push(msg);
+      if (msg[0] === 'pokeEnd') {
+        const part = current.find(([c]) => c === 'pokePart') as
+          | [string, PokePartBody]
+          | undefined;
+        if (part?.[1].rowsPatch?.length) {
+          return current;
+        }
+        current = [];
+      }
+    }
+  }
+
+  function rowOpsFor(poke: Downstream[], tableName: string) {
+    const part = poke.find(([c]) => c === 'pokePart') as
+      | [string, PokePartBody]
+      | undefined;
+    const rowsPatch = part?.[1].rowsPatch ?? [];
+    const puts = rowsPatch.filter(
+      (p): p is {op: 'put'; tableName: string; value: {id: string}} =>
+        p.op === 'put' && p.tableName === tableName,
+    );
+    const dels = rowsPatch.filter(
+      (p): p is {op: 'del'; tableName: string; id: {id: string}} =>
+        p.op === 'del' && p.tableName === tableName,
+    );
+    return {puts, dels};
+  }
+
+  // Stops the currently-running VS, applies `mutate`, spins up a fresh VS
+  // against the same CVR / replica, and reconnects the client at `baseCookie`.
+  // Reconnecting at the prior cookie lets the client-handler's toVersion
+  // filter drop no-op patches, so the poke we observe only contains the
+  // drift-induced diff.
+  async function restartAfter(opts: {
+    baseCookie: string | null;
+    mutate: () => void | Promise<void>;
+    queriesPatch: UpQueriesPatch;
+    wsID?: string | undefined;
+  }): Promise<{
+    queue: Queue<Downstream>;
+    stateChanges: Subscription<ReplicaState>;
+    cleanup: () => Promise<void>;
+  }> {
+    await vs.stop();
+    await viewSyncerDone;
+    await opts.mutate();
+    const restart = restartViewSyncer({
+      databaseStorage,
+      replicaDbFile,
+      cvrDB,
+      config,
+      customQueryTransformer,
+      setTimeoutFn,
+    });
+    const queue = restart.connect(
+      {
+        ...SYNC_CONTEXT,
+        baseCookie: opts.baseCookie,
+        wsID: opts.wsID ?? 'ws2',
+      },
+      opts.queriesPatch,
+    );
+    return {
+      queue,
+      stateChanges: restart.stateChanges,
+      cleanup: async () => {
+        await restart.vs.stop();
+        await restart.viewSyncerDone;
+      },
+    };
+  }
+
+  test('rowSetSignature persisted by end-to-end hydrate and advance', async () => {
+    const client = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
+    ]);
+    await nextPoke(client); // desiredQueriesPatch
+
+    stateChanges.push({state: 'version-ready'});
+    await nextPoke(client); // initial hydration — rows 1,2,3,4
+
+    expect(await loadStoredSig('query-hash1')).toEqual(
+      expectedIssuesSig(
+        issueRowID('1'),
+        issueRowID('2'),
+        issueRowID('3'),
+        issueRowID('4'),
+      ),
+    );
+
+    // Advance: delete issue 3 (leaves the query), update issue 4 (stays in the
+    // query, row-version bump only — must not change the signature).
+    replicator.processTransaction(
+      '123',
+      messages.delete('issues', {id: '3'}),
+      messages.update('issues', {
+        id: '4',
+        title: 'edited bar',
+        owner: 101,
+        parent: 2,
+        big: 100n,
+      }),
+    );
+    stateChanges.push({state: 'version-ready'});
+    await nextPoke(client);
+
+    expect(await loadStoredSig('query-hash1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2'), issueRowID('4')),
+    );
+  });
+
+  test('rowSetSignature drift on rehydration triggers re-execution and CVR correction', async () => {
+    // Initial hydration: CVR persists the authoritative sig for query-hash1.
+    const client = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
+    ]);
+    await nextPoke(client);
+    stateChanges.push({state: 'version-ready'});
+    await nextPoke(client);
+
+    const correctSig = expectedIssuesSig(
+      issueRowID('1'),
+      issueRowID('2'),
+      issueRowID('3'),
+      issueRowID('4'),
+    );
+    expect(await loadStoredSig('query-hash1')).toEqual(correctSig);
+
+    // Tamper with the stored sig to simulate what the CVR would hold if a
+    // prior non-deterministic hydration had produced a different row-set at
+    // this same stateVersion. On restart, drift detection must correct it.
+    const BOGUS_SIG = 'deadbeefcafebabe';
+    const {stateChanges: rsc, cleanup} = await restartAfter({
+      baseCookie: null,
+      mutate: async () => {
+        await cvrDB`
+          UPDATE ${cvrDB(cvrSchema(SHARD))}.queries
+             SET "rowSetSignature" = ${BOGUS_SIG}
+           WHERE "clientGroupID" = ${serviceID}
+             AND "queryHash" = 'query-hash1'
+        `;
+        expect(await loadStoredSig('query-hash1')).toEqual(BOGUS_SIG);
+      },
+      queriesPatch: [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY}],
+    });
+    try {
+      rsc.push({state: 'version-ready'});
+
+      // CVRQueryDrivenUpdater flush writes the corrected signature
+      // asynchronously. Poll until it matches the driver-side signature.
+      await vi.waitFor(
+        async () =>
+          expect(await loadStoredSig('query-hash1')).toEqual(correctSig),
+        {timeout: 10_000, interval: 20},
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('rowSetSignature drift diffs rows: del A, put C, keep B; version is bumped', async () => {
+    pruneIssues('3', '4', '5');
+
+    // Phase 1: query returns {1, 2}. A=1, B=2.
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+
+    expect(await loadStoredSig('query-hash1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+    );
+
+    // Phase 2: mutate replica — delete row 1 (A), insert row 6 (C). Row 2 (B)
+    // untouched. No stateVersion bump.
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: () => {
+        deleteIssue('1');
+        insertIssue('6', {title: 'row C'});
+      },
+      queriesPatch: [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2}],
+    });
+    try {
+      rsc.push({state: 'version-ready'});
+      const rowsPoke = await drainUntilRowsPatchOrQuiet(queue);
+      expect(rowsPoke).toBeDefined();
+
+      const pokeEnd = (
+        rowsPoke!.find(([c]) => c === 'pokeEnd') as [string, PokeEndBody]
+      )[1];
+      const {puts, dels} = rowOpsFor(rowsPoke!, 'issues');
+
+      // (1) Version is bumped past the pre-drift cookie.
+      expect(pokeEnd.cookie > phase1Cookie!).toBe(true);
+
+      // (2) Diff semantics: A retracted, C added, B not re-emitted.
+      expect(dels.map(p => p.id.id)).toEqual(['1']);
+      expect(puts.map(p => p.value.id)).toEqual(['6']);
+      for (const p of [...puts, ...dels]) {
+        const id = 'value' in p ? p.value.id : p.id.id;
+        expect(id).not.toEqual('2');
+      }
+
+      // Corrected signature is persisted.
+      expect(await loadStoredSig('query-hash1')).toEqual(
+        expectedIssuesSig(issueRowID('2'), issueRowID('6')),
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('same-hash rehydrate during deleteClients forces a version bump', async () => {
+    pruneIssues('3', '4', '5');
+
+    const ttl = 5000;
+    const {queue: client1} = connectWithQueueAndSource(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2, ttl},
+    ]);
+    const {queue: client2, source: connectSource2} = connectWithQueueAndSource(
+      {...SYNC_CONTEXT, clientID: 'bar', wsID: 'ws2'},
+      [{op: 'put', hash: 'query-hash2', ast: USERS_QUERY, ttl}],
+    );
+
+    await nextPoke(client1);
+    await nextPoke(client2);
+
+    stateChanges.push({state: 'version-ready'});
+
+    await nextPoke(client1);
+    await nextPoke(client1);
+    await nextPoke(client2);
+    await nextPoke(client2);
+
+    expect(await loadStoredSig('query-hash1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+    );
+
+    const originalQueries = PipelineDriver.prototype.queries;
+    const queriesSpy = vi
+      .spyOn(PipelineDriver.prototype, 'queries')
+      .mockImplementation(function (this: PipelineDriver) {
+        const queries = originalQueries.call(this);
+        const filtered = new Map(queries);
+        filtered.delete('query-hash1');
+        return filtered;
+      });
+    const originalAddQuery = PipelineDriver.prototype.addQuery;
+    const addQuerySpy = vi
+      .spyOn(PipelineDriver.prototype, 'addQuery')
+      .mockImplementation(function (
+        this: PipelineDriver,
+        ...args: Parameters<PipelineDriver['addQuery']>
+      ) {
+        const [, queryID] = args;
+        if (queryID !== 'query-hash1') {
+          return originalAddQuery.call(this, ...args);
+        }
+
+        const changes: RowChange[] = [
+          {
+            type: ChangeType.ADD,
+            queryID,
+            table: 'issues',
+            rowKey: {id: '2'},
+            row: {
+              id: '2',
+              title: 'parent issue bar',
+              owner: '101',
+              parent: null,
+              big: -9007199254740991,
+              json: null,
+              _0_version: '01',
+            },
+          },
+          {
+            type: ChangeType.ADD,
+            queryID,
+            table: 'issues',
+            rowKey: {id: '6'},
+            row: {
+              id: '6',
+              title: 'row C',
+              owner: '100',
+              parent: null,
+              big: 0,
+              json: null,
+              _0_version: '01',
+            },
+          },
+        ];
+        return changes;
+      });
+
+    connectSource2.cancel();
+    try {
+      await vs.deleteClients(SYNC_CONTEXT, [
+        'deleteClients',
+        {clientIDs: ['bar']},
+      ]);
+
+      const rowsPoke = await drainUntilRowsPatchOrQuiet(client1, 1000);
+      expect(rowsPoke).toBeDefined();
+
+      const {puts, dels} = rowOpsFor(rowsPoke!, 'issues');
+      expect(dels.map(p => p.id.id)).toEqual(['1']);
+      expect(puts.map(p => p.value.id)).toEqual(['6']);
+
+      if (!rowsPoke!.some(([cmd]) => cmd === 'deleteClients')) {
+        expect(await client1.dequeue()).toEqual([
+          'deleteClients',
+          {clientIDs: ['bar']},
+        ]);
+      }
+    } finally {
+      addQuerySpy.mockRestore();
+      queriesSpy.mockRestore();
+    }
+  });
+
+  test('rowSetSignature match on rehydration: no re-execution, no row-diff poke', async () => {
+    pruneIssues('3', '4', '5');
+
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+    const expectedSig = expectedIssuesSig(issueRowID('1'), issueRowID('2'));
+    expect(await loadStoredSig('query-hash1')).toEqual(expectedSig);
+
+    // No mutation between phases. Rehydration must produce the same sig →
+    // drift detection must NOT fire and must NOT force a re-execution.
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: () => {},
+      queriesPatch: [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2}],
+    });
+    const removeSpy = vi.spyOn(PipelineDriver.prototype, 'removeQuery');
+    try {
+      rsc.push({state: 'version-ready'});
+
+      // No drift → no row-diff poke.
+      expect(await drainUntilRowsPatchOrQuiet(queue)).toBeUndefined();
+
+      // Sig unchanged (re-execution via CVRQueryDrivenUpdater never ran,
+      // which is the only path that would flush a new sig here).
+      expect(await loadStoredSig('query-hash1')).toEqual(expectedSig);
+
+      // addQuery internally calls removeQuery(queryID); so a single hydration
+      // in hydrateUnchangedQueries produces exactly one call. Drift would add
+      // an explicit removeQuery plus a second hydration (3 total).
+      const callsForHash1 = removeSpy.mock.calls.filter(
+        ([id]) => id === 'query-hash1',
+      ).length;
+      expect(callsForHash1).toBe(1);
+    } finally {
+      removeSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test('rowSetSignature drift: only the drifted query is re-executed', async () => {
+    pruneIssues('3', '4', '5');
+
+    // Two queries on different tables: A=issues (will drift), B=users (stable).
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash-A', ast: ISSUES_QUERY2},
+      {op: 'put', hash: 'query-hash-B', ast: USERS_QUERY},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+
+    const initialSigA = expectedIssuesSig(issueRowID('1'), issueRowID('2'));
+    const initialSigB = await loadStoredSig('query-hash-B');
+    expect(await loadStoredSig('query-hash-A')).toEqual(initialSigA);
+    expect(initialSigB).toBeTruthy();
+
+    // Only issues is mutated. Users table is untouched → its sig must match
+    // on rehydration and drift must not fire for it.
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: () => {
+        deleteIssue('1');
+        insertIssue('6', {title: 'row C'});
+      },
+      queriesPatch: [
+        {op: 'put', hash: 'query-hash-A', ast: ISSUES_QUERY2},
+        {op: 'put', hash: 'query-hash-B', ast: USERS_QUERY},
+      ],
+    });
+    const removeSpy = vi.spyOn(PipelineDriver.prototype, 'removeQuery');
+    try {
+      rsc.push({state: 'version-ready'});
+      const rowsPoke = await drainUntilRowsPatchOrQuiet(queue);
+      expect(rowsPoke).toBeDefined();
+
+      const {puts: issuePuts, dels: issueDels} = rowOpsFor(rowsPoke!, 'issues');
+      const {puts: userPuts, dels: userDels} = rowOpsFor(rowsPoke!, 'users');
+
+      // Issues drifted: del 1, put 6.
+      expect(issueDels.map(p => p.id.id)).toEqual(['1']);
+      expect(issuePuts.map(p => p.value.id)).toEqual(['6']);
+
+      // Users did NOT drift: no row-level changes for users in this poke.
+      expect(userDels).toHaveLength(0);
+      expect(userPuts).toHaveLength(0);
+
+      // Sig A is updated; sig B is unchanged.
+      expect(await loadStoredSig('query-hash-A')).toEqual(
+        expectedIssuesSig(issueRowID('2'), issueRowID('6')),
+      );
+      expect(await loadStoredSig('query-hash-B')).toEqual(initialSigB);
+
+      // A was re-executed (drift): addQuery-internal + explicit drift-branch
+      // removeQuery + second hydration's internal = 3 calls.
+      // B was kept (no drift): just the single hydrateUnchangedQueries call = 1.
+      const callsFor = (id: string) =>
+        removeSpy.mock.calls.filter(([q]) => q === id).length;
+      expect(callsFor('query-hash-A')).toBe(3);
+      expect(callsFor('query-hash-B')).toBe(1);
+    } finally {
+      removeSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test('rowSetSignature absent (legacy): drift check is skipped, no forced re-execution', async () => {
+    pruneIssues('3', '4', '5');
+
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+    expect(await loadStoredSig('query-hash1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+    );
+
+    // Null the stored sig to simulate a query record written before this
+    // feature was deployed. Also mutate the replica: if drift detection
+    // incorrectly fired on null sigs, the mutation would surface as a row
+    // diff. With the correct behavior, the legacy query is left alone.
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: async () => {
+        await cvrDB`
+          UPDATE ${cvrDB(cvrSchema(SHARD))}.queries
+             SET "rowSetSignature" = NULL
+           WHERE "clientGroupID" = ${serviceID}
+             AND "queryHash" = 'query-hash1'
+        `;
+        expect(await loadStoredSig('query-hash1')).toBeNull();
+        deleteIssue('1');
+        insertIssue('6', {title: 'would be drift if detection fired'});
+      },
+      queriesPatch: [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2}],
+    });
+    try {
+      rsc.push({state: 'version-ready'});
+
+      // Core guarantee of the legacy-null-sig skip: no forced re-execution →
+      // no row-diff poke. If this fired, clients reconnecting to a pre-feature
+      // deployment would see a spurious re-send of every row.
+      expect(await drainUntilRowsPatchOrQuiet(queue)).toBeUndefined();
+
+      // The sig *does* get initialized on this cycle — but through
+      // CVRQueryDrivenUpdater.flush's opportunistic pass over all queries
+      // (triggered by the normal add of internal queries on restart), not
+      // through drift re-execution. That's the intended "sigs get initialized
+      // whenever they next re-execute via the normal path" behavior.
+      expect(await loadStoredSig('query-hash1')).toEqual(
+        expectedIssuesSig(issueRowID('2'), issueRowID('6')),
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('rowSetSignature drift: custom (named) query diffs rows correctly', async () => {
+    pruneIssues('3', '4', '5');
+
+    queryFetch.respond([
+      {ast: ISSUES_QUERY2, id: 'custom-1', name: 'named-query'},
+    ]);
+
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'custom-1', name: 'named-query', args: ['thing']},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+    expect(await loadStoredSig('custom-1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+    );
+
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: () => {
+        deleteIssue('1');
+        insertIssue('6', {title: 'row C'});
+      },
+      queriesPatch: [
+        {op: 'put', hash: 'custom-1', name: 'named-query', args: ['thing']},
+      ],
+    });
+    try {
+      rsc.push({state: 'version-ready'});
+      const rowsPoke = await drainUntilRowsPatchOrQuiet(queue);
+      expect(rowsPoke).toBeDefined();
+
+      const {puts, dels} = rowOpsFor(rowsPoke!, 'issues');
+      expect(dels.map(p => p.id.id)).toEqual(['1']);
+      expect(puts.map(p => p.value.id)).toEqual(['6']);
+
+      expect(await loadStoredSig('custom-1')).toEqual(
+        expectedIssuesSig(issueRowID('2'), issueRowID('6')),
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test('rowSetSignature: emptied-by-advance query rehydrates to "0" without drift', async () => {
+    // Phase 1: hydrate non-empty. Signature is sig(1) ^ sig(2).
+    pruneIssues('3', '4', '5');
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    await nextPoke(client1);
+    expect(await loadStoredSig('query-hash1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+    );
+
+    // Advance: delete both rows via the replicator. #trackRowSetSignatures
+    // XORs each REMOVE with the same unit the ADD contributed, so the live
+    // signature returns to 0n and the CVR persists hex "0".
+    replicator.processTransaction(
+      '123',
+      messages.delete('issues', {id: '1'}),
+      messages.delete('issues', {id: '2'}),
+    );
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+    expect(await loadStoredSig('query-hash1')).toEqual('0');
+
+    // Phase 2: restart. Rehydration yields 0 rows → the map entry is never
+    // created → provider returns undefined → candidate = undefined ?? 0n = 0n.
+    // Stored "0" parses to 0n. Match: no drift, no re-execution.
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: () => {},
+      queriesPatch: [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY2}],
+    });
+    const removeSpy = vi.spyOn(PipelineDriver.prototype, 'removeQuery');
+    try {
+      rsc.push({state: 'version-ready'});
+
+      expect(await drainUntilRowsPatchOrQuiet(queue)).toBeUndefined();
+      expect(await loadStoredSig('query-hash1')).toEqual('0');
+
+      // Single call = internal removeQuery from the one addQuery in
+      // hydrateUnchangedQueries. Drift would be 3.
+      const calls = removeSpy.mock.calls.filter(
+        ([id]) => id === 'query-hash1',
+      ).length;
+      expect(calls).toBe(1);
+    } finally {
+      removeSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test('rowSetSignature: transformationHash change bypasses the drift check', async () => {
+    // Direct-mock the transformer so we can drive the transformationHash
+    // explicitly (the real transformer caches by query id for 5s, which would
+    // re-serve phase 1's hash in phase 2).
+    pruneIssues('3', '4', '5');
+    const transformSpy = vi
+      .spyOn(customQueryTransformer!, 'transform')
+      .mockResolvedValue(
+        transformAttempt([
+          {
+            id: 'custom-1',
+            transformedAst: ISSUES_QUERY2,
+            transformationHash: 'hash-1',
+          },
+        ]),
+      );
+
+    // Phase 1: hydrate with hash-1. CVR persists transformationHash=hash-1 and
+    // the row-set signature for issues {1, 2}.
+    const client1 = connect(SYNC_CONTEXT, [
+      {op: 'put', hash: 'custom-1', name: 'named-query', args: ['thing']},
+    ]);
+    await nextPoke(client1);
+    stateChanges.push({state: 'version-ready'});
+    const phase1Cookie = cookieOf(await nextPoke(client1));
+    expect(await loadStoredSig('custom-1')).toEqual(
+      expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+    );
+
+    // Tamper the stored sig: if drift *were* checked in phase 2, a bogus
+    // stored value would force a drift re-execution. The hash-mismatch filter
+    // in #hydrateUnchangedQueries must drop this query before the drift
+    // comparison is reached.
+    const BOGUS_SIG = 'deadbeefcafebabe';
+
+    // Phase 2: restart. Transformer now returns hash-2 (different from the
+    // CVR's stored hash-1). In hydrateUnchangedQueries, the custom-query
+    // branch filters the mismatched entry out before any addQuery / drift
+    // check runs. #syncQueryPipelineSet then re-hydrates fresh.
+    const {
+      queue,
+      stateChanges: rsc,
+      cleanup,
+    } = await restartAfter({
+      baseCookie: phase1Cookie,
+      mutate: async () => {
+        await cvrDB`
+          UPDATE ${cvrDB(cvrSchema(SHARD))}.queries
+             SET "rowSetSignature" = ${BOGUS_SIG}
+           WHERE "clientGroupID" = ${serviceID}
+             AND "queryHash" = 'custom-1'
+        `;
+      },
+      queriesPatch: [
+        {op: 'put', hash: 'custom-1', name: 'named-query', args: ['thing']},
+      ],
+    });
+    transformSpy.mockResolvedValue(
+      transformAttempt([
+        {
+          id: 'custom-1',
+          transformedAst: ISSUES_QUERY2,
+          transformationHash: 'hash-2',
+        },
+      ]),
+    );
+    const removeSpy = vi.spyOn(PipelineDriver.prototype, 'removeQuery');
+    try {
+      rsc.push({state: 'version-ready'});
+      await drainUntilRowsPatchOrQuiet(queue);
+
+      // Transformation-hash-change path: query is dropped from
+      // hydrateUnchangedQueries at the hash-mismatch filter (no addQuery, no
+      // drift check). #syncQueryPipelineSet then hydrates fresh; its single
+      // addQuery fires one internal removeQuery. Total: 1.
+      // The drift path for this same query would produce 3 calls.
+      const calls = removeSpy.mock.calls.filter(
+        ([id]) => id === 'custom-1',
+      ).length;
+      expect(calls).toBe(1);
+
+      // Sig is overwritten by the fresh hydration (no longer BOGUS).
+      expect(await loadStoredSig('custom-1')).toEqual(
+        expectedIssuesSig(issueRowID('1'), issueRowID('2')),
+      );
+    } finally {
+      removeSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test('process advancement with lmid change, client has no queries.  See https://bugs.rocicorp.dev/issue/3628', async () => {
     const client = connect(SYNC_CONTEXT, []);
     expect(await nextPoke(client)).toMatchInlineSnapshot(`
@@ -4424,6 +5476,7 @@ describe('view-syncer/service', () => {
         httpCookie: undefined,
         origin: undefined,
         userID: 'user-1',
+        auth: undefined,
       },
       [{op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY}],
     );
@@ -5265,5 +6318,88 @@ describe('view-syncer/service', () => {
     expect(failSpy).not.toHaveBeenCalled();
     expect(destroySpy).toHaveBeenCalled();
     expect(destroyCalledAfterRelease).toBe(true);
+  });
+
+  // Regression test: a client that disconnects before initConnection's async
+  // callback resolves #initialized used to leave the ViewSyncer as a zombie
+  // in the ServiceRunner (run() blocked on readyState() forever), inflating
+  // the active-client-groups gauge. The fix rejects #initialized in the
+  // idle-shutdown path so that run() can exit.
+  test('view-syncer run completes when client disconnects before initialization', async () => {
+    const destroySpy = vi.spyOn(PipelineDriver.prototype, 'destroy');
+
+    // Use fake timers starting from *now* so that advancing past the
+    // keepalive window (DEFAULT_KEEPALIVE_MS = 5000, set at construction
+    // time using real Date.now()) works correctly.
+    vi.setSystemTime(vi.getRealSystemTime());
+
+    const {source} = connectWithQueueAndSource(SYNC_CONTEXT, [
+      {op: 'put', hash: 'query-hash1', ast: ISSUES_QUERY},
+    ]);
+
+    // Disconnect immediately, before the async initConnection callback
+    // has a chance to resolve #initialized.
+    source.cancel();
+
+    // Let the initConnection async callback acquire and release the lock.
+    await sleep(100);
+
+    // Advance time past the keepalive window (DEFAULT_KEEPALIVE_MS = 5000)
+    // so that #checkForShutdownConditionsInLock returns true.
+    vi.setSystemTime(Date.now() + 6000);
+
+    // Fire ALL pending timer callbacks (setTimeout is mocked).
+    for (const call of setTimeoutFn.mock.calls) {
+      call[0]();
+    }
+
+    // Let the shutdown lock acquisition and async cleanup settle.
+    await sleep(100);
+
+    // Fire any newly scheduled callbacks (shutdown may reschedule).
+    vi.setSystemTime(Date.now() + 6000);
+    for (const call of setTimeoutFn.mock.calls) {
+      call[0]();
+    }
+    await sleep(100);
+
+    // The idle-shutdown path fires (runInLockWithCVR →
+    // checkForShutdownConditionsInLock → rejects #initialized →
+    // stateChanges.cancel). This should cause vs.run() to exit via its
+    // catch block (which calls #cleanup) and finally block.
+    // Without the fix, viewSyncerDone would never resolve here.
+    const timeout = sleep(5000).then(() => 'timeout' as const);
+    const result = await Promise.race([
+      viewSyncerDone.then(() => 'done' as const),
+      timeout,
+    ]);
+    expect(result).toBe('done');
+
+    const stopWarns = logSink.messages.filter(
+      ([level, , args]) =>
+        level === 'warn' &&
+        args.some(
+          arg =>
+            typeof arg === 'string' &&
+            arg.includes('stopping view-syncer') &&
+            arg.includes('shut down before initialization completed'),
+        ),
+    );
+    expect(stopWarns).toHaveLength(1);
+
+    const stopErrors = logSink.messages.filter(
+      ([level, , args]) =>
+        level === 'error' &&
+        args.some(
+          arg =>
+            typeof arg === 'string' &&
+            arg.includes('stopping view-syncer') &&
+            arg.includes('shut down before initialization completed'),
+        ),
+    );
+    expect(stopErrors).toHaveLength(0);
+
+    // Verify that #cleanup ran (pipelines destroyed).
+    expect(destroySpy).toHaveBeenCalled();
   });
 });

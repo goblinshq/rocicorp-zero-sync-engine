@@ -1,5 +1,3 @@
-import type {LogContext} from '@rocicorp/logger';
-import {resolver} from '@rocicorp/resolver';
 import {
   pipeline,
   Readable,
@@ -7,6 +5,8 @@ import {
   Writable,
   type DuplexOptions,
 } from 'node:stream';
+import type {LogContext} from '@rocicorp/logger';
+import {resolver} from '@rocicorp/resolver';
 import {
   createWebSocketStream,
   type CloseEvent,
@@ -38,6 +38,18 @@ export type Source<T> = AsyncIterable<T> & {
    * @param err Terminate the iteration by throwing the `err` instead.
    */
   cancel: (err?: Error) => void;
+
+  /**
+   * Resolves the result of the specified `other` Promise, or a
+   * resolved/rejected Promise when the Source is terminated or
+   * rejects.
+   *
+   * This is similar to using `Promise.race([other, sourceDone])`, but
+   * in a memory safe way, as repeatedly calling `Promise.race([ ... ])` with
+   * a long-lived Promise results in leaking memory via a growing list of
+   * `then()` callbacks (https://github.com/nodejs/node/issues/17469).
+   */
+  doneOr<R>(other: Promise<R>): Promise<void | R>;
 
   /**
    * The presence of a `pipeline` iterable allows the usual "consumed-on-iterate" semantics
@@ -216,18 +228,36 @@ const ackSchema = v.object({ack: v.number()});
 
 type Ack = v.Infer<typeof ackSchema>;
 
-type Streamed<T> = {
-  /** Application-level message. */
-  msg: T;
-
-  /** ID used for the Ack message. */
-  id: number;
+/** A parsed JSON value paired with the exact source text it was parsed from. */
+export type ParsedJSON<T> = {
+  data: T;
+  json: string;
 };
 
-export async function streamOut<T extends JSONValue>(
+export function streamOut<T extends JSONValue>(
   lc: LogContext,
   source: Source<T>,
   sink: WebSocket,
+): Promise<void> {
+  return streamOutInternal(lc, source, sink, BigIntJSON.stringify);
+}
+
+/**
+ * Streams out a `Source` for which messages are already stringified JSON.
+ */
+export function streamOutStringified(
+  lc: LogContext,
+  source: Source<string>,
+  sink: WebSocket,
+): Promise<void> {
+  return streamOutInternal(lc, source, sink, json => json);
+}
+
+async function streamOutInternal<T extends JSONValue>(
+  lc: LogContext,
+  source: Source<T>,
+  sink: WebSocket,
+  stringify: (payload: T) => string,
 ): Promise<void> {
   sendPingsForLiveness(lc, sink, PING_INTERVAL_MS);
 
@@ -253,7 +283,7 @@ export async function streamOut<T extends JSONValue>(
       lc.debug?.(`started pipelined outbound stream`);
       for await (const {value: msg, consumed} of pipeline) {
         const id = ++nextID;
-        const data = BigIntJSON.stringify({msg, id} satisfies Streamed<T>);
+        const data = `{"id":${id},"msg":${stringify(msg)}}`;
         // Enable for debugging. Otherwise too verbose.
         // lc.debug?.(`pipelining`, data);
         sink.send(data);
@@ -271,7 +301,7 @@ export async function streamOut<T extends JSONValue>(
       lc.debug?.(`started synchronous outbound stream`);
       for await (const msg of source) {
         const id = ++nextID;
-        const data = BigIntJSON.stringify({msg, id} satisfies Streamed<T>);
+        const data = `{"id":${id},"msg":${stringify(msg)}}`;
         // Enable for debugging. Otherwise too verbose.
         // lc.debug?.(`sending`, data);
         sink.send(data);
@@ -288,11 +318,35 @@ export async function streamOut<T extends JSONValue>(
   }
 }
 
-export async function streamIn<T extends JSONValue>(
+export function streamIn<T extends JSONValue>(
   lc: LogContext,
   source: WebSocket,
   schema: v.Type<T>,
 ): Promise<Source<T>> {
+  return streamInInternal(lc, source, schema, data => data);
+}
+
+/**
+ * Streams in messages sent by {@link streamOutStringified}, preserving the
+ * exact application-level JSON alongside its parsed and validated value.
+ */
+export function streamInStringified<T extends JSONValue>(
+  lc: LogContext,
+  source: WebSocket,
+  schema: v.Type<T>,
+): Promise<Source<ParsedJSON<T>>> {
+  return streamInInternal(lc, source, schema, (data, frame, id) => ({
+    data,
+    json: extractStringifiedMessage(frame, id),
+  }));
+}
+
+async function streamInInternal<T extends JSONValue, Out>(
+  lc: LogContext,
+  source: WebSocket,
+  schema: v.Type<T>,
+  transform: (data: T, frame: string, id: number) => Out,
+): Promise<Source<Out>> {
   expectPingsForLiveness(lc, source, PING_INTERVAL_MS);
 
   const streamedSchema = v.object({
@@ -300,12 +354,15 @@ export async function streamIn<T extends JSONValue>(
     id: v.number(),
   });
 
-  const sink: Subscription<T, Streamed<T>> = new Subscription<T, Streamed<T>>(
+  const sink: Subscription<Out, {id: number; data: Out}> = new Subscription<
+    Out,
+    {id: number; data: Out}
+  >(
     {
       consumed: ({id}) => source.send(JSON.stringify({ack: id} satisfies Ack)),
       cleanup: () => closer.close(),
     },
-    ({msg}) => msg,
+    ({data}) => data,
   );
 
   const closer = WebSocketCloser.forSink(lc, source, sink, handleMessage);
@@ -321,7 +378,7 @@ export async function streamIn<T extends JSONValue>(
       const msg = v.parse(value, streamedSchema, 'passthrough');
       // Enable for debugging. Otherwise too verbose.
       // lc.debug?.(`received`, data);
-      sink.push(msg);
+      sink.push({id: msg.id, data: transform(msg.msg, data, msg.id)});
     } catch (e) {
       closer.close(e);
     }
@@ -329,6 +386,15 @@ export async function streamIn<T extends JSONValue>(
 
   await closer.connected;
   return sink;
+}
+
+function extractStringifiedMessage(frame: string, id: number): string {
+  const prefix = `{"id":${id},"msg":`;
+  assert(
+    frame.startsWith(prefix) && frame.endsWith('}'),
+    `invalid streamed message frame`,
+  );
+  return frame.slice(prefix.length, -1);
 }
 
 class WebSocketCloser {
@@ -348,10 +414,10 @@ class WebSocketCloser {
     return new WebSocketCloser(lc, ws, () => stream.cancel());
   }
 
-  static forSink<T>(
+  static forSink<T, Input>(
     lc: LogContext,
     ws: WebSocket,
-    stream: Subscription<T, Streamed<T>>,
+    stream: Subscription<T, Input>,
     messageHandler: (e: MessageEvent) => void | undefined,
   ) {
     // If the websocket is closed, call end() to allow the downstream Sink

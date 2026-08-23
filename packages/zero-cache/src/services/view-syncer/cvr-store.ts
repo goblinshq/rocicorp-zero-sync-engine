@@ -6,6 +6,7 @@ import {version} from '../../../../otel/src/version.ts';
 import {assert} from '../../../../shared/src/asserts.ts';
 import {CustomKeyMap} from '../../../../shared/src/custom-key-map.ts';
 import {CustomKeySet} from '../../../../shared/src/custom-key-set.ts';
+import {some} from '../../../../shared/src/iterables.ts';
 import {
   deepEqual,
   type ReadonlyJSONValue,
@@ -21,6 +22,10 @@ import {clampTTL, DEFAULT_TTL_MS} from '../../../../zql/src/query/ttl.ts';
 import * as Mode from '../../db/mode-enum.ts';
 import {runTx} from '../../db/run-transaction.ts';
 import {TransactionPool} from '../../db/transaction-pool.ts';
+import {
+  getOrCreateCounter,
+  getOrCreateLatencyHistogram,
+} from '../../observability/metrics.ts';
 import {recordRowsSynced} from '../../server/anonymous-otel-start.ts';
 import {ProtocolErrorWithLevel} from '../../types/error-with-level.ts';
 import type {PostgresDB, PostgresTransaction} from '../../types/pg.ts';
@@ -71,6 +76,10 @@ export type CVRFlushStats = {
 
 let flushCounter = 0;
 
+const RESULT_ATTRIBUTE = 'result';
+const ERROR_KIND_ATTRIBUTE = 'error.kind';
+const CVR_FLUSH_TYPE_ATTRIBUTE = 'flush.type';
+
 /**
  * Convert TTL/timestamp values for both old (seconds-based) and new (ms-based) columns.
  * Old columns: inactivatedAt (TIMESTAMPTZ), ttl (INTERVAL) - need conversion ms->seconds
@@ -111,6 +120,12 @@ function asQuery(row: QueriesRow): QueryRecord {
   const maybeVersion = (s: string | null) =>
     s === null ? undefined : versionFromString(s);
 
+  // Only attach rowSetSignature when the column is non-null, so existing
+  // snapshots that don't include the field don't break.
+  const sigField = row.rowSetSignature
+    ? {rowSetSignature: row.rowSetSignature}
+    : {};
+
   if (row.clientAST === null) {
     // custom query
     assert(
@@ -126,6 +141,7 @@ function asQuery(row: QueriesRow): QueryRecord {
       clientState: {},
       transformationHash: row.transformationHash ?? undefined,
       transformationVersion: maybeVersion(row.transformationVersion),
+      ...sigField,
     } satisfies CustomQueryRecord;
   }
 
@@ -137,6 +153,7 @@ function asQuery(row: QueriesRow): QueryRecord {
         ast,
         transformationHash: row.transformationHash ?? undefined,
         transformationVersion: maybeVersion(row.transformationVersion),
+        ...sigField,
       } satisfies InternalQueryRecord)
     : ({
         type: 'client',
@@ -146,6 +163,7 @@ function asQuery(row: QueriesRow): QueryRecord {
         clientState: {},
         transformationHash: row.transformationHash ?? undefined,
         transformationVersion: maybeVersion(row.transformationVersion),
+        ...sigField,
       } satisfies ClientQueryRecord);
 }
 
@@ -186,6 +204,21 @@ export class CVRStore {
   );
   readonly #forceUpdates = new CustomKeySet<RowID>(rowIDString);
   readonly #rowCache: RowRecordCache;
+  readonly #cvrLoads = getOrCreateCounter(
+    'sync',
+    'cvr.load_attempts',
+    'CVR load attempts, labeled by result.',
+  );
+  readonly #cvrLoadTime = getOrCreateLatencyHistogram(
+    'sync',
+    'cvr.load_duration',
+    'Time to load a CVR.',
+  );
+  readonly #cvrFlushes = getOrCreateCounter(
+    'sync',
+    'cvr.flush_attempts',
+    'CVR flush attempts, labeled by result and flush.type.',
+  );
   readonly #loadAttemptIntervalMs: number;
   readonly #maxLoadAttempts: number;
   #rowCount: number = 0;
@@ -228,30 +261,53 @@ export class CVRStore {
   }
 
   #updateQueryFields(queryHash: string, fields: Partial<QueriesRow>): void {
-    // Track as partial-only update for batched flush
-    this.#pendingQueryPartialUpdates.set(queryHash, fields);
+    // Track as partial-only update for batched flush. Merge into any
+    // pre-existing partial update for the same hash so independent callers
+    // (e.g. updateQuery + updateRowSetSignature) don't clobber each other.
+    const existing = this.#pendingQueryPartialUpdates.get(queryHash);
+    this.#pendingQueryPartialUpdates.set(
+      queryHash,
+      existing ? {...existing, ...fields} : fields,
+    );
   }
 
   load(lc: LogContext, lastConnectTime: number): Promise<CVR> {
+    const start = performance.now();
     return startAsyncSpan(tracer, 'cvr.load', async () => {
-      let err: RowsVersionBehindError | undefined;
-      for (let i = 0; i < this.#maxLoadAttempts; i++) {
-        if (i > 0) {
-          await sleep(this.#loadAttemptIntervalMs);
+      try {
+        let err: RowsVersionBehindError | undefined;
+        for (let i = 0; i < this.#maxLoadAttempts; i++) {
+          if (i > 0) {
+            await sleep(this.#loadAttemptIntervalMs);
+          }
+          const result = await this.#load(lc, lastConnectTime);
+          if (result instanceof RowsVersionBehindError) {
+            lc.info?.(`attempt ${i + 1}: ${String(result)}`);
+            err = result;
+            continue;
+          }
+          this.#recordLoad(performance.now() - start, {
+            [RESULT_ATTRIBUTE]: 'success',
+          });
+          return result;
         }
-        const result = await this.#load(lc, lastConnectTime);
-        if (result instanceof RowsVersionBehindError) {
-          lc.info?.(`attempt ${i + 1}: ${String(result)}`);
-          err = result;
-          continue;
-        }
-        return result;
+        assert(err, 'Expected error to be set after retry loop exhausted');
+        throw new ClientNotFoundError(
+          `max attempts exceeded waiting for CVR@${err.cvrVersion} to catch up from ${err.rowsVersion}`,
+        );
+      } catch (e) {
+        this.#recordLoad(performance.now() - start, {
+          [RESULT_ATTRIBUTE]: 'error',
+          [ERROR_KIND_ATTRIBUTE]: cvrErrorKind(e),
+        });
+        throw e;
       }
-      assert(err, 'Expected error to be set after retry loop exhausted');
-      throw new ClientNotFoundError(
-        `max attempts exceeded waiting for CVR@${err.cvrVersion} to catch up from ${err.rowsVersion}`,
-      );
     });
+  }
+
+  #recordLoad(elapsedMs: number, attributes: Record<string, string>) {
+    this.#cvrLoads.add(1, attributes);
+    this.#cvrLoadTime.recordMs(elapsedMs, attributes);
   }
 
   async #load(
@@ -302,7 +358,19 @@ export class CVRStore {
             'clients',
           )}
            WHERE "clientGroupID" = ${id}`,
-          tx<QueriesRow[]>`SELECT * FROM ${this.#cvr('queries')}
+          tx<QueriesRow[]>`SELECT
+            "clientGroupID",
+            "queryHash",
+            "clientAST",
+            "queryName",
+            "queryArgs",
+            "patchVersion",
+            "transformationHash",
+            "transformationVersion",
+            "internal",
+            "deleted",
+            "rowSetSignature"
+          FROM ${this.#cvr('queries')}
           WHERE "clientGroupID" = ${id} AND deleted IS DISTINCT FROM true`,
           tx<DesiresRow[]>`SELECT
           "clientGroupID",
@@ -587,6 +655,10 @@ export class CVRStore {
     });
   }
 
+  updateRowSetSignature(queryHash: string, signature: string): void {
+    this.#updateQueryFields(queryHash, {rowSetSignature: signature});
+  }
+
   insertClient(client: ClientRecord): void {
     const change: ClientsRow = {
       clientGroupID: this.#id,
@@ -665,7 +737,7 @@ export class CVRStore {
     const end = versionString(upToCVR.version);
     lc.debug?.(`scanning config patches for clients from ${start}`);
 
-    const reader = new TransactionPool(lc, Mode.READONLY).run(this.#db);
+    const reader = new TransactionPool(lc, {mode: Mode.READONLY}).run(this.#db);
     try {
       // Verify that we are reading the right version of the CVR.
       await reader.processReadTask(tx =>
@@ -675,7 +747,15 @@ export class CVRStore {
       const [allDesires, queryRows] = await reader.processReadTask(tx =>
         Promise.all([
           tx<DesiresRow[]>`
-      SELECT * FROM ${this.#cvr('desires')}
+      SELECT
+        "clientGroupID",
+        "clientID",
+        "queryHash",
+        "patchVersion",
+        "deleted",
+        "ttl",
+        "inactivatedAt"
+      FROM ${this.#cvr('desires')}
         WHERE "clientGroupID" = ${this.#id}
         AND "patchVersion" > ${start}
         AND "patchVersion" <= ${end}`,
@@ -749,7 +829,8 @@ export class CVRStore {
           "transformationHash",
           "transformationVersion",
           "internal",
-          "deleted"
+          "deleted",
+          "rowSetSignature"
         )
         SELECT
           "clientGroupID",
@@ -764,7 +845,8 @@ export class CVRStore {
           "transformationHash",
           "transformationVersion",
           "internal",
-          "deleted"
+          "deleted",
+          "rowSetSignature"
         FROM json_to_recordset(${rows}) AS x(
           "clientGroupID" TEXT,
           "queryHash" TEXT,
@@ -775,12 +857,13 @@ export class CVRStore {
           "transformationHash" TEXT,
           "transformationVersion" TEXT,
           "internal" BOOLEAN,
-          "deleted" BOOLEAN
+          "deleted" BOOLEAN,
+          "rowSetSignature" TEXT
         )
         ON CONFLICT ("clientGroupID", "queryHash") DO UPDATE SET
           "clientAST" = excluded."clientAST",
           "queryName" = excluded."queryName",
-          "queryArgs" = CASE 
+          "queryArgs" = CASE
             WHEN excluded."queryArgs" IS NULL THEN NULL
             ELSE excluded."queryArgs"::json
           END,
@@ -788,7 +871,8 @@ export class CVRStore {
           "transformationHash" = excluded."transformationHash",
           "transformationVersion" = excluded."transformationVersion",
           "internal" = excluded."internal",
-          "deleted" = excluded."deleted"
+          "deleted" = excluded."deleted",
+          "rowSetSignature" = excluded."rowSetSignature"
       `);
     }
 
@@ -808,6 +892,8 @@ export class CVRStore {
           transformationHash: partial.transformationHash ?? null,
           transformationVersionSet: partial.transformationVersion !== undefined,
           transformationVersion: partial.transformationVersion ?? null,
+          rowSetSignatureSet: partial.rowSetSignature !== undefined,
+          rowSetSignature: partial.rowSetSignature ?? null,
         }),
       );
       queries.push(tx`
@@ -828,6 +914,10 @@ export class CVRStore {
           "transformationVersion" = CASE
             WHEN u."transformationVersionSet" THEN u."transformationVersion"
             ELSE q."transformationVersion"
+          END,
+          "rowSetSignature" = CASE
+            WHEN u."rowSetSignatureSet" THEN u."rowSetSignature"
+            ELSE q."rowSetSignature"
           END
         FROM json_to_recordset(${rows}) AS u(
           "clientGroupID" TEXT,
@@ -839,7 +929,9 @@ export class CVRStore {
           "transformationHashSet" BOOLEAN,
           "transformationHash" TEXT,
           "transformationVersionSet" BOOLEAN,
-          "transformationVersion" TEXT
+          "transformationVersion" TEXT,
+          "rowSetSignatureSet" BOOLEAN,
+          "rowSetSignature" TEXT
         )
         WHERE q."clientGroupID" = u."clientGroupID"
           AND q."queryHash" = u."queryHash"
@@ -931,12 +1023,33 @@ export class CVRStore {
   ): Promise<void> {
     const start = Date.now();
     lc.debug?.('checking cvr version and ownership');
+    const expected = versionString(expectedCurrentVersion);
+
+    if (expected === EMPTY_CVR_VERSION.stateVersion) {
+      // SELECT FOR UPDATE cannot lock a row that does not exist. Ensure that
+      // new CVRs have a row before taking the lock so concurrent first flushes
+      // serialize on the primary key. After a conflicting insert commits, the
+      // SELECT below sees its version and rejects the stale writer.
+      await tx`
+        INSERT INTO ${this.#cvr('instances')} (
+          "clientGroupID",
+          "version",
+          "lastActive"
+        )
+        VALUES (
+          ${this.#id},
+          ${EMPTY_CVR_VERSION.stateVersion},
+          to_timestamp(0)
+        )
+        ON CONFLICT ("clientGroupID") DO NOTHING
+      `;
+    }
+
     const result = await tx<
       Pick<InstancesRow, 'version' | 'owner' | 'grantedAt'>[]
     >`SELECT "version", "owner", "grantedAt" FROM ${this.#cvr('instances')}
         WHERE "clientGroupID" = ${this.#id}
         FOR UPDATE`;
-    const expected = versionString(expectedCurrentVersion);
     const {version, owner, grantedAt} =
       result.length > 0
         ? result[0]
@@ -1053,9 +1166,9 @@ export class CVRStore {
           queryFlushes = this.#flushQueries(tx, lc);
 
           // Count both full updates and partial-only updates
-          const partialOnlyCount = Array.from(
-            this.#pendingQueryPartialUpdates.keys(),
-          ).filter(key => !this.#pendingQueryUpdates.has(key)).length;
+          const partialOnlyCount = [
+            ...this.#pendingQueryPartialUpdates.keys(),
+          ].filter(key => !this.#pendingQueryUpdates.has(key)).length;
 
           stats.queries = this.#pendingQueryUpdates.size + partialOnlyCount;
           stats.statements +=
@@ -1106,9 +1219,10 @@ export class CVRStore {
       (this.#pendingInstanceWrite ? 1 : 0) +
       this.#writes.size +
       (this.#pendingQueryUpdates.size > 0 ? 1 : 0) +
-      (Array.from(this.#pendingQueryPartialUpdates.keys()).filter(
+      (some(
+        this.#pendingQueryPartialUpdates.keys(),
         key => !this.#pendingQueryUpdates.has(key),
-      ).length > 0
+      )
         ? 1
         : 0) +
       (this.#pendingDesireUpdates.size > 0 ? 1 : 0);
@@ -1158,8 +1272,17 @@ export class CVRStore {
         );
         this.#rowCache.recordSyncFlushStats(stats, elapsed);
       }
+      this.#cvrFlushes.add(1, {
+        [RESULT_ATTRIBUTE]: 'success',
+        [CVR_FLUSH_TYPE_ATTRIBUTE]: stats ? 'sync' : 'noop',
+      });
       return stats;
     } catch (e) {
+      this.#cvrFlushes.add(1, {
+        [RESULT_ATTRIBUTE]: 'error',
+        [CVR_FLUSH_TYPE_ATTRIBUTE]: 'sync',
+        [ERROR_KIND_ATTRIBUTE]: cvrErrorKind(e),
+      });
       // Clear cached state if an error (e.g. ConcurrentModificationException) is encountered.
       this.#rowCache.clear();
       throw e;
@@ -1191,7 +1314,7 @@ export class CVRStore {
     const db = this.#db;
     const clientGroupID = this.#id;
 
-    const reader = new TransactionPool(lc, Mode.READONLY).run(db);
+    const reader = new TransactionPool(lc, {mode: Mode.READONLY}).run(db);
     try {
       return await reader.processReadTask(
         tx => tx<InspectQueryRow[]>`
@@ -1268,7 +1391,7 @@ export class ConcurrentModificationException extends ProtocolErrorWithLevel {
   constructor(expectedVersion: string, actualVersion: string) {
     super(
       {
-        kind: ErrorKind.Internal,
+        kind: ErrorKind.Rehome,
         message: `CVR has been concurrently modified. Expected ${expectedVersion}, got ${actualVersion}`,
         origin: ErrorOrigin.ZeroCache,
       },
@@ -1314,6 +1437,22 @@ export class InvalidClientSchemaError extends ProtocolErrorWithLevel {
       {cause},
     );
   }
+}
+
+function cvrErrorKind(e: unknown): string {
+  if (e instanceof ClientNotFoundError) {
+    return 'client_not_found';
+  }
+  if (e instanceof ConcurrentModificationException) {
+    return 'concurrent_modification';
+  }
+  if (e instanceof OwnershipError) {
+    return 'ownership';
+  }
+  if (e instanceof InvalidClientSchemaError) {
+    return 'invalid_client_schema';
+  }
+  return 'error';
 }
 
 export class RowsVersionBehindError extends Error {

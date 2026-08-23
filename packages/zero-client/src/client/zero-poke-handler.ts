@@ -7,12 +7,14 @@ import type {
 import type {PatchOperation} from '../../../replicache/src/patch-operation.ts';
 import type {ClientID} from '../../../replicache/src/sync/ids.ts';
 import {unreachable} from '../../../shared/src/asserts.ts';
-import type {JSONValue} from '../../../shared/src/json.ts';
+import * as v from '../../../shared/src/valita.ts';
 import type {MutationPatch} from '../../../zero-protocol/src/mutations-patch.ts';
-import type {
-  PokeEndBody,
-  PokePartBody,
-  PokeStartBody,
+import {
+  pokePartsSchema,
+  type PokeEndBody,
+  type PokePartBody,
+  type PokeParts,
+  type PokeStartBody,
 } from '../../../zero-protocol/src/poke.ts';
 import type {QueriesPatchOp} from '../../../zero-protocol/src/queries-patch.ts';
 import type {RowPatchOp} from '../../../zero-protocol/src/row-patch.ts';
@@ -35,6 +37,17 @@ type PokeAccumulator = {
   readonly pokeEnd: PokeEndBody;
 };
 
+type ReceivingPoke = {
+  readonly pokeStart: PokeStartBody;
+  readonly parts: PokePartBody[];
+  readonly chunks: Uint8Array[];
+};
+
+export type PokeEndResult = {
+  readonly lastMutationIDChangeForSelf: number | undefined;
+  readonly hasRows: boolean;
+};
+
 /**
  * Handles the multi-part format of zero pokes.
  * As an optimization it also debounces pokes, only poking Replicache with a
@@ -49,7 +62,7 @@ export class PokeHandler {
   readonly #onPokeError: (error: unknown) => void;
   readonly #clientID: ClientID;
   readonly #lc: LogContext;
-  #receivingPoke: Omit<PokeAccumulator, 'pokeEnd'> | undefined = undefined;
+  #receivingPoke: ReceivingPoke | undefined = undefined;
   readonly #pokeBuffer: PokeAccumulator[] = [];
   #pokePlaybackLoopRunning = false;
   #lastScheduledTimestamp = 0;
@@ -91,6 +104,7 @@ export class PokeHandler {
     this.#receivingPoke = {
       pokeStart,
       parts: [],
+      chunks: [],
     };
   }
 
@@ -103,11 +117,27 @@ export class PokeHandler {
       );
       return;
     }
+    if (this.#receivingPoke.chunks.length > 0) {
+      this.#handlePokeError('received both pokePart and binary poke chunks');
+      return;
+    }
     this.#receivingPoke.parts.push(pokePart);
     return pokePart.lastMutationIDChanges?.[this.#clientID];
   }
 
-  handlePokeEnd(pokeEnd: PokeEndBody): void {
+  handlePokeChunk(chunk: Uint8Array): void {
+    if (!this.#receivingPoke) {
+      this.#handlePokeError('received a binary poke chunk without pokeStart');
+      return;
+    }
+    if (this.#receivingPoke.parts.length > 0) {
+      this.#handlePokeError('received both pokePart and binary poke chunks');
+      return;
+    }
+    this.#receivingPoke.chunks.push(chunk);
+  }
+
+  handlePokeEnd(pokeEnd: PokeEndBody): PokeEndResult | undefined {
     if (pokeEnd.pokeID !== this.#receivingPoke?.pokeStart.pokeID) {
       this.#handlePokeError(
         `pokeEnd for ${pokeEnd.pokeID}, when receiving ${
@@ -120,11 +150,28 @@ export class PokeHandler {
       this.#receivingPoke = undefined;
       return;
     }
-    this.#pokeBuffer.push({...this.#receivingPoke, pokeEnd});
+    const receivingPoke = this.#receivingPoke;
+    let parts = receivingPoke.parts;
+    if (receivingPoke.chunks.length > 0) {
+      try {
+        parts = decodePokeChunks(receivingPoke.chunks);
+      } catch (e) {
+        this.#handlePokeError(e);
+        return;
+      }
+    }
+
+    const result = summarizePoke(parts, this.#clientID);
+    this.#pokeBuffer.push({
+      pokeStart: receivingPoke.pokeStart,
+      parts,
+      pokeEnd,
+    });
     this.#receivingPoke = undefined;
     if (!this.#pokePlaybackLoopRunning) {
       this.#startPlaybackLoop();
     }
+    return result;
   }
 
   handleDisconnect(): void {
@@ -212,6 +259,33 @@ export class PokeHandler {
   }
 }
 
+function decodePokeChunks(chunks: Uint8Array[]): PokeParts {
+  const decoder = new TextDecoder('utf-8', {fatal: true});
+  const decoded = new Array<string>(chunks.length + 1);
+  for (let i = 0; i < chunks.length; i++) {
+    decoded[i] = decoder.decode(chunks[i], {stream: true});
+  }
+  decoded[chunks.length] = decoder.decode();
+  chunks.length = 0;
+  return v.parse(JSON.parse(decoded.join('')), pokePartsSchema, 'passthrough');
+}
+
+function summarizePoke(
+  parts: PokePartBody[],
+  clientID: ClientID,
+): PokeEndResult {
+  let lastMutationIDChangeForSelf: number | undefined;
+  let hasRows = false;
+  for (const part of parts) {
+    const lmid = part.lastMutationIDChanges?.[clientID];
+    if (lmid !== undefined) {
+      lastMutationIDChangeForSelf = lmid;
+    }
+    hasRows ||= Boolean(part.rowsPatch?.length);
+  }
+  return {lastMutationIDChangeForSelf, hasRows};
+}
+
 export function mergePokes(
   pokeBuffer: PokeAccumulator[],
   schema: Schema,
@@ -223,7 +297,8 @@ export function mergePokes(
     return undefined;
   }
   const {baseCookie} = pokeBuffer[0].pokeStart;
-  const lastPoke = pokeBuffer[pokeBuffer.length - 1];
+  // oxlint-disable-next-line typescript/no-non-null-assertion
+  const lastPoke = pokeBuffer.at(-1)!;
   const {cookie} = lastPoke.pokeEnd;
   const mergedPatch: PatchOperationInternal[] = [];
   const mergedLastMutationIDChanges: Record<string, number> = {};
@@ -273,9 +348,14 @@ export function mergePokes(
       }
       if (pokePart.rowsPatch) {
         for (const p of pokePart.rowsPatch) {
-          mergedPatch.push(
-            rowsPatchOpToReplicachePatchOp(p, schema, serverToClient),
+          const patchOp = rowsPatchOpToReplicachePatchOp(
+            p,
+            schema,
+            serverToClient,
           );
+          if (patchOp) {
+            mergedPatch.push(patchOp);
+          }
         }
       }
       if (pokePart.mutationsPatch) {
@@ -348,11 +428,17 @@ function rowsPatchOpToReplicachePatchOp(
   op: RowPatchOp,
   schema: Schema,
   serverToClient: NameMapper,
-): PatchOperationInternal {
+): PatchOperationInternal | undefined {
   if (op.op === 'clear') {
     return op;
   }
-  const tableName = serverToClient.tableName(op.tableName, op as JSONValue);
+  // Skip rows for tables not in the client schema. This can happen when
+  // the server-side query AST references tables (e.g. issueNotifications)
+  // that are not yet part of the client schema definition.
+  const tableName = serverToClient.tableNameIfKnown(op.tableName);
+  if (!tableName) {
+    return undefined;
+  }
   switch (op.op) {
     case 'del':
       return {

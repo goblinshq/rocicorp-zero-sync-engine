@@ -1,5 +1,4 @@
-import {bench, run, summary} from 'mitata';
-import {expect, test} from 'vitest';
+import {bench, describe} from '../../shared/src/bench.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
 import {must} from '../../shared/src/must.ts';
 import {computeZqlSpecs} from '../../zero-cache/src/db/lite-tables.ts';
@@ -44,7 +43,7 @@ const costModel = createSQLiteCostModel(dbs.sqlite, tableSpecs);
 const clientToServerMapper = clientToServer(schema.tables);
 
 // Helper to benchmark planning time
-function benchmarkPlanning<TTable extends keyof typeof schema.tables & string>(
+function benchmarkPlanning<TTable extends keyof typeof schema.tables>(
   name: string,
   query: Query<TTable, typeof schema>,
 ) {
@@ -61,7 +60,7 @@ function benchmarkPlanning<TTable extends keyof typeof schema.tables & string>(
   });
 }
 
-summary(() => {
+describe('planner cost', () => {
   benchmarkPlanning(
     '1 exists: track.exists(album)',
     queries.track.whereExists('album'),
@@ -227,25 +226,4 @@ summary(() => {
       ),
     ),
   );
-});
-
-// Check if JSON output is requested via environment variable
-const format = process.env.BENCH_OUTPUT_FORMAT;
-
-if (format === 'json') {
-  // Output JSON without samples for smaller, cleaner output
-  await run({
-    format: {
-      json: {
-        samples: false,
-        debug: false,
-      },
-    },
-  });
-} else {
-  await run();
-}
-
-test('no-op', () => {
-  expect(true).toBe(true);
 });

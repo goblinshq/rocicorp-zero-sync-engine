@@ -13,17 +13,17 @@ import {
 } from '../../../../zero-protocol/src/error.ts';
 import * as MutationType from '../../../../zero-protocol/src/mutation-type-enum.ts';
 import {
-  primaryKeyValueSchema,
-  type PrimaryKeyValue,
-} from '../../../../zero-protocol/src/primary-key.ts';
-import {
   type CRUDMutation,
   type DeleteOp,
   type InsertOp,
   type Mutation,
   type UpdateOp,
   type UpsertOp,
-} from '../../../../zero-protocol/src/push.ts';
+} from '../../../../zero-protocol/src/mutation.ts';
+import {
+  primaryKeyValueSchema,
+  type PrimaryKeyValue,
+} from '../../../../zero-protocol/src/primary-key.ts';
 import type {DatabaseStorage} from '../../../../zqlite/src/database-storage.ts';
 import {Database} from '../../../../zqlite/src/db.ts';
 import {
@@ -329,7 +329,9 @@ export async function processMutationWithTx(
       return await stmt.execute();
     } finally {
       const q = stmt as unknown as Query;
-      lc.debug?.(`${q.string}: ${JSON.stringify(q.parameters)}`);
+      // `q.parameters` are the bound row values -- log the parameterized
+      // statement and the parameter count, never the values themselves.
+      lc.debug?.(`${q.string} (${q.parameters.length} params)`);
     }
   }
 
@@ -388,7 +390,10 @@ export function getInsertSQL(
   tx: postgres.TransactionSql,
   create: InsertOp,
 ): postgres.PendingQuery<postgres.Row[]> {
-  return tx`INSERT INTO ${tx(create.tableName)} ${tx(create.value)}`;
+  return tx`
+    INSERT INTO ${tx(create.tableName)} ${tx(create.value)}
+    ON CONFLICT (${tx(create.primaryKey)}) DO NOTHING
+  `;
 }
 
 export function getUpsertSQL(

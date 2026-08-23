@@ -15,11 +15,18 @@ import {
 } from '../../../shared/src/logging-test-utils.ts';
 import * as v from '../../../shared/src/valita.ts';
 import {ErrorKind} from '../../../zero-protocol/src/error-kind.ts';
+import {ErrorOrigin} from '../../../zero-protocol/src/error-origin.ts';
 import {ErrorReason} from '../../../zero-protocol/src/error-reason.ts';
 import {
   ProtocolError,
   isProtocolError,
 } from '../../../zero-protocol/src/error.ts';
+import {mutateResponseSchema} from '../../../zero-protocol/src/mutate-server.ts';
+import {queryResponseSchema} from '../../../zero-protocol/src/query-server.ts';
+import type {
+  ConnectionContext,
+  HeaderOptions,
+} from '../services/view-syncer/connection-context-manager.ts';
 import type {ShardID} from '../types/shards.ts';
 import {
   compileUrlPattern,
@@ -27,6 +34,7 @@ import {
   getBodyPreview,
   urlMatch,
 } from './fetch.ts';
+import * as apiMetrics from './metrics.ts';
 
 const mockFetch = vi.fn() as MockedFunction<typeof fetch>;
 vi.stubGlobal('fetch', mockFetch);
@@ -34,6 +42,38 @@ vi.stubGlobal('fetch', mockFetch);
 const shard: ShardID = {appID: 'test_app', shardNum: 1};
 const baseUrl = 'https://api.example.com/endpoint';
 const allowedPatterns = [compileUrlPattern(baseUrl)];
+
+function mockApiMetrics() {
+  const requestsAdd = vi.fn();
+  const requestDurationRecordMs = vi.fn();
+  const attemptsAdd = vi.fn();
+  const attemptDurationRecordMs = vi.fn();
+  const inFlightAdd = vi.fn();
+
+  vi.spyOn(apiMetrics, 'apiRequests').mockReturnValue({
+    add: requestsAdd,
+  } as unknown as ReturnType<typeof apiMetrics.apiRequests>);
+  vi.spyOn(apiMetrics, 'apiRequestDuration').mockReturnValue({
+    recordMs: requestDurationRecordMs,
+  } as unknown as ReturnType<typeof apiMetrics.apiRequestDuration>);
+  vi.spyOn(apiMetrics, 'apiAttempts').mockReturnValue({
+    add: attemptsAdd,
+  } as unknown as ReturnType<typeof apiMetrics.apiAttempts>);
+  vi.spyOn(apiMetrics, 'apiAttemptDuration').mockReturnValue({
+    recordMs: attemptDurationRecordMs,
+  } as unknown as ReturnType<typeof apiMetrics.apiAttemptDuration>);
+  vi.spyOn(apiMetrics, 'apiInFlight').mockReturnValue({
+    add: inFlightAdd,
+  } as unknown as ReturnType<typeof apiMetrics.apiInFlight>);
+
+  return {
+    requestsAdd,
+    requestDurationRecordMs,
+    attemptsAdd,
+    attemptDurationRecordMs,
+    inFlightAdd,
+  };
+}
 
 afterAll(() => {
   vi.unstubAllGlobals();
@@ -43,9 +83,70 @@ describe('fetchFromAPIServer', () => {
   const lc = createSilentLogContext();
   const body = {test: 'data'};
   const validator = v.object({success: v.boolean()});
+  let metrics: ReturnType<typeof mockApiMetrics>;
+
+  type FetchContextOptions = {
+    url?: string | undefined;
+    allowedUrlPatterns?: URLPattern[] | undefined;
+    headerOptions?: HeaderOptions | undefined;
+    auth?: string | undefined;
+    userID?: string | undefined;
+  };
+
+  function makeContext(options: FetchContextOptions = {}): ConnectionContext {
+    const url = options.url ?? baseUrl;
+    const allowedUrlPatterns = options.allowedUrlPatterns ?? allowedPatterns;
+    const headerOptions = options.headerOptions ?? {};
+
+    return {
+      state: 'provisional',
+      clientID: 'test-client',
+      wsID: 'test-ws',
+      user: {id: options.userID ?? null},
+      auth: options.auth ? {type: 'opaque', raw: options.auth} : undefined,
+      profileID: null,
+      baseCookie: null,
+      protocolVersion: 0,
+      revision: 0,
+      revalidateAt: undefined,
+      insertionOrder: 0,
+      queryContext: {
+        url,
+        allowedUrlPatterns,
+        headerOptions,
+      },
+      mutateContext: {
+        url,
+        allowedUrlPatterns,
+        headerOptions,
+      },
+    };
+  }
+
+  function fetchWithContext<
+    TValidator extends Parameters<typeof fetchFromAPIServer>[0],
+  >(
+    validator: TValidator,
+    source: Parameters<typeof fetchFromAPIServer>[1],
+    metricsOptions: Parameters<typeof fetchFromAPIServer>[6],
+    options: FetchContextOptions = {},
+    requestBody: typeof body = body,
+  ) {
+    return fetchFromAPIServer(
+      validator,
+      source,
+      lc,
+      makeContext(options),
+      shard,
+      requestBody,
+      metricsOptions,
+    );
+  }
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     mockFetch.mockReset();
+    metrics = mockApiMetrics();
     vi.useRealTimers();
   });
 
@@ -55,19 +156,17 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify(responsePayload), {status: 200}),
     );
 
-    const result = await fetchFromAPIServer(
+    const result = await fetchWithContext(
       validator,
       'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
+      {operation: 'mutate'},
       {
-        apiKey: 'key-123',
-        token: 'token-abc',
-        cookie: 'session=xyz',
+        headerOptions: {
+          apiKey: 'key-123',
+          cookie: 'session=xyz',
+        },
+        auth: 'token-abc',
       },
-      body,
     );
 
     expect(result).toEqual(responsePayload);
@@ -86,21 +185,454 @@ describe('fetchFromAPIServer', () => {
     });
   });
 
+  test('records API metrics for successful requests', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({success: true}), {status: 200}),
+    );
+
+    await fetchWithContext(validator, 'push', {operation: 'mutate'});
+
+    expect(metrics.inFlightAdd).toHaveBeenNthCalledWith(1, 1, {
+      operation: 'mutate',
+    });
+    expect(metrics.inFlightAdd).toHaveBeenNthCalledWith(2, -1, {
+      operation: 'mutate',
+    });
+    expect(metrics.attemptsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        operation: 'mutate',
+        attempt: 1,
+        result: 'success',
+        will_retry: false,
+        http_status_code: 200,
+        http_status_class: '2xx',
+      }),
+    );
+    expect(metrics.attemptDurationRecordMs).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({result: 'success'}),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        operation: 'mutate',
+        result: 'success',
+        attempt_count: 1,
+        http_status_code: 200,
+        http_status_class: '2xx',
+      }),
+    );
+    expect(metrics.requestDurationRecordMs).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({result: 'success'}),
+    );
+  });
+
+  test('records retry attempts and final success', async () => {
+    vi.useFakeTimers();
+    mockFetch
+      .mockResolvedValueOnce(new Response('bad gateway', {status: 502}))
+      .mockResolvedValueOnce(new Response('bad gateway', {status: 502}))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({success: true}), {status: 200}),
+      );
+
+    const promise = fetchWithContext(validator, 'push', {operation: 'mutate'});
+
+    await vi.advanceTimersByTimeAsync(2400);
+    await promise;
+
+    expect(metrics.attemptsAdd).toHaveBeenCalledTimes(3);
+    expect(metrics.attemptsAdd).toHaveBeenNthCalledWith(
+      1,
+      1,
+      expect.objectContaining({
+        attempt: 1,
+        result: 'http_error',
+        will_retry: true,
+        http_status_code: 502,
+      }),
+    );
+    expect(metrics.attemptsAdd).toHaveBeenNthCalledWith(
+      2,
+      1,
+      expect.objectContaining({
+        attempt: 2,
+        result: 'http_error',
+        will_retry: true,
+        http_status_code: 502,
+      }),
+    );
+    expect(metrics.attemptsAdd).toHaveBeenNthCalledWith(
+      3,
+      1,
+      expect.objectContaining({
+        attempt: 3,
+        result: 'success',
+        will_retry: false,
+        http_status_code: 200,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'success',
+        attempt_count: 3,
+      }),
+    );
+  });
+
+  test('records exhausted HTTP retries as http_error', async () => {
+    vi.useFakeTimers();
+    mockFetch.mockResolvedValue(new Response('bad gateway', {status: 502}));
+
+    const promise = fetchWithContext(validator, 'push', {operation: 'mutate'});
+
+    await Promise.all([
+      expect(promise).rejects.toThrow(/non-OK status 502/),
+      vi.advanceTimersByTimeAsync(5000),
+    ]);
+
+    expect(metrics.attemptsAdd).toHaveBeenCalledTimes(4);
+    expect(metrics.attemptsAdd).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({
+        attempt: 4,
+        result: 'http_error',
+        will_retry: false,
+        http_status_code: 502,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'http_error',
+        attempt_count: 4,
+        http_status_code: 502,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.HTTP,
+      }),
+    );
+  });
+
+  test('records fetch failed retry attempts', async () => {
+    vi.useFakeTimers();
+    mockFetch
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({success: true}), {status: 200}),
+      );
+
+    const promise = fetchWithContext(validator, 'push', {operation: 'mutate'});
+
+    await vi.advanceTimersByTimeAsync(1200);
+    await promise;
+
+    expect(metrics.attemptsAdd).toHaveBeenNthCalledWith(
+      1,
+      1,
+      expect.objectContaining({
+        attempt: 1,
+        result: 'fetch_error',
+        will_retry: true,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'success',
+        attempt_count: 2,
+      }),
+    );
+  });
+
+  test('records parse failures as parse_error', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('not-json', {status: 200}));
+
+    await expect(
+      fetchWithContext(validator, 'push', {operation: 'mutate'}),
+    ).rejects.toThrow(/Failed to parse response/);
+
+    expect(metrics.attemptsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'parse_error',
+        http_status_code: 200,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.Parse,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'parse_error',
+        attempt_count: 1,
+        http_status_code: 200,
+      }),
+    );
+  });
+
+  test('records URL allowlist failures without attempts', async () => {
+    await expect(
+      fetchWithContext(
+        validator,
+        'push',
+        {
+          operation: 'mutate',
+        },
+        {
+          url: 'https://evil.example.com/endpoint',
+        },
+      ),
+    ).rejects.toThrow(/not allowed by the ZERO_MUTATE_URL configuration/);
+
+    expect(metrics.attemptsAdd).not.toHaveBeenCalled();
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        operation: 'mutate',
+        result: 'url_not_allowed',
+        attempt_count: 0,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.Internal,
+      }),
+    );
+  });
+
+  test('records reserved query params as config_error without attempts', async () => {
+    await expect(
+      fetchWithContext(
+        validator,
+        'push',
+        {operation: 'mutate'},
+        {url: `${baseUrl}?schema=value`},
+      ),
+    ).rejects.toThrow(/reserved query param "schema"/);
+
+    expect(metrics.attemptsAdd).not.toHaveBeenCalled();
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        operation: 'mutate',
+        result: 'config_error',
+        attempt_count: 0,
+      }),
+    );
+  });
+
+  test('records cleanup type labels', async () => {
+    mockFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({success: true})))
+      .mockResolvedValueOnce(new Response(JSON.stringify({success: true})));
+
+    await fetchWithContext(validator, 'push', {
+      operation: 'cleanup',
+      cleanupType: 'single',
+    });
+    await fetchWithContext(validator, 'push', {
+      operation: 'cleanup',
+      cleanupType: 'bulk',
+    });
+
+    expect(metrics.requestsAdd).toHaveBeenNthCalledWith(
+      1,
+      1,
+      expect.objectContaining({
+        operation: 'cleanup',
+        cleanup_type: 'single',
+        result: 'success',
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenNthCalledWith(
+      2,
+      1,
+      expect.objectContaining({
+        operation: 'cleanup',
+        cleanup_type: 'bulk',
+        result: 'success',
+      }),
+    );
+  });
+
+  test('records validate_auth operation labels', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({success: true}), {status: 200}),
+    );
+
+    await fetchWithContext(validator, 'transform', {
+      operation: 'validate_auth',
+    });
+
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        operation: 'validate_auth',
+        result: 'success',
+      }),
+    );
+  });
+
+  test('records top-level API error responses as api_error', async () => {
+    const responsePayload = {
+      kind: ErrorKind.PushFailed,
+      origin: ErrorOrigin.ZeroCache,
+      reason: ErrorReason.Internal,
+      message: 'app returned an error',
+      mutationIDs: [],
+    } as const;
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(responsePayload), {status: 200}),
+    );
+
+    const result = await fetchWithContext(mutateResponseSchema, 'push', {
+      operation: 'mutate',
+    });
+
+    expect(result).toEqual(responsePayload);
+    expect(metrics.attemptsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'api_error',
+        http_status_code: 200,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.Internal,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'api_error',
+        attempt_count: 1,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.Internal,
+      }),
+    );
+  });
+
+  test('records legacy push error responses as api_error', async () => {
+    const responsePayload = {
+      error: 'unsupportedPushVersion',
+      mutationIDs: [{clientID: 'client-1', id: 1}],
+    } as const;
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(responsePayload), {status: 200}),
+    );
+
+    const result = await fetchWithContext(mutateResponseSchema, 'push', {
+      operation: 'mutate',
+    });
+
+    expect(result).toEqual(responsePayload);
+    expect(metrics.attemptsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'api_error',
+        http_status_code: 200,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.UnsupportedPushVersion,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'api_error',
+        attempt_count: 1,
+        error_kind: ErrorKind.PushFailed,
+        error_reason: ErrorReason.UnsupportedPushVersion,
+      }),
+    );
+  });
+
+  test('preserves unknown fields from successful API responses', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({success: true, ignored: 'value'}), {
+        status: 200,
+      }),
+    );
+
+    const result = await fetchWithContext(validator, 'push', {
+      operation: 'mutate',
+    });
+
+    expect(result).toEqual({success: true, ignored: 'value'});
+  });
+
+  test('parses legacy query responses through the helper', async () => {
+    const legacyResponse = [
+      'transformed',
+      [
+        {
+          id: 'q1',
+          name: 'issues',
+          ast: {
+            table: 'issue',
+          },
+        },
+      ],
+    ] as const;
+
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(legacyResponse), {status: 200}),
+    );
+
+    const result = await fetchWithContext(queryResponseSchema, 'transform', {
+      operation: 'query',
+    });
+
+    expect(result).toEqual(legacyResponse);
+  });
+
+  test('records legacy transformFailed responses as api_error', async () => {
+    const transformFailedBody = {
+      kind: ErrorKind.TransformFailed,
+      origin: ErrorOrigin.Server,
+      reason: ErrorReason.Parse,
+      message: 'Unable to transform query',
+      queryIDs: ['q1'],
+    } as const;
+    const legacyResponse = ['transformFailed', transformFailedBody] as const;
+
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(legacyResponse), {status: 200}),
+    );
+
+    const result = await fetchWithContext(queryResponseSchema, 'transform', {
+      operation: 'query',
+    });
+
+    expect(result).toEqual(legacyResponse);
+    expect(metrics.attemptsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'api_error',
+        http_status_code: 200,
+        error_kind: ErrorKind.TransformFailed,
+        error_reason: ErrorReason.Parse,
+      }),
+    );
+    expect(metrics.requestsAdd).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        result: 'api_error',
+        attempt_count: 1,
+        error_kind: ErrorKind.TransformFailed,
+        error_reason: ErrorReason.Parse,
+      }),
+    );
+  });
+
   test('preserves existing query params when appending reserved ones', async () => {
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
     const urlWithQuery = `${baseUrl}?foo=bar`;
 
-    await fetchFromAPIServer(
+    await fetchWithContext(
       validator,
       'push',
-      lc,
-      urlWithQuery,
-      allowedPatterns,
-      shard,
-      {},
-      body,
+      {operation: 'mutate'},
+      {url: urlWithQuery},
     );
 
     const calledUrl = mockFetch.mock.calls[0]![0] as string;
@@ -115,44 +647,32 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {},
-      body,
-    );
+    await fetchWithContext(validator, 'push', {operation: 'mutate'});
 
     const init = mockFetch.mock.calls[0]![1];
     expect(init?.headers).toEqual({'Content-Type': 'application/json'});
   });
 
-  test('includes customHeaders in request when allowed', async () => {
+  test('includes forwarded headers in request', async () => {
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
+    await fetchWithContext(
       validator,
       'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
+      {operation: 'mutate'},
       {
-        customHeaders: {
-          'x-vercel-automation-bypass-secret': 'my-secret',
-          'x-custom-header': 'custom-value',
+        headerOptions: {
+          customHeaders: {
+            'x-vercel-automation-bypass-secret': 'my-secret',
+            'x-custom-header': 'custom-value',
+          },
+          requestHeaders: {
+            'x-forwarded-for': '203.0.113.1',
+          },
         },
-        allowedClientHeaders: [
-          'x-vercel-automation-bypass-secret',
-          'x-custom-header',
-        ],
       },
-      body,
     );
 
     const init = mockFetch.mock.calls[0]![1];
@@ -160,6 +680,7 @@ describe('fetchFromAPIServer', () => {
       'Content-Type': 'application/json',
       'x-vercel-automation-bypass-secret': 'my-secret',
       'x-custom-header': 'custom-value',
+      'x-forwarded-for': '203.0.113.1',
     });
   });
 
@@ -168,22 +689,19 @@ describe('fetchFromAPIServer', () => {
       new Response(JSON.stringify({success: true}), {status: 200}),
     );
 
-    await fetchFromAPIServer(
+    await fetchWithContext(
       validator,
       'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
+      {operation: 'mutate'},
       {
-        apiKey: 'api-key',
-        customHeaders: {
-          'x-vercel-automation-bypass-secret': 'my-secret',
+        headerOptions: {
+          apiKey: 'api-key',
+          customHeaders: {
+            'x-vercel-automation-bypass-secret': 'my-secret',
+          },
         },
-        allowedClientHeaders: ['x-vercel-automation-bypass-secret'],
-        token: 'jwt-token',
+        auth: 'jwt-token',
       },
-      body,
     );
 
     const init = mockFetch.mock.calls[0]![1];
@@ -195,134 +713,16 @@ describe('fetchFromAPIServer', () => {
     });
   });
 
-  test('filters out all client headers when allowedClientHeaders is not set', async () => {
-    mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({success: true}), {status: 200}),
-    );
-
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
-        customHeaders: {
-          'x-request-id': '123',
-          'x-custom': 'value',
-        },
-        // allowedClientHeaders not set
-      },
-      body,
-    );
-
-    const init = mockFetch.mock.calls[0]![1];
-    expect(init?.headers).toEqual({
-      'Content-Type': 'application/json',
-    });
-  });
-
-  test('filters out all client headers when allowedClientHeaders is empty', async () => {
-    mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({success: true}), {status: 200}),
-    );
-
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
-        customHeaders: {
-          'x-request-id': '123',
-          'x-custom': 'value',
-        },
-        allowedClientHeaders: [],
-      },
-      body,
-    );
-
-    const init = mockFetch.mock.calls[0]![1];
-    expect(init?.headers).toEqual({
-      'Content-Type': 'application/json',
-    });
-  });
-
-  test('only forwards headers in allowedClientHeaders list', async () => {
-    mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({success: true}), {status: 200}),
-    );
-
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
-        customHeaders: {
-          'x-request-id': '123',
-          'x-forbidden': 'bad',
-          'X-Correlation-ID': 'abc',
-        },
-        allowedClientHeaders: ['x-request-id', 'x-correlation-id'],
-      },
-      body,
-    );
-
-    const init = mockFetch.mock.calls[0]![1];
-    expect(init?.headers).toEqual({
-      'Content-Type': 'application/json',
-      'x-request-id': '123',
-      'X-Correlation-ID': 'abc',
-    });
-  });
-
-  test('header filtering is case-insensitive', async () => {
-    mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({success: true}), {status: 200}),
-    );
-
-    await fetchFromAPIServer(
-      validator,
-      'push',
-      lc,
-      baseUrl,
-      allowedPatterns,
-      shard,
-      {
-        customHeaders: {
-          'X-REQUEST-ID': 'uppercase',
-          'x-custom-header': 'lowercase',
-        },
-        allowedClientHeaders: ['x-request-id', 'X-CUSTOM-HEADER'],
-      },
-      body,
-    );
-
-    const init = mockFetch.mock.calls[0]![1];
-    expect(init?.headers).toEqual({
-      'Content-Type': 'application/json',
-      'X-REQUEST-ID': 'uppercase',
-      'x-custom-header': 'lowercase',
-    });
-  });
-
   test('rejects URLs that are not allowed by configuration for push', async () => {
     await expect(
       fetchFromAPIServer(
         validator,
         'push',
         lc,
-        'https://evil.example.com/endpoint',
-        allowedPatterns,
+        makeContext({url: 'https://evil.example.com/endpoint'}),
         shard,
-        {},
         body,
+        {operation: 'mutate'},
       ),
     ).rejects.toThrow(
       'URL "https://evil.example.com/endpoint" is not allowed by the ZERO_MUTATE_URL configuration',
@@ -336,11 +736,10 @@ describe('fetchFromAPIServer', () => {
         validator,
         'transform',
         lc,
-        'https://evil.example.com/endpoint',
-        allowedPatterns,
+        makeContext({url: 'https://evil.example.com/endpoint'}),
         shard,
-        {},
         body,
+        {operation: 'query'},
       ),
     ).rejects.toThrow(
       'URL "https://evil.example.com/endpoint" is not allowed by the ZERO_QUERY_URL configuration',
@@ -357,11 +756,10 @@ describe('fetchFromAPIServer', () => {
           validator,
           'push',
           lc,
-          url,
-          allowedPatterns,
+          makeContext({url}),
           shard,
-          {},
           body,
+          {operation: 'mutate'},
         ),
       ).rejects.toThrow(
         `The push URL cannot contain the reserved query param "${reserved}"`,
@@ -371,21 +769,12 @@ describe('fetchFromAPIServer', () => {
 
   test('wraps non-OK responses in ProtocolError with http type', async () => {
     mockFetch.mockResolvedValueOnce(
-      new Response('failure-body', {status: 503}),
+      new Response('failure-body', {status: 400}),
     );
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'push', {operation: 'mutate'});
     } catch (error) {
       caught = error;
     }
@@ -403,9 +792,9 @@ describe('fetchFromAPIServer', () => {
       caught.errorBody.reason === ErrorReason.HTTP,
       'Expected zeroCache HTTP error',
     );
-    expect(caught.errorBody.status).toBe(503);
+    expect(caught.errorBody.status).toBe(400);
     expect(caught.errorBody.bodyPreview).toBe('failure-body');
-    expect(caught.errorBody.message).toMatch(/non-OK status 503/);
+    expect(caught.errorBody.message).toMatch(/non-OK status 400/);
   });
 
   test('wraps JSON parse failures in ProtocolError with parse type', async () => {
@@ -417,16 +806,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'push', {operation: 'mutate'});
     } catch (error) {
       caught = error;
     }
@@ -452,16 +832,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'transform', {operation: 'query'});
     } catch (error) {
       caught = error;
     }
@@ -484,16 +855,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'transform', {operation: 'query'});
     } catch (error) {
       caught = error;
     }
@@ -520,16 +882,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        strictValidator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(strictValidator, 'push', {operation: 'mutate'});
     } catch (error) {
       caught = error;
     }
@@ -554,16 +907,9 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        strictValidator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(strictValidator, 'transform', {
+        operation: 'query',
+      });
     } catch (error) {
       caught = error;
     }
@@ -585,16 +931,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'push', {operation: 'mutate'});
     } catch (error) {
       caught = error;
     }
@@ -616,16 +953,7 @@ describe('fetchFromAPIServer', () => {
 
     let caught: unknown;
     try {
-      await fetchFromAPIServer(
-        validator,
-        'transform',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      await fetchWithContext(validator, 'transform', {operation: 'query'});
     } catch (error) {
       caught = error;
     }
@@ -647,59 +975,26 @@ describe('fetchFromAPIServer', () => {
       vi.useFakeTimers();
     });
 
-    test('retries on 502 and succeeds', async () => {
-      mockFetch
-        .mockResolvedValueOnce(new Response('bad gateway', {status: 502}))
-        .mockResolvedValueOnce(new Response('bad gateway', {status: 502}))
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({success: true}), {status: 200}),
-        );
+    test.each([500, 502, 503, 504, 599])(
+      'retries on %i and succeeds',
+      async status => {
+        mockFetch
+          .mockResolvedValueOnce(new Response('server error', {status}))
+          .mockResolvedValueOnce(
+            new Response(JSON.stringify({success: true}), {status: 200}),
+          );
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+        const promise = fetchWithContext(validator, 'push', {
+          operation: 'mutate',
+        });
 
-      // 1st retry
-      await vi.advanceTimersByTimeAsync(1200);
-      // 2nd retry
-      await vi.advanceTimersByTimeAsync(1200);
+        await vi.advanceTimersByTimeAsync(1200);
 
-      const result = await promise;
-      expect(result).toEqual({success: true});
-      expect(mockFetch).toHaveBeenCalledTimes(3);
-    });
-
-    test('retries on 504 and succeeds', async () => {
-      mockFetch
-        .mockResolvedValueOnce(new Response('gateway timeout', {status: 504}))
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({success: true}), {status: 200}),
-        );
-
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
-
-      await vi.advanceTimersByTimeAsync(1200);
-
-      const result = await promise;
-      expect(result).toEqual({success: true});
-      expect(mockFetch).toHaveBeenCalledTimes(2);
-    });
+        const result = await promise;
+        expect(result).toEqual({success: true});
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      },
+    );
 
     test('retries on fetch failed and succeeds', async () => {
       mockFetch
@@ -708,16 +1003,9 @@ describe('fetchFromAPIServer', () => {
           new Response(JSON.stringify({success: true}), {status: 200}),
         );
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push', {
+        operation: 'mutate',
+      });
 
       await vi.advanceTimersByTimeAsync(1200);
 
@@ -729,16 +1017,9 @@ describe('fetchFromAPIServer', () => {
     test('fails after max retries (status code)', async () => {
       mockFetch.mockResolvedValue(new Response('bad gateway', {status: 502}));
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push', {
+        operation: 'mutate',
+      });
 
       // Exhaust all retries
       await Promise.all([
@@ -753,16 +1034,9 @@ describe('fetchFromAPIServer', () => {
     test('fails after max retries (fetch failed)', async () => {
       mockFetch.mockRejectedValue(new TypeError('fetch failed'));
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push', {
+        operation: 'mutate',
+      });
 
       // Exhaust all retries
       await Promise.all([
@@ -777,16 +1051,9 @@ describe('fetchFromAPIServer', () => {
     test('does not retry on other errors', async () => {
       mockFetch.mockResolvedValue(new Response('bad request', {status: 400}));
 
-      const promise = fetchFromAPIServer(
-        validator,
-        'push',
-        lc,
-        baseUrl,
-        allowedPatterns,
-        shard,
-        {},
-        body,
-      );
+      const promise = fetchWithContext(validator, 'push', {
+        operation: 'mutate',
+      });
 
       await expect(promise).rejects.toThrow(/non-OK status 400/);
       expect(mockFetch).toHaveBeenCalledTimes(1);

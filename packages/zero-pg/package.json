@@ -1,25 +1,29 @@
 {
   "name": "zero-pg",
-  "description": "Library to help implement custom mutators in a user's API server when they are using Postgres as their database.",
   "version": "0.0.0",
   "private": true,
+  "description": "Library to help implement custom mutators in a user's API server when they are using Postgres as their database.",
   "type": "module",
   "scripts": {
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
     "check-types": "tsc",
     "check-types:watch": "tsc --watch",
-    "lint": "oxlint --type-aware src/",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts src/",
     "test": "vitest run",
-    "test:watch": "vitest watch"
+    "test:watch": "vitest watch",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
-    "@rocicorp/logger": "^5.4.0"
+    "@rocicorp/logger": "^6.1.0"
   },
   "devDependencies": {
-    "@vitest/runner": "4.0.15",
-    "vitest": "4.0.15",
-    "zero-cache": "0.0.0",
-    "zero-server": "0.0.0"
-  }
+    "@vitest/runner": "^4.1.6",
+    "oxfmt": "^0.45.0",
+    "vitest": "^4.1.6",
+    "zero-cache": "workspace:*",
+    "zero-server": "workspace:*"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

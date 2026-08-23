@@ -1,6 +1,10 @@
-import type {LogContext} from '@rocicorp/logger';
+import {LogContext} from '@rocicorp/logger';
 import {afterEach, beforeEach, describe, expect, test} from 'vitest';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
+import {AbortError} from '../../../shared/src/abort-error.ts';
+import {
+  createSilentLogContext,
+  TestLogSink,
+} from '../../../shared/src/logging-test-utils.ts';
 import type {Database as Db} from '../../../zqlite/src/db.ts';
 import {DbFile} from '../test/lite.ts';
 import {
@@ -254,4 +258,171 @@ describe('db/migration-lite', () => {
       db.close();
     });
   }
+
+  const thrownValue = {type: 'custom-throw-value'};
+
+  type ErrorCase = {
+    name: string;
+    setup: Migration;
+    verify: (err: unknown) => void;
+  };
+
+  const errorCases: ErrorCase[] = [
+    {
+      name: 'preserves sqlite error for internal rollback',
+      setup: {
+        migrateSchema: (_log, db) => {
+          db.exec(`
+            CREATE TABLE "AutoRollback" (
+              id INTEGER PRIMARY KEY
+            );
+
+            CREATE TRIGGER "AutoRollbackTrigger"
+            BEFORE INSERT ON "AutoRollback"
+            BEGIN
+              SELECT RAISE(ROLLBACK, 'auto rollback');
+            END;
+          `);
+          db.prepare(`INSERT INTO "AutoRollback" (id) VALUES (1)`).run();
+        },
+      },
+      verify: err => {
+        expect(err).toBeInstanceOf(Error);
+        expect(String(err)).toContain('auto rollback');
+        expect(String(err)).toContain(
+          'cannot rollback - no transaction is active',
+        );
+        expect(String((err as Error).cause)).toContain('auto rollback');
+      },
+    },
+    {
+      name: 'preserves sqlite error without internal rollback',
+      setup: {
+        migrateSchema: (_log, db) => {
+          db.exec(`
+            CREATE TABLE "NoAutoRollback" (
+              id INTEGER PRIMARY KEY,
+              email TEXT UNIQUE
+            );
+          `);
+          db.prepare(
+            `INSERT INTO "NoAutoRollback" (id, email) VALUES (1, 'a@example.com')`,
+          ).run();
+          db.prepare(
+            `INSERT INTO "NoAutoRollback" (id, email) VALUES (2, 'a@example.com')`,
+          ).run();
+        },
+      },
+      verify: err => {
+        expect(String(err)).toContain('UNIQUE constraint failed');
+      },
+    },
+    {
+      name: 'preserves synchronous javascript error',
+      setup: {
+        migrateSchema: () => {
+          throw new Error('sync javascript error');
+        },
+      },
+      verify: err => {
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).toBe('sync javascript error');
+      },
+    },
+    {
+      name: 'preserves asynchronous javascript error',
+      setup: {
+        migrateData: async () => {
+          await Promise.resolve();
+          throw new Error('async javascript error');
+        },
+      },
+      verify: err => {
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).toBe('async javascript error');
+      },
+    },
+    {
+      name: 'preserves non-Error thrown values',
+      setup: {
+        migrateSchema: () => {
+          throw thrownValue;
+        },
+      },
+      verify: err => {
+        expect(err).toBe(thrownValue);
+      },
+    },
+  ];
+
+  test.each(errorCases)('$name', async c => {
+    let err: unknown;
+    try {
+      await runSchemaMigrations(
+        createSilentLogContext(),
+        debugName,
+        dbFile.path,
+        c.setup,
+        {1: {}},
+      );
+    } catch (e) {
+      err = e;
+    }
+
+    expect(err).toBeDefined();
+    c.verify(err);
+  });
+
+  test('AbortError is logged at warn, not error', async () => {
+    // AbortErrors (e.g. AutoResetSignal signaling that the replica needs a
+    // reset) are an expected, self-healing control-flow signal and must not be
+    // logged at `error`, which would trip error-based alerting.
+    const sink = new TestLogSink();
+    const lc = new LogContext('debug', undefined, sink);
+
+    const abort = new AbortError('replica database appears corrupt');
+    let caught: unknown;
+    try {
+      await runSchemaMigrations(
+        lc,
+        debugName,
+        dbFile.path,
+        {migrateSchema: () => Promise.reject(abort)},
+        {1: {}},
+      );
+    } catch (e) {
+      caught = e;
+    }
+
+    // The signal still propagates so the caller can resync.
+    expect(caught).toBe(abort);
+
+    const errors = sink.messages.filter(([level]) => level === 'error');
+    const warns = sink.messages.filter(([level]) => level === 'warn');
+    expect(errors).toEqual([]);
+    expect(warns.some(([, , args]) => args.includes(abort))).toBe(true);
+  });
+
+  test('non-AbortError is logged at error', async () => {
+    const sink = new TestLogSink();
+    const lc = new LogContext('debug', undefined, sink);
+
+    const err = new Error('genuine migration failure');
+    let caught: unknown;
+    try {
+      await runSchemaMigrations(
+        lc,
+        debugName,
+        dbFile.path,
+        {migrateSchema: () => Promise.reject(err)},
+        {1: {}},
+      );
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBe(err);
+    const errors = sink.messages.filter(([level]) => level === 'error');
+    expect(errors.some(([, , args]) => args.includes(err))).toBe(true);
+  });
 });

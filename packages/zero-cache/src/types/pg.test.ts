@@ -1,9 +1,87 @@
-import {describe, expect, test} from 'vitest';
 import {
+  createServer,
+  type AddressInfo,
+  type Server,
+  type Socket,
+} from 'node:net';
+import {LogContext} from '@rocicorp/logger';
+import postgres from 'postgres';
+import {afterEach, describe, expect, test} from 'vitest';
+import {
+  createSilentLogContext,
+  TestLogSink,
+} from '../../../shared/src/logging-test-utils.ts';
+import {
+  inactivityTimeoutSocket,
+  isPostgresConfigError,
   millisecondsToPostgresTime,
   postgresTimeToMilliseconds,
+  postgresTypeConfig,
   timestampToFpMillis,
 } from './pg.ts';
+
+function postgresError(code: string) {
+  return Object.assign(new postgres.PostgresError('test error'), {
+    code,
+    severity: 'ERROR',
+    severity_local: 'ERROR',
+  });
+}
+
+function connectionError(code: string) {
+  return Object.assign(new Error(`connection failed: ${code}`), {code});
+}
+
+describe('isPostgresConfigError', () => {
+  test.each([
+    '08000',
+    '08001',
+    '08003',
+    '08006',
+    '28000',
+    '28P01',
+    '3D000',
+    '42501',
+    '53300',
+    '53400',
+  ])('treats %s as configuration-related', code => {
+    expect(isPostgresConfigError(postgresError(code))).toBe(true);
+  });
+
+  test.each([
+    'CONNECT_TIMEOUT',
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'EHOSTUNREACH',
+    'ENETUNREACH',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'ETIMEDOUT',
+    'ERR_TLS_CERT_ALTNAME_INVALID',
+    'SELF_SIGNED_CERT_IN_CHAIN',
+    'DEPTH_ZERO_SELF_SIGNED_CERT',
+    'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  ])('treats %s connection errors as configuration-related', code => {
+    expect(isPostgresConfigError(connectionError(code))).toBe(true);
+  });
+
+  test.each(['42P01', '42703', '57P01', '57P03', 'XX000'])(
+    'does not treat %s as configuration-related',
+    code => {
+      expect(isPostgresConfigError(postgresError(code))).toBe(false);
+    },
+  );
+
+  test('does not treat non-startup connection errors as configuration-related', () => {
+    expect(isPostgresConfigError(connectionError('CONNECTION_CLOSED'))).toBe(
+      false,
+    );
+  });
+
+  test('does not treat non-Postgres errors as configuration-related', () => {
+    expect(isPostgresConfigError(new Error('boom'))).toBe(false);
+  });
+});
 
 describe('timestampToFpMillis', () => {
   test.each([
@@ -21,8 +99,65 @@ describe('timestampToFpMillis', () => {
     ['2024-12-05 16:38:21.907-05', 1733434701907],
     ['2024-12-05 16:38:21.907-05:30', 1733436501907],
   ])('parse timestamp: %s', (timestamp, result) => {
-    // expect(new PreciseDate(timestamp).getTime()).toBe(Math.floor(result));
     expect(timestampToFpMillis(timestamp)).toBe(result);
+  });
+
+  test.each([
+    // No fractional seconds
+    ['2024-01-15 12:00:00', 1705320000000],
+    ['2024-01-15 12:00:00+00', 1705320000000],
+
+    // Whole milliseconds only
+    ['2024-01-15 12:00:00.5', 1705320000500],
+    ['2024-01-15 12:00:00.123', 1705320000123],
+  ])('parse timestamp without microseconds: %s', (timestamp, result) => {
+    expect(timestampToFpMillis(timestamp)).toBe(result);
+  });
+
+  test.each([
+    // 1 BC = year 0 in JS
+    ['0001-06-15 12:00:00 BC', new Date('0000-06-15T12:00:00Z').getTime()],
+    // 2 BC = year -1
+    ['0002-06-15 12:00:00 BC', new Date('-000001-06-15T12:00:00Z').getTime()],
+    // BC with timezone
+    ['0001-01-01 00:00:00+00 BC', new Date('0000-01-01T00:00:00Z').getTime()],
+  ])('parse BC timestamp: %s', (timestamp, result) => {
+    expect(timestampToFpMillis(timestamp)).toBe(result);
+  });
+
+  test.each([
+    // Year > 9999 uses expanded year format
+    ['10000-01-01 00:00:00', new Date('+010000-01-01T00:00:00Z').getTime()],
+    ['99999-06-15 12:00:00', new Date('+099999-06-15T12:00:00Z').getTime()],
+  ])('parse large year timestamp: %s', (timestamp, result) => {
+    expect(timestampToFpMillis(timestamp)).toBe(result);
+  });
+
+  test.each([
+    // Negative timezone offsets
+    ['2024-01-15 12:00:00-05', 1705338000000],
+    ['2024-01-15 12:00:00-05:30', 1705339800000],
+    // Positive timezone offsets
+    ['2024-01-15 12:00:00+05', 1705302000000],
+    ['2024-01-15 12:00:00+05:30', 1705300200000],
+    // Single digit tz hour
+    ['2024-01-15 12:00:00+5', 1705302000000],
+    ['2024-01-15 12:00:00-5', 1705338000000],
+  ])('parse timestamp with timezone offset: %s', (timestamp, result) => {
+    expect(timestampToFpMillis(timestamp)).toBe(result);
+  });
+
+  test('infinity', () => {
+    expect(timestampToFpMillis('infinity')).toBe(Infinity);
+    expect(timestampToFpMillis('-infinity')).toBe(-Infinity);
+  });
+
+  test('throws on invalid timestamp', () => {
+    expect(() => timestampToFpMillis('not a timestamp')).toThrow(
+      'Error parsing not a timestamp',
+    );
+    expect(() => timestampToFpMillis('')).toThrow('Error parsing ');
+    expect(() => timestampToFpMillis('2024-13-40 99:99:99')).toThrow();
   });
 });
 
@@ -346,5 +481,200 @@ describe('postgresTimeToMilliseconds', () => {
     ])('should handle PostgreSQL format: %s', (_caseName, input, expected) => {
       expect(postgresTimeToMilliseconds(input)).toBe(expected);
     });
+  });
+
+  describe('timezone offset handling', () => {
+    test.each([
+      // UTC offset - no change
+      ['UTC +00', '12:00:00+00', 43200000],
+      // Positive offsets subtract from UTC
+      ['positive offset +01', '12:00:00+01', 39600000],
+      ['positive offset +05:30', '12:00:00+05:30', 23400000],
+      ['positive offset +14', '12:00:00+14', 79200000], // normalizes (wraps to 22:00)
+      // Negative offsets add to UTC
+      ['negative offset -05', '12:00:00-05', 61200000],
+      ['negative offset -05:30', '12:00:00-05:30', 63000000],
+      // Normalization: result < 0 wraps to previous day
+      ['midnight UTC+01 wraps to 23:00', '00:00:00+01', 82800000],
+      ['midnight UTC+05:30 wraps', '00:00:00+05:30', 66600000],
+      // Normalization: result > 24h wraps forward
+      ['23:00 UTC-02 wraps to 01:00 next day', '23:00:00-02', 3600000],
+    ])('should apply timezone offset: %s', (_caseName, input, expected) => {
+      expect(postgresTimeToMilliseconds(input)).toBe(expected);
+    });
+  });
+});
+
+describe('serializeTime (via postgresTypeConfig)', () => {
+  const {time, timetz} = postgresTypeConfig().types;
+
+  describe('string inputs are passed through unchanged', () => {
+    test.each([
+      ['plain time string', '12:34:56'],
+      ['time with milliseconds', '12:34:56.789'],
+      ['time with UTC offset', '12:34:56+00'],
+      ['time with positive offset', '12:34:56+05:30'],
+      ['time with negative offset', '12:34:56-08'],
+      ['midnight', '00:00:00'],
+    ])('%s', (_caseName, input) => {
+      expect(time.serialize(input)).toBe(input);
+      expect(timetz.serialize(input)).toBe(input);
+    });
+  });
+
+  describe('number inputs are converted via millisecondsToPostgresTime', () => {
+    test.each([
+      ['midnight (0)', 0, '00:00:00.000+00'],
+      ['1 hour', 3600000, '01:00:00.000+00'],
+      ['noon', 43200000, '12:00:00.000+00'],
+      [
+        'complex time',
+        12 * 3600000 + 34 * 60000 + 56 * 1000 + 789,
+        '12:34:56.789+00',
+      ],
+      ['max value', 86399999, '23:59:59.999+00'],
+    ])('%s', (_caseName, input, expected) => {
+      expect(time.serialize(input)).toBe(expected);
+      expect(timetz.serialize(input)).toBe(expected);
+    });
+  });
+
+  describe('unsupported input types throw', () => {
+    test.each([
+      ['boolean true', true],
+      ['boolean false', false],
+      ['plain object', {}],
+      ['array', []],
+      ['null', null],
+    ])('%s', (_caseName, input) => {
+      expect(() => time.serialize(input)).toThrow(/Unsupported type/);
+      expect(() => timetz.serialize(input)).toThrow(/Unsupported type/);
+    });
+  });
+
+  describe('round trip: serialize then parse', () => {
+    test.each([
+      ['midnight', 0],
+      ['one millisecond', 1],
+      ['noon', 43200000],
+      ['complex time', 45296789],
+      ['max', 86399999],
+    ])('%s', (_caseName, ms) => {
+      const serialized = time.serialize(ms) as string;
+      expect(postgresTimeToMilliseconds(serialized)).toBe(ms);
+    });
+  });
+});
+
+describe('inactivityTimeoutSocket', () => {
+  const lc = createSilentLogContext();
+  let server: Server;
+  let cleanup: (() => void)[] = [];
+
+  function listen(onConnection?: (socket: Socket) => void) {
+    server = createServer(socket => {
+      // The client resets (RSTs) the connection, which surfaces here as an
+      // ECONNRESET 'error' event on the server side of the socket.
+      socket.on('error', () => {});
+      onConnection?.(socket);
+    });
+    cleanup.push(() => server.close());
+    return new Promise<number>(resolve => {
+      server.listen(0, '127.0.0.1', () =>
+        resolve((server.address() as AddressInfo).port),
+      );
+    });
+  }
+
+  function factoryOptions(port: number) {
+    return {host: ['127.0.0.1'], port: [port]};
+  }
+
+  function connected(socket: Socket) {
+    cleanup.push(() => socket.destroy());
+    return new Promise<void>(resolve => socket.once('connect', resolve));
+  }
+
+  afterEach(() => {
+    cleanup.forEach(fn => fn());
+    cleanup = [];
+  });
+
+  test('connects and exposes host/port for TLS SNI', async () => {
+    const port = await listen();
+    const socket = inactivityTimeoutSocket(lc, 120_000)(factoryOptions(port));
+    await connected(socket);
+
+    // postgres.js reads socket.host as the SNI servername in secure().
+    expect(socket).toMatchObject({host: '127.0.0.1', port});
+  });
+
+  test('resets the connection after inactivity', async () => {
+    const logSink = new TestLogSink();
+    const warnLc = new LogContext('warn', undefined, logSink);
+    const port = await listen(); // server accepts but never responds
+    const socket = inactivityTimeoutSocket(warnLc, 100)(factoryOptions(port));
+    await connected(socket);
+
+    // Simulate a query that never gets a response.
+    socket.write('BEGIN');
+    await new Promise<void>(resolve => socket.once('close', resolve));
+    expect(socket.destroyed).toBe(true);
+
+    // The reset is logged so that occurrences are visible in production.
+    expect(logSink.messages).toMatchObject([
+      [
+        'warn',
+        undefined,
+        [expect.stringContaining('after 100 ms of inactivity')],
+      ],
+    ]);
+  });
+
+  test('activity resets the inactivity timer', async () => {
+    const port = await listen(socket => {
+      // Server echoes everything back, i.e. the connection has activity.
+      socket.on('data', data => socket.write(data));
+    });
+    const socket = inactivityTimeoutSocket(lc, 200)(factoryOptions(port));
+    await connected(socket);
+
+    let closed = false;
+    socket.once('close', () => (closed = true));
+
+    // Keep the wire active well past the 200ms timeout.
+    const ping = setInterval(() => socket.write('ping'), 50);
+    cleanup.push(() => clearInterval(ping));
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(closed).toBe(false);
+
+    // Then go silent (the server never initiates) and expect the reset.
+    clearInterval(ping);
+    await new Promise<void>(resolve => socket.once('close', resolve));
+    expect(socket.destroyed).toBe(true);
+  });
+
+  test('watchdog survives the removeAllListeners() of a TLS upgrade', async () => {
+    const port = await listen(); // server accepts but never responds
+    const socket = inactivityTimeoutSocket(lc, 100)(factoryOptions(port));
+    await connected(socket);
+
+    // postgres.js removes all listeners from the raw socket when upgrading
+    // it to TLS (secure() in connection.js). The watchdog must still fire.
+    socket.removeAllListeners();
+
+    socket.write('BEGIN');
+    await new Promise<void>(resolve => socket.once('close', resolve));
+    expect(socket.destroyed).toBe(true);
+  });
+
+  test('timeout of 0 disables the watchdog', async () => {
+    const port = await listen(); // server accepts but never responds
+    const socket = inactivityTimeoutSocket(lc, 0)(factoryOptions(port));
+    await connected(socket);
+
+    // No amount of silence resets the connection.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(socket.destroyed).toBe(false);
   });
 });

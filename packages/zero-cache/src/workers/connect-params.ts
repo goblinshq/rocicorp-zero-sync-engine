@@ -1,4 +1,4 @@
-import type {IncomingHttpHeaders} from 'node:http2';
+import type {IncomingHttpHeaders} from 'node:http';
 import {must} from '../../../shared/src/must.ts';
 import {
   decodeSecProtocols,
@@ -17,11 +17,30 @@ export type ConnectParams = {
   readonly wsID: string;
   readonly debugPerf: boolean;
   readonly auth: string | undefined;
-  readonly userID: string;
+  readonly userID: string | undefined;
   readonly initConnectionMsg: InitConnectionMessage | undefined;
   readonly httpCookie: string | undefined;
   readonly origin: string | undefined;
+  readonly requestHeaders?: Readonly<Record<string, string>> | undefined;
 };
+
+/**
+ * Normalizes Node's {@link IncomingHttpHeaders} (whose values are
+ * `string | string[] | undefined`) into a plain `Record<string, string>`,
+ * joining array values with `, ` and dropping `undefined` values.
+ */
+function normalizeHeaders(
+  headers: IncomingHttpHeaders,
+): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) {
+      continue;
+    }
+    normalized[key] = Array.isArray(value) ? value.join(', ') : value;
+  }
+  return normalized;
+}
 
 export function getConnectParams(
   protocolVersion: number,
@@ -46,7 +65,7 @@ export function getConnectParams(
     const timestamp = params.getInteger('ts', true);
     const lmID = params.getInteger('lmid', true);
     const wsID = params.get('wsid', false) ?? '';
-    const userID = params.get('userID', false) ?? '';
+    const userID = params.get('userID', false) ?? undefined;
     const debugPerf = params.getBoolean('debugPerf');
     const {initConnectionMessage, authToken} = decodeSecProtocols(
       must(headers['sec-websocket-protocol']),
@@ -68,6 +87,7 @@ export function getConnectParams(
         userID,
         httpCookie: headers.cookie,
         origin: headers.origin,
+        requestHeaders: normalizeHeaders(headers),
       },
       error: null,
     };

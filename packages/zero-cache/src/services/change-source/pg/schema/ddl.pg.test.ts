@@ -11,11 +11,14 @@ import type {
 } from '../logical-replication/pgoutput.types.ts';
 import {subscribe} from '../logical-replication/stream.ts';
 import {
+  createEventFunctionStatements,
   createEventTriggerStatements,
   ddlStartEventSchema,
   ddlUpdateEventSchema,
+  schemaSnapshotEventSchema,
   type DdlStartEvent,
   type DdlUpdateEvent,
+  type SchemaSnapshotEvent,
 } from './ddl.ts';
 
 const SLOT_NAME = 'ddl_test_slot';
@@ -30,19 +33,20 @@ describe('change-source/tables/ddl', () => {
 
   beforeEach<PgTest>(async ({testDBs}) => {
     notices = new Queue();
-    upstream = await testDBs.create('ddl_test_upstream', n =>
-      notices.enqueue(n),
-    );
+    upstream = await testDBs.create('ddl_test_upstream', {
+      onNotice: n => notices.enqueue(n),
+    });
 
     await upstream.unsafe(STARTING_SCHEMA);
 
-    await upstream.unsafe(
-      createEventTriggerStatements({
-        appID: APP_ID,
-        shardNum: SHARD_NUM,
-        publications: ['zero_all', 'zero_sum'],
-      }),
-    );
+    const shard = {
+      appID: APP_ID,
+      shardNum: SHARD_NUM,
+      publications: ['zero_all', 'zero_sum'],
+    };
+
+    await upstream.unsafe(createEventFunctionStatements(shard));
+    await upstream.unsafe(createEventTriggerStatements(shard));
 
     await upstream`SELECT pg_create_logical_replication_slot(${SLOT_NAME}, 'pgoutput')`;
 
@@ -70,11 +74,14 @@ describe('change-source/tables/ddl', () => {
     };
   });
 
-  async function drainReplicationMessages(num: number): Promise<Message[]> {
+  async function expectReplicationMessagesToMatchObject(
+    expected: unknown[],
+  ): Promise<Message[]> {
     const drained: Message[] = [];
-    while (drained.length < num) {
+    while (drained.length < expected.length) {
       drained.push(await messages.dequeue());
     }
+    expect(drained).toMatchObject(expected);
     return drained;
   }
 
@@ -100,9 +107,13 @@ describe('change-source/tables/ddl', () => {
     `;
 
   // For zero_all, zero_sum
-  const DDL_START: Omit<DdlStartEvent, 'context'> = {
+  const DDL_START: Omit<DdlStartEvent, 'context'> & {
+    schema: NonNullable<DdlStartEvent['schema']>;
+  } = {
     type: 'ddlStart',
     version: 1,
+    event: {tag: 'UNUSED'},
+    previousSchema: null,
     schema: {
       tables: [
         {
@@ -1299,7 +1310,7 @@ describe('change-source/tables/ddl', () => {
         },
       },
     ],
-  ] satisfies [string, string, DdlUpdateEvent][])(
+  ] satisfies [string, string, Partial<DdlUpdateEvent>][])(
     '%s',
     async (_, query, ddlUpdate) => {
       await upstream.begin(async tx => {
@@ -1307,21 +1318,20 @@ describe('change-source/tables/ddl', () => {
         await tx.unsafe(query);
       });
 
-      const messages = await drainReplicationMessages(6);
-      expect(messages).toMatchObject([
+      const messages = await expectReplicationMessagesToMatchObject([
         {tag: 'begin'},
         {tag: 'relation'},
         {tag: 'insert'},
         {
           tag: 'message',
-          prefix: 'zap/0',
+          prefix: 'zap/0/ddl',
           content: expect.any(Uint8Array),
           flags: 1,
           transactional: true,
         },
         {
           tag: 'message',
-          prefix: 'zap/0',
+          prefix: 'zap/0/ddl',
           content: expect.any(Uint8Array),
           flags: 1,
           transactional: true,
@@ -1332,11 +1342,104 @@ describe('change-source/tables/ddl', () => {
       let msg = messages[3] as MessageMessage;
       expect(parseDDLStartEvent(msg)).toMatchObject({
         ...DDL_START,
+        event: ddlUpdate.event,
         context: {query},
-      } satisfies DdlStartEvent);
+      } satisfies Partial<DdlStartEvent>);
 
       msg = messages[4] as MessageMessage;
       expect(parseDDLUpdateEvent(msg)).toMatchObject(ddlUpdate);
+    },
+  );
+
+  test.each([
+    [
+      'COMMENT',
+      /*sql*/ `
+      ALTER PUBLICATION zero_sum DROP TABLE pub.boo;
+      COMMENT ON PUBLICATION zero_sum IS 'foo'
+      `,
+      {
+        context: {
+          query: /*sql*/ `
+      ALTER PUBLICATION zero_sum DROP TABLE pub.boo;
+      COMMENT ON PUBLICATION zero_sum IS 'foo'
+      `,
+        },
+        type: 'schemaSnapshot',
+        version: 1,
+        event: {tag: 'COMMENT'},
+        schema: {
+          tables: replaced(DDL_START.schema.tables, 0, 1, {
+            ...DDL_START.schema.tables[0],
+            // No longer associated with the zero_sum publication.
+            publications: {['zero_all']: {rowFilter: null}},
+          }),
+          indexes: DDL_START.schema.indexes,
+        },
+      },
+    ],
+    [
+      'Manually SELECT update_schemas()',
+      /*sql*/ `
+      ALTER PUBLICATION zero_sum DROP TABLE pub.foo;
+      SELECT ${APP_ID}_${SHARD_NUM}.update_schemas();
+      `,
+      {
+        context: {
+          query: /*sql*/ `
+      ALTER PUBLICATION zero_sum DROP TABLE pub.foo;
+      SELECT ${APP_ID}_${SHARD_NUM}.update_schemas();
+      `,
+        },
+        type: 'schemaSnapshot',
+        version: 1,
+        event: {tag: 'MANUAL'},
+        schema: {
+          tables: replaced(DDL_START.schema.tables, 1, 1, {
+            ...DDL_START.schema.tables[1],
+            // No longer associated with the zero_sum publication.
+            publications: {['zero_all']: {rowFilter: null}},
+          }),
+          indexes: DDL_START.schema.indexes,
+        },
+      },
+    ],
+  ] satisfies [string, string, Partial<SchemaSnapshotEvent>][])(
+    'Snapshot workarounds when event triggers are unavailable: %s',
+    async (_, query, schemaSnapshot) => {
+      await upstream.begin(async tx => {
+        // Disable all event triggers, and re-enable only the COMMENT one,
+        // in order to simulate a diff in the schema that isn't caught by
+        // the standard event triggers.
+        await tx.unsafe(/*sql*/ `
+          DROP EVENT TRIGGER ${APP_ID}_ddl_start_${SHARD_NUM};
+          DROP EVENT TRIGGER ${APP_ID}_ddl_end_${SHARD_NUM};
+
+          CREATE EVENT TRIGGER ${APP_ID}_ddl_end_${SHARD_NUM}
+            ON ddl_command_end
+            WHEN TAG IN ('COMMENT')
+            EXECUTE PROCEDURE ${APP_ID}_${SHARD_NUM}.emit_ddl_end();
+        `);
+        await tx`INSERT INTO pub.boo(id) VALUES('1')`;
+        await tx.unsafe(query);
+      });
+
+      const messages = await expectReplicationMessagesToMatchObject([
+        {tag: 'begin'},
+        {tag: 'relation'},
+        {tag: 'insert'},
+        {
+          tag: 'message',
+          prefix: 'zap/0/ddl',
+          content: expect.any(Uint8Array),
+          flags: 1,
+          transactional: true,
+        },
+        {tag: 'commit'},
+      ]);
+
+      const msg = messages[3] as MessageMessage;
+      expect(parseSchemaSnapshotEvent(msg)).toMatchObject(schemaSnapshot);
     },
   );
 
@@ -1346,19 +1449,21 @@ describe('change-source/tables/ddl', () => {
   test.each([
     [
       'CREATE TABLE private.bar(id TEXT PRIMARY KEY, a INT4 UNIQUE, b INT8 UNIQUE, UNIQUE(b, a))',
-      [/ignoring CREATE TABLE .*private.bar/],
+      [/ignoring irrelevant CREATE TABLE .*private.bar/],
     ],
     [
       'CREATE INDEX foo_name_index on private.foo (name desc, id)',
-      [/ignoring CREATE INDEX .*private.foo_name_index/],
+      [/ignoring irrelevant CREATE INDEX .*private.foo_name_index/],
     ],
     [
       `ALTER TABLE private.foo RENAME name to handle`,
-      [/ignoring ALTER TABLE .*private.foo.handle/],
+      [/ignoring irrelevant ALTER TABLE .*private.foo.handle/],
     ],
     [
       `ALTER PUBLICATION nonzeropub ADD TABLE pub.yoo`,
-      [/ignoring ALTER PUBLICATION .*pub.yoo in publication nonzeropub/],
+      [
+        /ignoring irrelevant ALTER PUBLICATION .*pub.yoo in publication nonzeropub/,
+      ],
     ],
     [
       `
@@ -1374,13 +1479,13 @@ describe('change-source/tables/ddl', () => {
       );
       SELECT "dataVersion", "schemaVersion", "minSafeVersion" FROM "cvr"."versionHistory";
       `,
-      [/ignoring CREATE TABLE .*cvr.\\"versionHistory\\"/],
+      [/ignoring irrelevant CREATE TABLE .*cvr.\\"versionHistory\\"/],
     ],
     [
       `CREATE TABLE IF NOT EXISTS pub.foo(id TEXT PRIMARY KEY, name TEXT UNIQUE, description TEXT);`,
       [
-        /relation \"foo\" already exists, skipping/,
-        /ignoring CREATE TABLE .*\"object_identity\":null/,
+        /relation "foo" already exists, skipping/,
+        /ignoring irrelevant CREATE TABLE .*"object_identity":null/,
       ],
     ],
   ] satisfies [string, RegExp[]][])(
@@ -1396,14 +1501,13 @@ describe('change-source/tables/ddl', () => {
       });
 
       // There should only be a ddlStart message, and no ddlUpdate message.
-      const messages = await drainReplicationMessages(5);
-      expect(messages).toMatchObject([
+      const messages = await expectReplicationMessagesToMatchObject([
         {tag: 'begin'},
         {tag: 'relation'},
         {tag: 'insert'},
         {
           tag: 'message',
-          prefix: 'zap/0',
+          prefix: 'zap/0/ddl',
           content: expect.any(Uint8Array),
           flags: 1,
           transactional: true,
@@ -1415,6 +1519,48 @@ describe('change-source/tables/ddl', () => {
       expect(JSON.parse(new TextDecoder().decode(start))).toMatchObject({
         type: 'ddlStart',
       });
+
+      expect((await notices.dequeue()).message).toMatch(/Emitted .* ddlStart/);
+      for (const n of expectedNotices) {
+        const notice = await notices.dequeue();
+        expect(notice.message).toMatch(n);
+      }
+    },
+  );
+
+  test.each([
+    [
+      `COMMENT ON TABLE zero.foo IS 'whatever';`,
+      [/ignoring irrelevant COMMENT.*zero.foo/],
+    ],
+    [
+      `COMMENT ON PUBLICATION nonzeropub IS 'whatever';`,
+      [/ignoring irrelevant COMMENT.*nonzeropub/],
+    ],
+    // TODO: include this test when no-op schemaSnapshots are skipped,
+    // once 1.5.0 is rollback safe. (1.0.0 ~ 1.4.0 rely on them)
+    // [
+    //   `COMMENT ON PUBLICATION zero_sum IS 'foo'`,
+    //   [/ignoring noop COMMENT.*zero_sum/],
+    // ],
+  ] satisfies [string, RegExp[]][])(
+    'ignore unrelated or noop comments: %s',
+    async (query, expectedNotices) => {
+      while (notices.size()) {
+        await notices.dequeue();
+      }
+
+      await upstream.begin(async tx => {
+        await tx`INSERT INTO pub.boo(id) VALUES('1')`;
+        await tx.unsafe(query);
+      });
+
+      await expectReplicationMessagesToMatchObject([
+        {tag: 'begin'},
+        {tag: 'relation'},
+        {tag: 'insert'},
+        {tag: 'commit'},
+      ]);
 
       for (const n of expectedNotices) {
         const notice = await notices.dequeue();
@@ -1433,19 +1579,18 @@ describe('change-source/tables/ddl', () => {
       `ALTER TABLE pub.foo ADD boo text; ALTER TABLE pub.foo DROP boo;`,
     );
 
-    const messages = await drainReplicationMessages(10);
-    expect(messages).toMatchObject([
+    const messages = await expectReplicationMessagesToMatchObject([
       {tag: 'begin'},
       {
         tag: 'message',
-        prefix: 'zap/0',
+        prefix: 'zap/0/ddl',
         content: expect.any(Uint8Array),
         flags: 1,
         transactional: true,
       },
       {
         tag: 'message',
-        prefix: 'zap/0',
+        prefix: 'zap/0/ddl',
         content: expect.any(Uint8Array),
         flags: 1,
         transactional: true,
@@ -1455,28 +1600,28 @@ describe('change-source/tables/ddl', () => {
       {tag: 'begin'},
       {
         tag: 'message',
-        prefix: 'zap/0',
+        prefix: 'zap/0/ddl',
         content: expect.any(Uint8Array),
         flags: 1,
         transactional: true,
       },
       {
         tag: 'message',
-        prefix: 'zap/0',
+        prefix: 'zap/0/ddl',
         content: expect.any(Uint8Array),
         flags: 1,
         transactional: true,
       },
       {
         tag: 'message',
-        prefix: 'zap/0',
+        prefix: 'zap/0/ddl',
         content: expect.any(Uint8Array),
         flags: 1,
         transactional: true,
       },
       {
         tag: 'message',
-        prefix: 'zap/0',
+        prefix: 'zap/0/ddl',
         content: expect.any(Uint8Array),
         flags: 1,
         transactional: true,
@@ -1514,6 +1659,97 @@ describe('change-source/tables/ddl', () => {
       event: {tag: 'ALTER TABLE'},
     });
   });
+
+  test('parse legacy ddlStartEvent', () => {
+    const legacyDdlStartEvent: Omit<DdlStartEvent, 'event'> = {
+      type: 'ddlStart',
+      version: 1,
+      context: {query: 'foo'},
+      schema: {tables: [], indexes: []},
+    };
+    const parsed = v.parse(legacyDdlStartEvent, ddlStartEventSchema);
+    expect(parsed).toMatchObject({
+      type: 'ddlStart',
+      version: 1,
+      context: {query: 'foo'},
+      schema: {tables: [], indexes: []},
+      event: {tag: 'UNKNOWN'},
+    });
+  });
+
+  // Events from future versions of the upstream functions may report the
+  // columns created in the transaction that emitted the event.
+  test('parse ddlUpdateEvent with newColumns', () => {
+    const ddlUpdateEvent: DdlUpdateEvent = {
+      type: 'ddlUpdate',
+      version: 1,
+      context: {query: 'ALTER TABLE pub.foo ADD bar text'},
+      schema: {tables: [], indexes: []},
+      event: {tag: 'ALTER TABLE'},
+      newColumns: {'12345': [4, 7]},
+    };
+    expect(v.parse(ddlUpdateEvent, ddlUpdateEventSchema)).toEqual(
+      ddlUpdateEvent,
+    );
+    expect(
+      v.parse({...ddlUpdateEvent, newColumns: null}, ddlUpdateEventSchema),
+    ).toEqual({...ddlUpdateEvent, newColumns: null});
+
+    const {newColumns: _, ...withoutNewColumns} = ddlUpdateEvent;
+    expect(v.parse(withoutNewColumns, ddlUpdateEventSchema)).toEqual(
+      withoutNewColumns,
+    );
+  });
+
+  // Protocol v2 (planned): ddlStart events without a schema change are
+  // context-only. This release does not emit them yet, but must parse them
+  // so that the release that does can be rolled back to this one.
+  test('parse context-only ddlStartEvent', () => {
+    const contextOnlyDdlStartEvent: DdlStartEvent = {
+      type: 'ddlStart',
+      version: 2,
+      context: {query: 'REFRESH MATERIALIZED VIEW CONCURRENTLY foo'},
+      event: {tag: 'CREATE TABLE'},
+    };
+    const parsed = v.parse(contextOnlyDdlStartEvent, ddlStartEventSchema);
+    expect(parsed).toMatchObject(contextOnlyDdlStartEvent);
+    expect(parsed.schema).toBeUndefined();
+    expect(parsed.previousSchema).toBeUndefined();
+  });
+
+  test('REFRESH MATERIALIZED VIEW CONCURRENTLY emits only no-op ddlStart events', async () => {
+    await upstream.unsafe(/*sql*/ `
+      CREATE MATERIALIZED VIEW pub.mat AS SELECT id FROM pub.foo;
+      CREATE UNIQUE INDEX mat_id_key ON pub.mat (id);
+    `);
+
+    const query = 'REFRESH MATERIALIZED VIEW CONCURRENTLY pub.mat';
+    await upstream.unsafe(query);
+
+    // Marker transaction to bound the message scan.
+    await upstream`INSERT INTO pub.boo(id) VALUES('refresh-done')`;
+
+    const ddlEvents: DdlStartEvent[] = [];
+    for (;;) {
+      const msg = await messages.dequeue();
+      if (msg.tag === 'insert') {
+        break;
+      }
+      if (msg.tag === 'message') {
+        // parseDDLStartEvent() fails if a ddlUpdate event was emitted.
+        ddlEvents.push(parseDDLStartEvent(msg));
+      }
+    }
+
+    // The CREATE UNIQUE INDEX (on the unpublished materialized view) and
+    // the internal CREATE/ALTER/DROP TABLE sub-commands of the REFRESH
+    // each emit a no-op ddlStart event, and no ddlUpdate events.
+    expect(ddlEvents.length).toBeGreaterThan(1);
+    expect(ddlEvents.map(e => e.context.query)).toContain(query);
+    for (const event of ddlEvents) {
+      expect(event).toMatchObject({type: 'ddlStart', previousSchema: null});
+    }
+  });
 });
 
 function parseDDLStartEvent(msg: MessageMessage) {
@@ -1527,5 +1763,12 @@ function parseDDLUpdateEvent(msg: MessageMessage) {
   return v.parse(
     JSON.parse(new TextDecoder().decode(msg.content)),
     ddlUpdateEventSchema,
+  );
+}
+
+function parseSchemaSnapshotEvent(msg: MessageMessage) {
+  return v.parse(
+    JSON.parse(new TextDecoder().decode(msg.content)),
+    schemaSnapshotEventSchema,
   );
 }

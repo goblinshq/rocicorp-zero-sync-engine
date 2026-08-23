@@ -1,8 +1,8 @@
+import {getDefaultHighWaterMark} from 'stream';
 import websocket from '@fastify/websocket';
 import {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
 import Fastify, {type FastifyInstance} from 'fastify';
-import {getDefaultHighWaterMark} from 'stream';
 import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
 import WebSocket from 'ws';
 import {unreachable} from '../../../shared/src/asserts.ts';
@@ -17,7 +17,9 @@ import * as v from '../../../shared/src/valita.ts';
 import {
   stream,
   streamIn,
+  streamInStringified,
   streamOut,
+  streamOutStringified,
   type Sink,
   type Source,
 } from './streams.ts';
@@ -57,7 +59,7 @@ describe('streams with flow control', () => {
         ws,
         messageSchema,
       );
-      void serverRequests.enqueue({serverIn: instream, serverOut: outstream});
+      serverRequests.enqueue({serverIn: instream, serverOut: outstream});
     });
     const url = await server.listen({port: 0});
     lc.info?.(`server running on ${url}`);
@@ -214,6 +216,7 @@ describe('streams with internal acks', () => {
 
   let server: FastifyInstance;
   let producer: Subscription<Message>;
+  let stringifiedProducer: Subscription<string>;
   let consumed: Queue<Message>;
   let cleanedUp: Promise<Message[]>;
   let cleanup: (m: Message[]) => void;
@@ -233,10 +236,14 @@ describe('streams with internal acks', () => {
       consumed: m => consumed.enqueue(m),
       cleanup: resolve,
     });
+    stringifiedProducer = Subscription.create();
 
     server = Fastify();
     await server.register(websocket);
-    server.get('/', {websocket: true}, ws => streamOut(lc, producer, ws));
+    server.get('/', {websocket: true}, ws => {
+      void streamOut(lc, producer, ws);
+      void streamOutStringified(lc, stringifiedProducer, ws);
+    });
 
     // Run the server for real instead of using `injectWS()`, as that has a
     // different behavior for ws.close().
@@ -259,6 +266,14 @@ describe('streams with internal acks', () => {
         ws,
         messageSchema,
       )) as Subscription<Message>,
+    };
+  }
+
+  async function startStringifiedReceiver() {
+    ws = new WebSocket(`http://localhost:${port}/`);
+    return {
+      ws,
+      consumer: await streamInStringified(lc, ws, messageSchema),
     };
   }
 
@@ -441,11 +456,8 @@ describe('streams with internal acks', () => {
     ]);
   });
 
-  async function drain(
-    num: number,
-    consumer: Source<Message>,
-  ): Promise<Message[]> {
-    const drained: Message[] = [];
+  async function drain<T>(num: number, consumer: Source<T>): Promise<T[]> {
+    const drained: T[] = [];
     let i = 0;
     for await (const msg of consumer) {
       drained.push(msg);
@@ -462,6 +474,25 @@ describe('streams with internal acks', () => {
     const {consumer} = await startReceiver();
     expect(await drain(1, consumer)).toEqual([
       {from: 1, to: 2, str: 'foo', extra: 'bar'},
+    ]);
+  });
+
+  test('stringified source', async () => {
+    const json =
+      '{"from":1,"to":2,"str":"before\\u0000after","big":9007199254740993}';
+    stringifiedProducer.push(json);
+
+    const {consumer} = await startStringifiedReceiver();
+    expect(await drain(1, consumer)).toEqual([
+      {
+        data: {
+          from: 1,
+          to: 2,
+          str: 'before\0after',
+          big: 9007199254740993n,
+        },
+        json,
+      },
     ]);
   });
 

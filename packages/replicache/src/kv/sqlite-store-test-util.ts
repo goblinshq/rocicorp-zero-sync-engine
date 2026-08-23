@@ -39,15 +39,13 @@ function createCleanupFunction(
     clearAllNamedStores();
 
     // Clean up tracked store names using the store provider's drop method
-    const cleanupPromises = Array.from(createdStoreNames).map(
-      async storeName => {
-        try {
-          await storeProvider.drop(storeName);
-        } catch (_error) {
-          // Ignore cleanup errors
-        }
-      },
-    );
+    const cleanupPromises = Array.from(createdStoreNames, async storeName => {
+      try {
+        await storeProvider.drop(storeName);
+      } catch {
+        // Ignore cleanup errors
+      }
+    });
 
     // Wait for all cleanup operations to complete
     void Promise.all(cleanupPromises).finally(() => {
@@ -92,6 +90,36 @@ export function runSQLiteStoreTests<TOptions = unknown>(
   runAll(storeName, () => createStoreWithDefaults(`test-${++storeCounter}`));
 
   // SQLite-specific tests
+  test('concurrent get and has calls return correct results', async () => {
+    const store = createStoreWithDefaults(`batch-test-${++storeCounter}`);
+
+    await withWrite(store, async wt => {
+      await wt.put('a', 'alpha');
+      await wt.put('b', 'beta');
+    });
+
+    await withRead(store, async rt => {
+      const [valA, valB, hasA, hasC] = await Promise.all([
+        rt.get('a'),
+        rt.get('b'),
+        rt.has('a'),
+        rt.has('c'),
+      ]);
+      expect(valA).toBe('alpha');
+      expect(valB).toBe('beta');
+      expect(hasA).toBe(true);
+      expect(hasC).toBe(false);
+    });
+
+    await withWrite(store, async wt => {
+      const [valA, hasB] = await Promise.all([wt.get('a'), wt.has('b')]);
+      expect(valA).toBe('alpha');
+      expect(hasB).toBe(true);
+    });
+
+    await store.close();
+  });
+
   test('shared read transaction behavior', async () => {
     const store = createStoreWithDefaults(`shared-read-test-${++storeCounter}`);
 

@@ -1,6 +1,6 @@
 import type {SQLQuery} from '@databases/sql';
 import type {JSONValue} from 'postgres';
-import {beforeAll, describe, expect, test} from 'vitest';
+import {afterAll, beforeAll, describe, expect, test} from 'vitest';
 import {testDBs} from '../../zero-cache/src/test/db.ts';
 import type {PostgresDB} from '../../zero-cache/src/types/pg.ts';
 import {formatPgInternalConvert, sql, sqlConvertColumnArg} from './sql.ts';
@@ -9,7 +9,7 @@ const DB_NAME = 'sql-test';
 
 let pg: PostgresDB;
 beforeAll(async () => {
-  pg = await testDBs.create(DB_NAME, undefined, false);
+  pg = await testDBs.create(DB_NAME, {typeOpts: false});
   await pg.unsafe(`
     CREATE TABLE test_items (
       id SERIAL PRIMARY KEY,
@@ -21,6 +21,10 @@ beforeAll(async () => {
       tags TEXT[]
     );
   `);
+});
+
+afterAll(async () => {
+  await testDBs.drop(pg);
 });
 
 describe('SQL builder with PostgreSQL', () => {
@@ -99,6 +103,211 @@ describe('SQL builder with PostgreSQL', () => {
       isActive: true,
       tags: ['tag1', 'tag2'],
     });
+  });
+
+  test.each([
+    {label: 'empty string', type: 'json', value: ''},
+    {label: 'empty string', type: 'jsonb', value: ''},
+    {label: 'non-empty string', type: 'json', value: 'same'},
+    {label: 'non-empty string', type: 'jsonb', value: 'same'},
+  ] as const)(
+    'writes equal $label values correctly when text is formatted before $type',
+    async ({label: _label, type, value}) => {
+      const table = `mixed_values_${type}`;
+      await pg.unsafe(`
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          summary TEXT NOT NULL,
+          content ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const stmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (summary, content)
+        VALUES (${sqlConvertArg('text', value)}, ${sqlConvertArg(type, value)})
+        RETURNING summary, content
+      `);
+      const result = await pg.unsafe(stmt.text, stmt.values as JSONValue[]);
+
+      expect(result).toEqual([{summary: value, content: value}]);
+    },
+  );
+
+  test.each([
+    {label: 'empty string', type: 'json', value: ''},
+    {label: 'empty string', type: 'jsonb', value: ''},
+    {label: 'non-empty string', type: 'json', value: 'same'},
+    {label: 'non-empty string', type: 'jsonb', value: 'same'},
+  ] as const)(
+    'writes equal $label values correctly when $type is formatted before text',
+    async ({label: _label, type, value}) => {
+      const table = `mixed_values_${type}`;
+      await pg.unsafe(`
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          summary TEXT NOT NULL,
+          content ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const stmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (content, summary)
+        VALUES (${sqlConvertArg(type, value)}, ${sqlConvertArg('text', value)})
+        RETURNING content, summary
+      `);
+      const result = await pg.unsafe(stmt.text, stmt.values as JSONValue[]);
+
+      expect(result).toEqual([{content: value, summary: value}]);
+    },
+  );
+
+  test.each([
+    {type: 'timestamp', value: 1712345678901.5},
+    {type: 'timestamptz', value: 1712345678901.5},
+  ] as const)(
+    'numeric $type with fractional milliseconds round-trips correctly',
+    async ({type, value}) => {
+      await using pg = await testDBs.create(`${DB_NAME}_${type}_frac`);
+
+      const table = `round_trip_${type}_frac`;
+      await pg.unsafe(`
+        SET TIME ZONE 'UTC';
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          value ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      // Insert a fractional-millisecond timestamp.
+      // With the old ::bigint cast this would fail:
+      //   "invalid input syntax for type bigint: 1712345678901.5"
+      const insertStmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (value)
+        VALUES (${sqlConvertArg(type, value)})
+      `);
+      await pg.unsafe(insertStmt.text, insertStmt.values as JSONValue[]);
+
+      // Query it back using the same fractional value as a filter.
+      const selectStmt = formatPgInternalConvert(sql`
+        SELECT value FROM ${sql.ident(table)}
+        WHERE value = ${sqlConvertArg(type, value, singularComparison)}
+      `);
+      const result = await pg.unsafe(
+        selectStmt.text,
+        selectStmt.values as JSONValue[],
+      );
+      expect(result).toHaveLength(1);
+    },
+  );
+
+  test.each([
+    // 0001-01-01 00:00:00 BC  (year 0 in proleptic Gregorian / JS)
+    {type: 'timestamp', value: -62167219200000},
+    {type: 'timestamptz', value: -62167219200000},
+    // 0044-03-15 00:00:00 BC  (44 BC, year -43 in JS)
+    {type: 'timestamp', value: -63492537600000},
+    {type: 'timestamptz', value: -63492537600000},
+  ] as const)(
+    'numeric $type with BC date ($value) round-trips correctly',
+    async ({type, value}) => {
+      await using pg = await testDBs.create(`${DB_NAME}_${type}_bc`);
+
+      const table = `round_trip_${type}_bc`;
+      await pg.unsafe(`
+        SET TIME ZONE 'UTC';
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          value ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const insertStmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (value)
+        VALUES (${sqlConvertArg(type, value)})
+      `);
+      await pg.unsafe(insertStmt.text, insertStmt.values as JSONValue[]);
+
+      const selectStmt = formatPgInternalConvert(sql`
+        SELECT value FROM ${sql.ident(table)}
+        WHERE value = ${sqlConvertArg(type, value, singularComparison)}
+      `);
+      const result = await pg.unsafe(
+        selectStmt.text,
+        selectStmt.values as JSONValue[],
+      );
+      expect(result).toHaveLength(1);
+    },
+  );
+
+  test.each([
+    {type: 'time', value: 32887654},
+    {type: 'timetz', value: 32887654},
+  ] as const)(
+    'numeric $type inserts round-trip as milliseconds',
+    async ({type, value}) => {
+      await using pg = await testDBs.create(`${DB_NAME}_${type}`);
+
+      const table = `round_trip_${type}`;
+      await pg.unsafe(`
+        SET TIME ZONE 'UTC';
+        DROP TABLE IF EXISTS "${table}";
+        CREATE TABLE "${table}" (
+          value ${type.toUpperCase()} NOT NULL
+        );
+      `);
+
+      const stmt = formatPgInternalConvert(sql`
+        INSERT INTO ${sql.ident(table)} (value)
+        VALUES (${sqlConvertArg(type, value)})
+        RETURNING value
+      `);
+
+      const result = await pg.unsafe(stmt.text, stmt.values as JSONValue[]);
+
+      expect(result).toEqual([{value}]);
+    },
+  );
+
+  test('text-represented scalar types insert and compare by native type', async () => {
+    await using pg = await testDBs.create(`${DB_NAME}_text_represented`);
+    await pg.unsafe(`
+      CREATE EXTENSION IF NOT EXISTS isn;
+      CREATE TABLE text_represented_scalars (
+        isbn ISBN13 PRIMARY KEY,
+        ip INET NOT NULL,
+        mac MACADDR NOT NULL
+      );
+    `);
+
+    const row = {
+      isbn: '9780306406157',
+      ip: '192.168.0.1/24',
+      mac: '08:00:2b:01:02:03',
+    };
+
+    const insertStmt = formatPgInternalConvert(sql`
+      INSERT INTO text_represented_scalars (isbn, ip, mac)
+      VALUES (
+        ${sqlConvertArg('isbn13', row.isbn)},
+        ${sqlConvertArg('inet', row.ip)},
+        ${sqlConvertArg('macaddr', row.mac)}
+      )
+    `);
+    await pg.unsafe(insertStmt.text, insertStmt.values as JSONValue[]);
+
+    const selectStmt = formatPgInternalConvert(sql`
+      SELECT isbn::text AS isbn, ip::text AS ip, mac::text AS mac
+      FROM text_represented_scalars
+      WHERE isbn = ${sqlConvertArg('isbn13', row.isbn, singularComparison)}
+        AND ip = ${sqlConvertArg('inet', row.ip, singularComparison)}
+        AND mac = ${sqlConvertArg('macaddr', row.mac, singularComparison)}
+    `);
+    const result = await pg.unsafe(
+      selectStmt.text,
+      selectStmt.values as JSONValue[],
+    );
+
+    expect(result).toEqual([{...row, isbn: '978-0-306-40615-7'}]);
   });
 });
 

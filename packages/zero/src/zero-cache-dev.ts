@@ -2,9 +2,9 @@
 
 import '../../shared/src/dotenv.ts';
 
+import {spawn, type ChildProcess} from 'node:child_process';
 import {resolver} from '@rocicorp/resolver';
 import {watch} from 'chokidar';
-import {spawn, type ChildProcess} from 'node:child_process';
 import {createLogContext} from '../../shared/src/logging.ts';
 import {parseOptionsAdvanced} from '../../shared/src/options.ts';
 import * as v from '../../shared/src/valita.ts';
@@ -16,6 +16,7 @@ import {deployPermissionsOptions} from '../../zero-cache/src/scripts/permissions
 
 const deployPermissionsScript = 'zero-deploy-permissions';
 const zeroCacheScript = 'zero-cache';
+const startupMessageEnv = 'ZERO_ENABLE_STARTUP_MESSAGE';
 
 function killProcess(childProcess: ChildProcess | undefined) {
   if (!childProcess || childProcess.exitCode !== null) {
@@ -133,6 +134,9 @@ async function main() {
       // Default NODE_ENV to development mode.
       // @ts-ignore NODE_ENV is not always set. Please ignore error.
       ['NODE_ENV']: 'development',
+
+      // Print the dev-only startup message after the server is listening.
+      [startupMessageEnv]: '1',
 
       // But let the developer override any of these dev defaults.
       ...process.env,

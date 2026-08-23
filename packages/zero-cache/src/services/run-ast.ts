@@ -18,6 +18,7 @@ import {
   buildPipeline,
   type BuilderDelegate,
 } from '../../../zql/src/builder/builder.ts';
+import {ChangeType} from '../../../zql/src/ivm/change-type.ts';
 import type {Node} from '../../../zql/src/ivm/data.ts';
 import {skipYields} from '../../../zql/src/ivm/operator.ts';
 import type {ConnectionCostModel} from '../../../zql/src/planner/planner-connection.ts';
@@ -108,11 +109,20 @@ export async function runAst(
     return node ? ((node.row[childField] as LiteralValue) ?? null) : undefined;
   };
 
-  const {ast: resolvedAst} = resolveSimpleScalarSubqueries(
+  const {ast: resolvedAst, ignoredScalarHints} = resolveSimpleScalarSubqueries(
     ast,
     options.tableSpecs,
     executor,
   );
+  for (const {table, uniqueKeys} of ignoredScalarHints) {
+    lc.warn?.(
+      `Ignoring {scalar: true} on the "${table}" subquery: it does not ` +
+        `constrain every column of any unique key ` +
+        `[${uniqueKeys.map(k => `(${k.join(', ')})`).join(', ')}] to a ` +
+        `literal with "=", so it is not provably limited to one row. ` +
+        `The gate runs as a plain EXISTS.`,
+    );
+  }
 
   const pipeline = buildPipeline(
     resolvedAst,
@@ -138,7 +148,10 @@ export async function runAst(
       await yieldProcess();
       continue;
     }
-    assert(rowChange.type === 'add', 'Hydration only handles add row changes');
+    assert(
+      rowChange.type === ChangeType.ADD,
+      'Hydration only handles add row changes',
+    );
 
     // yield to other tasks to avoid blocking for too long
     if (syncedRowCount % 10 === 0) {
@@ -183,6 +196,7 @@ export async function runAst(
   }
   result.readRowCount = readRowCount;
   result.dbScansByQuery = host.debug?.getNVisitCounts() ?? {};
+  result.sqlitePlans = host.debug?.getSQLitePlans() ?? {};
 
   if (options.vendedRows) {
     result.readRows = host.debug?.getVendedRows();

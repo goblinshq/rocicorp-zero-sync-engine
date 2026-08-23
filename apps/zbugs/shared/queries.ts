@@ -9,17 +9,14 @@ import {
 } from '@rocicorp/zero';
 import * as z from 'zod/mini';
 import type {AuthData, Role} from './auth.ts';
-import {INITIAL_COMMENT_LIMIT} from './consts.ts';
 import {QueryError, QueryErrorCode} from './error.ts';
 import {builder, ZERO_PROJECT_NAME} from './schema.ts';
 
-function applyIssuePermissions<TQuery extends IssueQuery>(
+export function applyIssuePermissions<TQuery extends IssueQuery>(
   q: TQuery,
   role: Role | undefined,
 ): TQuery {
-  return q.where(({or, cmp, cmpLit}) =>
-    or(cmp('visibility', '=', 'public'), cmpLit(role, '=', 'crew')),
-  ) as TQuery;
+  return role === 'crew' ? q : (q.where('visibility', 'public') as TQuery);
 }
 
 const idValidator = z.string();
@@ -98,11 +95,9 @@ export const queries = defineQueries({
 
   issuePreloadV2: defineQuery(
     z.object({
-      userID: z.string(),
       projectName: z.string(),
     }),
-
-    ({ctx: auth, args: {userID, projectName}}) =>
+    ({ctx: auth, args: {projectName}}) =>
       applyIssuePermissions(
         builder.issue
           .whereExists(
@@ -111,7 +106,9 @@ export const queries = defineQueries({
             {scalar: true},
           )
           .related('labels')
-          .related('viewState', q => q.where('userID', userID))
+          .related('viewState', q =>
+            auth?.sub ? q.where('userID', auth.sub) : alwaysFalse(q),
+          )
           .related('creator')
           .related('assignee')
           .related('emoji', emoji => emoji.related('creator'))
@@ -177,14 +174,47 @@ export const queries = defineQueries({
     },
   ),
 
+  // Paged comment window for the zero-virtual comments list. Ordered
+  // (created, id); a backward page flips the order. `start` is the cursor row.
+  commentsPage: defineQuery(
+    z.object({
+      issueID: z.string(),
+      limit: z.number(),
+      start: z.nullable(z.object({id: z.string(), created: z.number()})),
+      dir: z.union([z.literal('forward'), z.literal('backward')]),
+      inclusive: z.boolean(),
+    }),
+    ({args: {issueID, limit, start, dir, inclusive}}) => {
+      const orderDir = dir === 'forward' ? 'asc' : 'desc';
+      let q = builder.comment
+        .related('creator')
+        .related('emoji', emoji => emoji.related('creator'))
+        .where('issueID', issueID)
+        .orderBy('created', orderDir)
+        .orderBy('id', orderDir);
+      if (start) {
+        q = q.start(start, {inclusive});
+      }
+      return q.limit(limit);
+    },
+  ),
+
+  // Single-comment lookup for comment permalinks (the comments virtualizer
+  // pages in the window around it).
+  comment: defineQuery(idValidator, ({args: id}) =>
+    builder.comment
+      .related('creator')
+      .related('emoji', emoji => emoji.related('creator'))
+      .where('id', id)
+      .one(),
+  ),
+
   issueDetail: defineQuery(
     z.object({
       idField: z.union([z.literal('shortID'), z.literal('id')]),
       id: z.union([z.string(), z.number()]),
-      userID: z.string(),
     }),
-
-    ({args: {idField, id, userID}, ctx: auth}) =>
+    ({args: {idField, id}, ctx: auth}) =>
       applyIssuePermissions(
         builder.issue
           .where(idField, id)
@@ -193,16 +223,23 @@ export const queries = defineQueries({
           .related('creator')
           .related('assignee')
           .related('labels')
-          .related('notificationState', q => q.where('userID', userID))
-          .related('viewState', viewState =>
-            viewState.where('userID', userID).one(),
+          .related('notificationState', q =>
+            auth?.sub ? q.where('userID', auth.sub) : alwaysFalse(q),
           )
+          .related('viewState', viewState =>
+            (auth?.sub
+              ? viewState.where('userID', auth.sub)
+              : alwaysFalse(viewState)
+            ).one(),
+          )
+          // Preload the most recent comments so the comments list resolves
+          // locally on navigation (it renders and pages via `commentsPage`;
+          // for issues with up to 50 comments this covers the whole thread).
           .related('comments', comments =>
             comments
               .related('creator')
               .related('emoji', emoji => emoji.related('creator'))
-              // One more than we display so we can detect if there are more to load.
-              .limit(INITIAL_COMMENT_LIMIT + 1)
+              .limit(50)
               .orderBy('created', 'desc')
               .orderBy('id', 'desc'),
           )
@@ -214,15 +251,14 @@ export const queries = defineQueries({
   issueListV2: defineQuery(
     z.object({
       listContext: listContextParams,
-      userID: z.string(),
       limit: z.nullable(z.number()),
       start: z.nullable(issueRowSortSchema),
       dir: z.union([z.literal('forward'), z.literal('backward')]),
       inclusive: z.optional(z.boolean()),
     }),
 
-    ({ctx: auth, args: {listContext, userID, limit, start, dir, inclusive}}) =>
-      issueListV2(listContext, limit, userID, auth, start, dir, inclusive),
+    ({ctx: auth, args: {listContext, limit, start, dir, inclusive}}) =>
+      issueListV2(listContext, limit, auth?.sub, auth, start, dir, inclusive),
   ),
 
   /**
@@ -249,27 +285,6 @@ export const queries = defineQueries({
   // TODO(arv): Remove
 
   // The below queries are DEPRECATED
-  issuePreload: defineQuery(idValidator, ({ctx: auth, args: userID}) =>
-    applyIssuePermissions(
-      builder.issue
-        .related('labels')
-        .related('viewState', q => q.where('userID', userID))
-        .related('creator')
-        .related('assignee')
-        .related('emoji', emoji => emoji.related('creator'))
-        .related('comments', comments =>
-          comments
-            .related('creator')
-            .related('emoji', emoji => emoji.related('creator'))
-            .limit(10)
-            .orderBy('created', 'desc'),
-        )
-        .orderBy('modified', 'desc')
-        .orderBy('id', 'desc')
-        .limit(1000),
-      auth?.role,
-    ),
-  ),
   prevNext: defineQuery(
     z.object({
       listContext: z.nullable(listContextParams),
@@ -288,11 +303,10 @@ export const queries = defineQueries({
   issueList: defineQuery(
     z.object({
       listContext: listContextParams,
-      userID: z.string(),
       limit: z.number(),
     }),
-    ({ctx: auth, args: {listContext, userID, limit}}) =>
-      issueListV2(listContext, limit, userID, auth, null, 'forward', false),
+    ({ctx: auth, args: {listContext, limit}}) =>
+      issueListV2(listContext, limit, auth?.sub, auth, null, 'forward', false),
   ),
 
   userPicker: defineQuery(
@@ -334,7 +348,7 @@ export type ListContext = {
 function issueListV2(
   listContext: ListContextParams,
   limit: number | null,
-  userID: string,
+  userID: string | undefined,
   auth: AuthData | undefined,
   start: IssueRowSort | null,
   dir: 'forward' | 'backward',
@@ -355,7 +369,7 @@ export type ListQueryArgs = {
   issueQuery?: (typeof builder)['issue'] | undefined;
   listContext?: ListContext['params'] | undefined;
   project?: string | undefined;
-  userID?: string;
+  userID?: string | undefined;
   role?: Role | undefined;
   limit?: number | undefined;
   start?: IssueRowSort | undefined;
@@ -436,6 +450,10 @@ export function buildListQuery(args: ListQueryArgs) {
         : undefined,
       ...(labels ?? []).map(label =>
         exists('issueLabels', q =>
+          // `label`'s unique key is `(projectID, name)` and only `name` is
+          // pinned here — but the inner `project` gate is itself scalar, so it
+          // rewrites to `label.projectID = <literal>` before this gate is
+          // tested, completing the key. Both gates are honored.
           q.whereExists(
             'label',
             q =>

@@ -8,18 +8,19 @@
     "deploy": "vercel deploy",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "oxlint --type-aware .",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "check-types": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@vercel/node": "^3.0.0"
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts .",
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "check-types": "tsc --noEmit",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
-    "@vitest/coverage-v8": "4.0.15",
-    "typescript": "~5.9.3",
-    "vitest": "4.0.15"
-  }
+    "@vitest/coverage-v8": "^4.1.6",
+    "oxfmt": "^0.45.0",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.6"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

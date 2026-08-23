@@ -1,21 +1,37 @@
 import {describe, expect, test} from 'vitest';
 import {testLogConfig} from '../../otel/src/test-log-config.ts';
+import {assert} from '../../shared/src/asserts.ts';
 import type {JSONValue} from '../../shared/src/json.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
+import {must} from '../../shared/src/must.ts';
 import type {Row, Value} from '../../zero-protocol/src/data.ts';
+import {
+  Debug,
+  type DebugDelegate,
+} from '../../zql/src/builder/debug-delegate.ts';
 import {Catch} from '../../zql/src/ivm/catch.ts';
-import type {Change} from '../../zql/src/ivm/change.ts';
+import {
+  makeAddChange,
+  makeEditChange,
+  makeRemoveChange,
+  type Change,
+} from '../../zql/src/ivm/change.ts';
 import {makeComparator} from '../../zql/src/ivm/data.ts';
-import {Database} from './db.ts';
+import {
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from '../../zql/src/ivm/source.ts';
+import {consume} from '../../zql/src/ivm/stream.ts';
+import {Database, Statement} from './db.ts';
+import {explainQueries} from './explain-queries.ts';
 import {format} from './internal/sql.ts';
+import {filtersToSQL} from './query-builder.ts';
 import {
   fromSQLiteTypes,
   TableSource,
   UnsupportedValueError,
 } from './table-source.ts';
-import {filtersToSQL} from './query-builder.ts';
-import {assert} from '../../shared/src/asserts.ts';
-import {consume} from '../../zql/src/ivm/stream.ts';
 
 const columns = {
   id: {type: 'string'},
@@ -112,7 +128,7 @@ describe('fetching from a table source', () => {
       name: 'complex source with compound order',
       sourceArgs: ['foo', columns, compoundOrder],
       fetchArgs: {constraint: undefined, start: undefined},
-      expectedRows: allRows.slice().sort(compoundComparator),
+      expectedRows: allRows.toSorted(compoundComparator),
     },
     {
       name: 'complex source with compound order and constraint',
@@ -127,7 +143,7 @@ describe('fetching from a table source', () => {
         constraint: undefined,
         start: {row: allRows[4], basis: 'after'},
       },
-      expectedRows: allRows.slice().sort(compoundComparator).slice(5),
+      expectedRows: allRows.toSorted(compoundComparator).slice(5),
     },
     {
       name: 'complex source with compound order and start `after` and constraint',
@@ -148,7 +164,7 @@ describe('fetching from a table source', () => {
         constraint: undefined,
         start: {row: allRows[4], basis: 'at'},
       },
-      expectedRows: allRows.slice().sort(compoundComparator).slice(4),
+      expectedRows: allRows.toSorted(compoundComparator).slice(4),
     },
     {
       name: 'complex source with compound order and start `at` and constraint',
@@ -194,6 +210,176 @@ describe('fetching from a table source', () => {
         return r.row;
       }),
     ).toEqual(expectedRows);
+  });
+});
+
+describe('fetching across a NULL-sorted cursor region', () => {
+  // SQLite sorts NULLs first, so rows with a NULL sort value form the head
+  // of the walk. A cursor anchored in that region must continue exactly
+  // where the IVM comparator says it continues — `col > NULL` matched
+  // nothing, so the continuation silently came back empty — and a backward
+  // walk from a non-NULL anchor must admit the NULL group that sorts before
+  // it. The NULL-bound forms hold with or without `optional` metadata (the
+  // bound value itself proves nullability); admitting the NULL group below a
+  // non-NULL bound relies on a truthful `optional` flag, which the replica
+  // specs now derive from the upstream NOT NULL constraint.
+  type Bar = {id: string; a: number | null};
+  const barColumns = {
+    id: {type: 'string'},
+    a: {type: 'number', optional: true},
+  } as const;
+  const bareBarColumns = {
+    id: {type: 'string'},
+    a: {type: 'number'},
+  } as const;
+  const barOrder = [
+    ['a', 'asc'],
+    ['id', 'asc'],
+  ] as const;
+  // Declared in comparator order: the NULL group first (tie-broken by id),
+  // then the non-NULL values.
+  const allRows: Bar[] = [
+    {id: '01', a: null},
+    {id: '02', a: null},
+    {id: '03', a: null},
+    {id: '04', a: 1},
+    {id: '05', a: 2},
+    {id: '06', a: 3},
+  ];
+  const db = new Database(createSilentLogContext(), ':memory:');
+  db.exec(/* sql */ `CREATE TABLE bar (id TEXT PRIMARY KEY, a);`);
+  const stmt = db.prepare(/* sql */ `INSERT INTO bar (id, a) VALUES (?, ?);`);
+  for (const row of allRows) {
+    stmt.run(row.id, row.a);
+  }
+
+  test('the declared row order is the IVM comparator order', () => {
+    expect(allRows.toSorted(makeComparator(barOrder))).toEqual(allRows);
+  });
+
+  test.each([
+    {
+      name: 'start `after` a NULL-sorted row continues through the NULL group into the non-NULL rows',
+      fetchArgs: {
+        constraint: undefined,
+        start: {row: allRows[1], basis: 'after'},
+      },
+      expectedRows: allRows.slice(2),
+    },
+    {
+      name: 'start `after` a NULL-sorted row needs no optional metadata — the bound value proves nullability',
+      columns: bareBarColumns,
+      fetchArgs: {
+        constraint: undefined,
+        start: {row: allRows[1], basis: 'after'},
+      },
+      expectedRows: allRows.slice(2),
+    },
+    {
+      name: 'start `at` a NULL-sorted row includes the anchor row',
+      fetchArgs: {
+        constraint: undefined,
+        start: {row: allRows[1], basis: 'at'},
+      },
+      expectedRows: allRows.slice(1),
+    },
+    {
+      name: 'reverse start `after` a NULL-sorted row walks the strictly-before rows',
+      fetchArgs: {
+        constraint: undefined,
+        start: {row: allRows[1], basis: 'after'},
+        reverse: true,
+      },
+      expectedRows: allRows.slice(0, 1),
+    },
+    {
+      name: 'reverse start `after` a non-NULL row admits the NULL group that sorts before it',
+      fetchArgs: {
+        constraint: undefined,
+        start: {row: allRows[4], basis: 'after'},
+        reverse: true,
+      },
+      expectedRows: allRows.slice(0, 4).toReversed(),
+    },
+  ] as const)('$name', ({fetchArgs, expectedRows, ...testCase}) => {
+    const source = new TableSource(
+      lc,
+      testLogConfig,
+      db,
+      'bar',
+      'columns' in testCase ? testCase.columns : barColumns,
+      ['id'],
+    );
+    const c = source.connect(barOrder);
+    const out = new Catch(c);
+    c.setOutput(out);
+    const rows = out.fetch(fetchArgs);
+    expect(
+      rows.map(r => {
+        assert(r !== 'yield', 'Expected row result, not yield');
+        return r.row;
+      }),
+    ).toEqual(expectedRows);
+  });
+
+  test('a NULL in a later sort key continues through the rest of its tie-break group', () => {
+    // The anchor's leading key is non-NULL; only the second sort key is NULL.
+    // The continuation must cover the remaining rows of the leading-key group
+    // (its NULL tie-break siblings first, then its non-NULL ones) before
+    // moving on — previously `b > NULL` and `b = NULL` matched nothing, so
+    // every remaining row of the group was silently dropped and the walk
+    // jumped straight to the next leading-key value.
+    type Baz = {id: string; a: number; b: string | null};
+    const bazColumns = {
+      id: {type: 'string'},
+      a: {type: 'number'},
+      b: {type: 'string'},
+    } as const;
+    const bazOrder = [
+      ['a', 'asc'],
+      ['b', 'asc'],
+      ['id', 'asc'],
+    ] as const;
+    // Declared in comparator order.
+    const bazRows: Baz[] = [
+      {id: 'x1', a: 1, b: null},
+      {id: 'x2', a: 1, b: null},
+      {id: 'x3', a: 1, b: null},
+      {id: 'y1', a: 1, b: 'p'},
+      {id: 'z1', a: 2, b: 'r'},
+    ];
+    const bazDb = new Database(createSilentLogContext(), ':memory:');
+    bazDb.exec(/* sql */ `CREATE TABLE baz (id TEXT PRIMARY KEY, a, b);`);
+    const insert = bazDb.prepare(
+      /* sql */ `INSERT INTO baz (id, a, b) VALUES (?, ?, ?);`,
+    );
+    for (const row of bazRows) {
+      insert.run(row.id, row.a, row.b);
+    }
+
+    expect(bazRows.toSorted(makeComparator(bazOrder))).toEqual(bazRows);
+
+    const source = new TableSource(
+      lc,
+      testLogConfig,
+      bazDb,
+      'baz',
+      bazColumns,
+      ['id'],
+    );
+    const c = source.connect(bazOrder);
+    const out = new Catch(c);
+    c.setOutput(out);
+    const rows = out.fetch({
+      constraint: undefined,
+      start: {row: bazRows[1], basis: 'after'},
+    });
+    expect(
+      rows.map(r => {
+        assert(r !== 'yield', 'Expected row result, not yield');
+        return r.row;
+      }),
+    ).toEqual(bazRows.slice(2));
   });
 });
 
@@ -289,7 +475,7 @@ describe('fetched value types', () => {
 
       if (c.output) {
         expect(
-          [...input.fetch({})].map(node =>
+          Array.from(input.fetch({}), node =>
             node === 'yield' ? node : node.row,
           ),
         ).toEqual([c.output]);
@@ -346,15 +532,13 @@ test('pushing values does the correct writes and outputs', () => {
      * 4. add a row that already exists throws
      */
     consume(
-      source.push({
-        type: 'add',
-        row: {a: 1, b: 2.123, c: false, d: 'json string'},
-      }),
+      source.push(
+        makeSourceChangeAdd({a: 1, b: 2.123, c: false, d: 'json string'}),
+      ),
     );
 
-    expect(outputted.shift()).toEqual({
-      type: 'add',
-      node: {
+    expect(outputted.shift()).toEqual(
+      makeAddChange({
         relationships: {},
         row: {
           a: 1,
@@ -362,49 +546,32 @@ test('pushing values does the correct writes and outputs', () => {
           c: false,
           d: 'json string',
         },
-      },
-    });
-    expect(read.all()).toEqual([{a: 1, b: 2.123, c: 0, d: '"json string"'}]);
-
-    consume(
-      source.push({
-        type: 'remove',
-        row: {a: 1, b: 2.123},
       }),
     );
+    expect(read.all()).toEqual([{a: 1, b: 2.123, c: 0, d: '"json string"'}]);
 
-    expect(outputted.shift()).toEqual({
-      type: 'remove',
-      node: {
+    consume(source.push(makeSourceChangeRemove({a: 1, b: 2.123})));
+
+    expect(outputted.shift()).toEqual(
+      makeRemoveChange({
         relationships: {},
         row: {
           a: 1,
           b: 2.123,
         },
-      },
-    });
+      }),
+    );
     expect(read.all()).toEqual([]);
 
     expect(() => {
-      consume(
-        source.push({
-          type: 'remove',
-          row: {a: 1, b: 2.123},
-        }),
-      );
+      consume(source.push(makeSourceChangeRemove({a: 1, b: 2.123})));
     }).toThrow();
     expect(read.all()).toEqual([]);
 
-    consume(
-      source.push({
-        type: 'add',
-        row: {a: 1, b: 2.123, c: true, d: {}},
-      }),
-    );
+    consume(source.push(makeSourceChangeAdd({a: 1, b: 2.123, c: true, d: {}})));
 
-    expect(outputted.shift()).toEqual({
-      type: 'add',
-      node: {
+    expect(outputted.shift()).toEqual(
+      makeAddChange({
         relationships: {},
         row: {
           a: 1,
@@ -412,44 +579,40 @@ test('pushing values does the correct writes and outputs', () => {
           c: true,
           d: {},
         },
-      },
-    });
+      }),
+    );
     expect(read.all()).toEqual([{a: 1, b: 2.123, c: 1, d: '{}'}]);
 
     expect(() => {
       consume(
-        source.push({
-          type: 'add',
-          row: {a: 1, b: 2.123, c: true, d: null},
-        }),
+        source.push(makeSourceChangeAdd({a: 1, b: 2.123, c: true, d: null})),
       );
     }).toThrow();
 
     // bigint rows
     consume(
-      source.push({
-        type: 'add',
-        row: {
+      source.push(
+        makeSourceChangeAdd({
           a: BigInt(Number.MAX_SAFE_INTEGER),
           b: 3.456,
           c: true,
           d: [],
-        } as unknown as Row,
-      }),
+        } as unknown as Row),
+      ),
     );
 
-    expect(outputted.shift()).toEqual({
-      type: 'add',
-      node: {
+    expect(outputted.shift()).toEqual(
+      makeAddChange({
         relationships: {},
         row: {
-          a: 9007199254740991n,
+          // TODO(arv): Fix Row type!!!
+          a: 9007199254740991n as unknown as number,
           b: 3.456,
           c: true,
           d: [],
         },
-      },
-    });
+      }),
+    );
 
     expect(read.all()).toEqual([
       {a: 1, b: 2.123, c: 1, d: '{}'},
@@ -457,28 +620,26 @@ test('pushing values does the correct writes and outputs', () => {
     ]);
 
     consume(
-      source.push({
-        type: 'add',
-        row: {
+      source.push(
+        makeSourceChangeAdd({
           a: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
           b: 0,
           c: true,
           d: true,
-        } as unknown as Row,
-      }),
+        } as unknown as Row),
+      ),
     );
     outputted.shift();
 
     consume(
-      source.push({
-        type: 'add',
-        row: {
+      source.push(
+        makeSourceChangeAdd({
           a: 0,
           b: BigInt(Number.MIN_SAFE_INTEGER) - 1n,
           c: true,
           d: false,
-        } as unknown as Row,
-      }),
+        } as unknown as Row),
+      ),
     );
     outputted.shift();
 
@@ -502,43 +663,43 @@ test('pushing values does the correct writes and outputs', () => {
     read.safeIntegers(false);
 
     consume(
-      source.push({
-        type: 'remove',
-        row: {
+      source.push(
+        makeSourceChangeRemove({
           a: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
           b: 0,
           c: true,
-        } as unknown as Row,
-      }),
+        } as unknown as Row),
+      ),
     );
     outputted.shift();
 
     consume(
-      source.push({
-        type: 'remove',
-        row: {
+      source.push(
+        makeSourceChangeRemove({
           a: 0,
           b: BigInt(Number.MIN_SAFE_INTEGER) - 1n,
           c: true,
-        } as unknown as Row,
-      }),
+        } as unknown as Row),
+      ),
     );
     outputted.shift();
 
     // edit changes
     consume(
-      source.push({
-        type: 'edit',
-        row: {a: 1, b: 2.123, c: false, d: {a: true}} as unknown as Row,
-        oldRow: {a: 1, b: 2.123, c: true, d: {}} as unknown as Row,
-      }),
+      source.push(
+        makeSourceChangeEdit(
+          {a: 1, b: 2.123, c: false, d: {a: true}} as unknown as Row,
+          {a: 1, b: 2.123, c: true, d: {}} as unknown as Row,
+        ),
+      ),
     );
 
-    expect(outputted.shift()).toEqual({
-      type: 'edit',
-      oldNode: {row: {a: 1, b: 2.123, c: true, d: {}}, relationships: {}},
-      node: {row: {a: 1, b: 2.123, c: false, d: {a: true}}, relationships: {}},
-    });
+    expect(outputted.shift()).toEqual(
+      makeEditChange(
+        {row: {a: 1, b: 2.123, c: false, d: {a: true}}, relationships: {}},
+        {row: {a: 1, b: 2.123, c: true, d: {}}, relationships: {}},
+      ),
+    );
 
     expect(read.all()).toEqual([
       {a: 1, b: 2.123, c: 0, d: '{"a":true}'},
@@ -547,20 +708,22 @@ test('pushing values does the correct writes and outputs', () => {
 
     // edit pk should fall back to remove and insert
     consume(
-      source.push({
-        type: 'edit',
-        oldRow: {a: 1, b: 2.123, c: false, d: {a: true}},
-        row: {a: 1, b: 3, c: false, d: {a: true}},
-      }),
+      source.push(
+        makeSourceChangeEdit(
+          {a: 1, b: 3, c: false, d: {a: true}},
+          {a: 1, b: 2.123, c: false, d: {a: true}},
+        ),
+      ),
     );
-    expect(outputted.shift()).toEqual({
-      type: 'edit',
-      oldNode: {
-        row: {a: 1, b: 2.123, c: false, d: {a: true}},
-        relationships: {},
-      },
-      node: {row: {a: 1, b: 3, c: false, d: {a: true}}, relationships: {}},
-    });
+    expect(outputted.shift()).toEqual(
+      makeEditChange(
+        {row: {a: 1, b: 3, c: false, d: {a: true}}, relationships: {}},
+        {
+          row: {a: 1, b: 2.123, c: false, d: {a: true}},
+          relationships: {},
+        },
+      ),
+    );
     expect(read.all()).toEqual([
       {a: 9007199254740991, b: 3.456, c: 1, d: '[]'},
       {a: 1, b: 3, c: 0, d: '{"a":true}'},
@@ -569,11 +732,12 @@ test('pushing values does the correct writes and outputs', () => {
     // non existing old row
     expect(() => {
       consume(
-        source.push({
-          type: 'edit',
-          row: {a: 11, b: 2.123, c: 0},
-          oldRow: {a: 12, b: 2.123, c: 1},
-        }),
+        source.push(
+          makeSourceChangeEdit(
+            {a: 11, b: 2.123, c: 0},
+            {a: 12, b: 2.123, c: 1},
+          ),
+        ),
       );
     }).toThrow('Row not found');
   }
@@ -975,4 +1139,170 @@ describe('fromSQLiteTypes error messages', () => {
       `[SyntaxError: Unexpected token 'o', "not valid json" is not valid JSON]`,
     );
   });
+});
+
+test('debug.recordExplain captures the plan SQLite picked for the real bindings', () => {
+  const db = new Database(lc, ':memory:');
+  db.exec(`
+    CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT);
+    CREATE UNIQUE INDEX idx_users_email ON users(email);
+  `);
+  db.prepare('INSERT INTO users (id, email) VALUES (?, ?)').run('1', 'a@b');
+  db.prepare('INSERT INTO users (id, email) VALUES (?, ?)').run('2', 'c@d');
+
+  const source = new TableSource(
+    lc,
+    testLogConfig,
+    db,
+    'users',
+    {id: {type: 'string'}, email: {type: 'string'}},
+    ['id'],
+  );
+
+  const debug = new Debug();
+  const input = source.connect([['id', 'asc']], undefined, undefined, debug);
+
+  // Drain the iterator with a constraint that uses the email index.
+  [...input.fetch({constraint: {email: 'a@b'}})];
+
+  const plans = debug.getSQLitePlans();
+  const entries = Object.entries(plans);
+  expect(entries).toHaveLength(1);
+  const [sql, planLines] = entries[0];
+  expect(sql).toContain('"email" = ?');
+  // The captured plan reflects what SQLite actually ran with email='a@b'.
+  // SQLite picks the unique index here (SEARCH ... USING INDEX), not a SCAN.
+  expect(planLines.join('\n')).toMatch(/SEARCH .* USING (COVERING )?INDEX/);
+});
+
+test('captured plan diverges from substituted-literal plan when bindings affect plan choice', () => {
+  // Demonstrates the bug explainQueries has: substituting 'sdfse' for ?
+  // can cause SQLite to pick a more optimistic plan than the prepared
+  // statement actually uses.
+  //
+  // For `WHERE name LIKE ?` with PRAGMA case_sensitive_like = 1, SQLite
+  // cannot know at prepare time whether the bound value contains wildcards,
+  // so it conservatively picks SCAN. When the literal 'sdfse' is substituted,
+  // SQLite sees a wildcard-free pattern and rewrites it to an index range
+  // search — a plan that bears no resemblance to what actually runs.
+  const db = new Database(lc, ':memory:');
+  db.exec(`
+    PRAGMA case_sensitive_like = 1;
+    CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_items_name ON items(name);
+  `);
+  for (let i = 0; i < 50; i++) {
+    db.prepare('INSERT INTO items (id, name) VALUES (?, ?)').run(
+      String(i),
+      `name_${i}`,
+    );
+  }
+  db.exec('ANALYZE');
+
+  const source = new TableSource(
+    lc,
+    testLogConfig,
+    db,
+    'items',
+    {id: {type: 'string'}, name: {type: 'string'}},
+    ['id'],
+  );
+
+  const likeFilter = {
+    type: 'simple',
+    left: {type: 'column', name: 'name'},
+    op: 'LIKE',
+    right: {type: 'literal', value: 'name_5%'},
+  } as const;
+
+  const debug = new Debug();
+  const input = source.connect([['id', 'asc']], likeFilter, undefined, debug);
+
+  [...input.fetch({})];
+
+  const plans = debug.getSQLitePlans();
+  const entries = Object.entries(plans);
+  expect(entries).toHaveLength(1);
+  const [sql, capturedPlan] = entries[0];
+  expect(sql).toContain('"name" LIKE ?');
+
+  // Captured plan reflects the real prepared statement: SCAN, since SQLite
+  // cannot prove the LIKE pattern is wildcard-free.
+  expect(capturedPlan.join('\n')).toMatch(/SCAN/);
+  expect(capturedPlan.join('\n')).not.toMatch(
+    /SEARCH .* USING (COVERING )?INDEX/,
+  );
+
+  // explainQueries substitutes 'sdfse' for ?, so SQLite sees a wildcard-free
+  // pattern and produces a range-scan plan that does not match reality.
+  const substitutedPlan = explainQueries({items: {[sql]: 1}}, db)[sql];
+  expect(substitutedPlan.join('\n')).toMatch(
+    /SEARCH .* USING (COVERING )?INDEX/,
+  );
+
+  expect(capturedPlan).not.toEqual(substitutedPlan);
+});
+
+test('SQLite iterator is closed when an error occurs before #mapFromSQLiteTypes is iterated', () => {
+  const db = new Database(lc, ':memory:');
+  db.exec('CREATE TABLE test (id TEXT PRIMARY KEY, val INTEGER);');
+  db.prepare('INSERT INTO test (id, val) VALUES (?, ?)').run('1', 1);
+
+  const source = new TableSource(
+    lc,
+    testLogConfig,
+    db,
+    'test',
+    {id: {type: 'string'}, val: {type: 'number'}},
+    ['id'],
+  );
+
+  // Spy on Statement.prototype.iterate to track .return() calls on the
+  // returned iterator.
+  let iteratorReturnCalled = false;
+  const origIterate = Statement.prototype.iterate;
+  // @ts-expect-error monkey-patching for test
+  Statement.prototype.iterate = function (...args) {
+    const iter = origIterate.apply(this, args);
+    const origReturn = must(iter.return).bind(iter);
+    iter.return = () => {
+      iteratorReturnCalled = true;
+      return origReturn();
+    };
+    return iter;
+  };
+
+  try {
+    // debug.initQuery() is called in #fetch after the SQLite iterator is
+    // created but before the yield* generator chain (and thus
+    // #mapFromSQLiteTypes) is ever iterated. If initQuery throws, the fix
+    // ensures rowIterator.return() is still called in #fetch's finally block.
+    // Without the fix, rowIterator.return() was only in #mapFromSQLiteTypes'
+    // finally block, which never ran because the generator was never started.
+    const throwingDebug: DebugDelegate = {
+      initQuery() {
+        throw new Error('initQuery error');
+      },
+      rowVended() {},
+      getVendedRowCounts: () => ({}),
+      getVendedRows: () => ({}),
+      recordNVisit() {},
+      getNVisitCounts: () => ({}),
+      recordExplain() {},
+      getSQLitePlans: () => ({}),
+      reset() {},
+    };
+
+    const input = source.connect(
+      [['id', 'asc']],
+      undefined,
+      undefined,
+      throwingDebug,
+    );
+
+    expect(() => [...input.fetch({})]).toThrow('initQuery error');
+    expect(iteratorReturnCalled).toBe(true);
+  } finally {
+    Statement.prototype.iterate = origIterate;
+  }
 });

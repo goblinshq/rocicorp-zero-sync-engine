@@ -1,24 +1,25 @@
 import type {LogLevel} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
-import {nanoid} from '../util/nanoid.ts';
 // import {type VitestUtils} from 'vitest';
 import type {Store} from '../../../replicache/src/dag/store.ts';
 import {assert} from '../../../shared/src/asserts.ts';
 import type {JSONValue, ReadonlyJSONValue} from '../../../shared/src/json.ts';
 import {TestLogSink} from '../../../shared/src/logging-test-utils.ts';
+import {assertTesting} from '../../../shared/src/testing.ts';
 import type {ConnectedMessage} from '../../../zero-protocol/src/connect.ts';
 import type {Downstream} from '../../../zero-protocol/src/down.ts';
 import type {
   ErrorBody,
   ErrorMessage,
 } from '../../../zero-protocol/src/error.ts';
-import type {
-  PokeEndBody,
-  PokeEndMessage,
-  PokePartBody,
-  PokePartMessage,
-  PokeStartBody,
-  PokeStartMessage,
+import {
+  POKE_CHUNK_MESSAGE_TYPE,
+  type PokeEndBody,
+  type PokeEndMessage,
+  type PokePartBody,
+  type PokePartMessage,
+  type PokeStartBody,
+  type PokeStartMessage,
 } from '../../../zero-protocol/src/poke.ts';
 import type {PongMessage} from '../../../zero-protocol/src/pong.ts';
 import type {
@@ -34,6 +35,7 @@ import {upstreamSchema} from '../../../zero-protocol/src/up.ts';
 import type {Schema} from '../../../zero-types/src/schema.ts';
 import {asQueryInternals} from '../../../zql/src/query/query-internals.ts';
 import type {AnyQuery, Query} from '../../../zql/src/query/query.ts';
+import {nanoid} from '../util/nanoid.ts';
 import type {
   ConnectionManager,
   ConnectionManagerState,
@@ -118,12 +120,12 @@ export class TestZero<
   }
 
   get connectionStatus(): ConnectionStatus {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     return this[exposedToTestingSymbol].connectionManager().state.name;
   }
 
   get connectionState(): ConnectionManagerState {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     return this[exposedToTestingSymbol].connectionManager().state;
   }
 
@@ -151,7 +153,7 @@ export class TestZero<
   }
 
   [createLogOptionsSymbol](options: {consoleLogLevel: LogLevel}): LogOptions {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     return {
       logLevel: options.consoleLogLevel,
       logSink: new TestLogSink(),
@@ -159,7 +161,7 @@ export class TestZero<
   }
 
   get testLogSink(): TestLogSink {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     const {logSink} = this[exposedToTestingSymbol].logOptions;
     assert(
       logSink instanceof TestLogSink,
@@ -215,6 +217,23 @@ export class TestZero<
     return this.triggerMessage(msg);
   }
 
+  async triggerPokeChunks(pokeParts: PokePartBody[]): Promise<void> {
+    const socket = await this.socket;
+    assert(!socket.closed, 'Expected socket to be open');
+    const payload = new TextEncoder().encode(JSON.stringify(pokeParts));
+    const bytes = new Uint8Array(payload.byteLength + 1);
+    bytes[0] = POKE_CHUNK_MESSAGE_TYPE;
+    bytes.set(payload, 1);
+    socket.dispatchEvent(
+      new MessageEvent('message', {
+        data: bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        ),
+      }),
+    );
+  }
+
   triggerPokeEnd(pokeEnd: PokeEndBody): Promise<void> {
     const msg: PokeEndMessage = ['pokeEnd', pokeEnd];
     return this.triggerMessage(msg);
@@ -228,10 +247,7 @@ export class TestZero<
       pokeID: id,
       baseCookie: baseCookieStr,
     });
-    await this.triggerPokePart({
-      ...pokePart,
-      pokeID: id,
-    });
+    await this.triggerPokeChunks([{...pokePart, pokeID: id}]);
     if (this.#cookie === null) {
       this.#cookie = 1;
     } else {
@@ -259,9 +275,11 @@ export class TestZero<
     return this.triggerMessage(msg);
   }
 
-  async triggerClose(): Promise<void> {
+  async triggerClose(code?: number | undefined): Promise<void> {
     const socket = await this.socket;
-    socket.dispatchEvent(new CloseEvent('close'));
+    socket.dispatchEvent(
+      new CloseEvent('close', code !== undefined ? {code} : undefined),
+    );
   }
 
   async triggerGotQueriesPatch(
@@ -284,22 +302,22 @@ export class TestZero<
   declare [exposedToTestingSymbol]: TestingContext;
 
   get pusher() {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     return this[exposedToTestingSymbol].pusher;
   }
 
   get puller() {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     return this[exposedToTestingSymbol].puller;
   }
 
   set reload(r: () => void) {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     this[exposedToTestingSymbol].setReload(r);
   }
 
   get queryDelegate() {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     return this[exposedToTestingSymbol].queryDelegate();
   }
 
@@ -330,7 +348,7 @@ export class TestZero<
    * want to simulate that all queries have been fully synced from the server.
    */
   async markAllQueriesAsGot(): Promise<void> {
-    assert(TESTING, 'Expected TESTING to be true');
+    assertTesting();
     const queryManager = this[exposedToTestingSymbol].queryManager();
     const gotQueriesPatch = Array.from(
       queryManager.getAllNonGotQueryHashes(),
@@ -348,8 +366,6 @@ export class TestZero<
     await this.triggerPoke({gotQueriesPatch});
   }
 }
-
-declare const TESTING: boolean;
 
 let testZeroCounter = 0;
 

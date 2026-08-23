@@ -1,5 +1,7 @@
 import {expect, suite, test} from 'vitest';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {assert} from '../../../shared/src/asserts.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {CompoundKey, Ordering} from '../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../zero-protocol/src/primary-key.ts';
@@ -8,11 +10,14 @@ import {Catch, type CaughtChange} from './catch.ts';
 import {Join} from './join.ts';
 import type {Input} from './operator.ts';
 import {Snitch, type SnitchMessage} from './snitch.ts';
-import type {SourceChange} from './source.ts';
-import {createSource} from './test/source-factory.ts';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
+import {
+  type SourceChange,
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from './source.ts';
 import {consume} from './stream.ts';
+import {createSource} from './test/source-factory.ts';
 
 const lc = createSilentLogContext();
 
@@ -54,7 +59,7 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [{id: 'o1'}, {id: 'o2'}],
       ],
-      pushes: [[0, {type: 'add', row: {id: 'i3', ownerId: 'o2'}}]],
+      pushes: [[0, makeSourceChangeAdd({id: 'i3', ownerId: 'o2'})]],
     });
     expect(log).toMatchInlineSnapshot(`
       [
@@ -151,7 +156,7 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [{id: 'o1'}],
       ],
-      pushes: [[2, {type: 'add', row: {id: 'o2'}}]],
+      pushes: [[2, makeSourceChangeAdd({id: 'o2'})]],
     });
     expect(log).toMatchInlineSnapshot(`
       [
@@ -227,7 +232,7 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [{id: 'o1'}, {id: 'o2'}],
       ],
-      pushes: [[1, {type: 'add', row: {id: 'c5', issueId: 'i1'}}]],
+      pushes: [[1, makeSourceChangeAdd({id: 'c5', issueId: 'i1'})]],
     });
     expect(log).toMatchInlineSnapshot(`
       [
@@ -305,7 +310,7 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [{id: 'o1'}, {id: 'o2'}],
       ],
-      pushes: [[2, {type: 'remove', row: {id: 'o2'}}]],
+      pushes: [[2, makeSourceChangeRemove({id: 'o2'})]],
     });
     expect(log).toMatchInlineSnapshot(`
       [
@@ -381,7 +386,7 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         ],
         [{id: 'o1'}, {id: 'o2'}],
       ],
-      pushes: [[1, {type: 'remove', row: {id: 'c4', issueId: 'i2'}}]],
+      pushes: [[1, makeSourceChangeRemove({id: 'c4', issueId: 'i2'})]],
     });
     expect(log).toMatchInlineSnapshot(`
       [
@@ -485,11 +490,10 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         pushes: [
           [
             0,
-            {
-              type: 'edit',
-              oldRow: {id: 'i1', ownerId: 'o1', text: 'issue 1'},
-              row: {id: 'i1', ownerId: 'o1', text: 'issue 1 changed'},
-            },
+            makeSourceChangeEdit(
+              {id: 'i1', ownerId: 'o1', text: 'issue 1 changed'},
+              {id: 'i1', ownerId: 'o1', text: 'issue 1'},
+            ),
           ],
         ],
       });
@@ -539,11 +543,10 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         pushes: [
           [
             1,
-            {
-              type: 'edit',
-              oldRow: {id: 'c4', issueId: 'i2', text: 'comment 4'},
-              row: {id: 'c4', issueId: 'i2', text: 'comment 4 changed'},
-            },
+            makeSourceChangeEdit(
+              {id: 'c4', issueId: 'i2', text: 'comment 4 changed'},
+              {id: 'c4', issueId: 'i2', text: 'comment 4'},
+            ),
           ],
         ],
       });
@@ -623,11 +626,10 @@ suite('sibling relationships tests with issues, comments, and owners', () => {
         pushes: [
           [
             2,
-            {
-              type: 'edit',
-              oldRow: {id: 'o2', text: 'owner 2'},
-              row: {id: 'o2', text: 'owner 2 changed'},
-            },
+            makeSourceChangeEdit(
+              {id: 'o2', text: 'owner 2 changed'},
+              {id: 'o2', text: 'owner 2'},
+            ),
           ],
         ],
       });
@@ -718,7 +720,7 @@ function pushSiblingTest(t: PushTestSibling): PushTestSiblingResults {
       t.primaryKeys[i],
     );
     for (const row of rows) {
-      consume(source.push({type: 'add', row}));
+      consume(source.push(makeSourceChangeAdd(row)));
     }
     const snitch = new Snitch(source.connect(ordering), String(i), log, [
       'fetch',
@@ -752,9 +754,10 @@ function pushSiblingTest(t: PushTestSibling): PushTestSiblingResults {
     parent = join;
   }
 
-  const finalJoin = joins[joins.length - 1];
+  const finalJoin = joins.at(-1);
 
-  const c = new Catch(finalJoin);
+  // oxlint-disable-next-line typescript/no-non-null-assertion
+  const c = new Catch(finalJoin!);
   c.fetch();
 
   log.length = 0;

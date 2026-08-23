@@ -7,6 +7,10 @@ import type {Service} from './service.ts';
 
 export type Options = {
   port: number;
+  keepaliveTimeoutMs: number | undefined;
+
+  // Wait for the readinessGate to resolve before responding to health checks.
+  readinessGate?: Promise<void> | undefined;
 };
 
 /**
@@ -20,8 +24,10 @@ export class HttpService implements Service {
   readonly #fastify: FastifyInstance;
   readonly #port: number;
   protected readonly _state: RunningState;
-  readonly #heartbeatMonitor: HeartbeatMonitor;
+  readonly #heartbeatMonitor: HeartbeatMonitor | undefined;
   readonly #init: (fastify: FastifyInstance) => void | Promise<void>;
+
+  #ready = false;
 
   constructor(
     id: string,
@@ -29,13 +35,18 @@ export class HttpService implements Service {
     opts: Options,
     init: (fastify: FastifyInstance) => void | Promise<void>,
   ) {
+    const {port, keepaliveTimeoutMs, readinessGate = promiseVoid} = opts;
     this.id = id;
     this._lc = lc.withContext('component', this.id);
     this.#fastify = Fastify();
-    this.#port = opts.port;
+    this.#port = port;
     this.#init = init;
     this._state = new RunningState(id);
-    this.#heartbeatMonitor = new HeartbeatMonitor(this._lc);
+    this.#heartbeatMonitor = keepaliveTimeoutMs
+      ? new HeartbeatMonitor(this._lc, keepaliveTimeoutMs)
+      : undefined;
+
+    void readinessGate.then(() => (this.#ready = true));
   }
 
   // Life-cycle hooks for subclass implementations
@@ -46,10 +57,16 @@ export class HttpService implements Service {
   // start() is used in unit tests.
   // run() is the lifecycle method called by the ServiceRunner.
   async start(): Promise<string> {
-    this.#fastify.get('/', (_req, res) => res.send('OK'));
+    this.#fastify.get('/', (_req, res) => {
+      if (this.#ready) {
+        res.send('OK');
+      }
+    });
     this.#fastify.get('/keepalive', ({headers}, res) => {
-      this.#heartbeatMonitor.onHeartbeat(headers);
-      return res.send('OK');
+      this.#heartbeatMonitor?.onHeartbeat(headers);
+      if (this.#ready) {
+        res.send('OK');
+      }
     });
     await this.#init(this.#fastify);
     const address = await this.#fastify.listen({
@@ -68,7 +85,7 @@ export class HttpService implements Service {
 
   async stop(): Promise<void> {
     this._lc.info?.(`${this.id}: no longer accepting connections`);
-    this.#heartbeatMonitor.stop();
+    this.#heartbeatMonitor?.stop();
     this._state.stop(this._lc);
     await this.#fastify.close();
     await this._onStop();

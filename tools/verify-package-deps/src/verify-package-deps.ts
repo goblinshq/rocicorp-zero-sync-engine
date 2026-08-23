@@ -2,7 +2,7 @@
 import {readdir, readFile, writeFile} from 'node:fs/promises';
 import {dirname, join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {parseAsync} from 'oxc-parser';
+import {parse} from 'oxc-parser';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE_ROOT = join(__dirname, '../../..');
@@ -79,7 +79,7 @@ async function extractImports(
   const lines = content.split('\n');
 
   try {
-    const result = await parseAsync(filePath, content);
+    const result = await parse(filePath, content);
 
     // Extract static imports from the module info
     for (const imp of result.module.staticImports) {
@@ -402,9 +402,9 @@ async function fixPackageJson(
     pkgJson.devDependencies = {};
   }
 
-  // Add missing dependencies with their actual versions
+  // Add missing dependencies using workspace protocol for workspace packages
   for (const dep of missingDeps) {
-    pkgJson.devDependencies[dep.name] = dep.version;
+    pkgJson.devDependencies[dep.name] = 'workspace:*';
   }
 
   // Sort devDependencies alphabetically
@@ -556,9 +556,12 @@ async function verifyPackageJsonDependencies(fix: boolean) {
       if (!allDeclaredDeps[targetWorkspaceName]) {
         missing.push({name: targetWorkspaceName, version: targetVersion});
       } else {
-        // Check if version matches
+        // Check if version matches — workspace:* protocol is always valid for workspace packages
         const declaredVersion = allDeclaredDeps[targetWorkspaceName];
-        if (declaredVersion !== targetVersion) {
+        if (
+          declaredVersion !== targetVersion &&
+          !declaredVersion.startsWith('workspace:')
+        ) {
           versionMismatches.push({
             package: sourcePackage,
             dependency: targetWorkspaceName,
@@ -671,7 +674,7 @@ async function verifyPackageJsonDependencies(fix: boolean) {
     const total =
       missingDeps.length + versionMismatches.length + extraDeps.length;
     console.log(
-      `✅ Fixed ${total} issue(s). Run 'npm install' to update lockfile.`,
+      `✅ Fixed ${total} issue(s). Run 'pnpm install' to update lockfile.`,
     );
     return true;
   } else {

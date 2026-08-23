@@ -1,6 +1,8 @@
 import {expect, suite, test} from 'vitest';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {assert} from '../../../shared/src/asserts.ts';
 import type {JSONValue} from '../../../shared/src/json.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {Ordering} from '../../../zero-protocol/src/ast.ts';
 import type {Row, Value} from '../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../zero-protocol/src/primary-key.ts';
@@ -11,12 +13,11 @@ import {MemoryStorage} from './memory-storage.ts';
 import type {FetchRequest} from './operator.ts';
 import {Snitch, type SnitchMessage} from './snitch.ts';
 import type {Stream} from './stream.ts';
+import {consume} from './stream.ts';
 import {Take, type PartitionKey} from './take.ts';
 import {createSource} from './test/source-factory.ts';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
-import {consume} from './stream.ts';
 
+import {makeSourceChangeAdd} from './source.ts';
 const lc = createSilentLogContext();
 
 suite('take with no partition', () => {
@@ -414,7 +415,7 @@ test('early return during hydrate', () => {
     {id: 'i3', created: 300},
   ];
   for (const row of sourceRows) {
-    consume(source.push({type: 'add', row}));
+    consume(source.push(makeSourceChangeAdd(row)));
   }
   const snitch = new Snitch(source.connect([['id', 'asc']]), 'takeSnitch', log);
   const storage = new MemoryStorage();
@@ -1413,7 +1414,7 @@ function takeTest(t: TakeTest): TakeTestResults {
     t.primaryKey,
   );
   for (const row of t.sourceRows) {
-    consume(source.push({type: 'add', row}));
+    consume(source.push(makeSourceChangeAdd(row)));
   }
   const snitch = new Snitch(
     source.connect(t.sort || [['id', 'asc']]),

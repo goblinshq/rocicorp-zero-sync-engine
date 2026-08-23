@@ -87,29 +87,37 @@ export interface Connection {
   readonly state: Source<ConnectionState>;
 
   /**
-   * Resumes the connection from a terminal state.
+   * Updates the auth token and, when Zero is paused in `needs-auth` or `error`,
+   * resumes connecting.
    *
-   * If called when not in a terminal state, this method does nothing.
+   * Calling `connect()` without `auth` preserves the current auth token.
+   * If Zero is already `connected`, it sends an auth update to the server
+   * _without_ reconnecting. In other states, the new token is used the next time
+   * Zero connects.
    *
-   * @param opts - Optional connection options
-   * @param opts.auth - Token to use for authentication. If provided, this overrides
-   *                    the stored auth credential for this connection attempt.
-   *                    If `null` or `undefined`, the stored auth credential is cleared.
-   * @returns A promise that resolves once the connection state has transitioned to connecting.
+   * This method does not reconnect from `disconnected` or `closed`. To switch
+   * to logged-out, create a new Zero instance with `auth` omitted.
+   *
+   * @param opts - Optional connection options.
+   * @param opts.auth - Optional new auth token to store and use for auth refreshes or
+   *                    the next connection.
+   * @returns A promise that resolves immediately unless Zero is paused in
+   *          `needs-auth` or `error`, in which case it resolves after the next
+   *          connection state change.
    */
-  connect(opts?: {auth: string | null | undefined}): Promise<void>;
+  connect(opts?: {auth: string}): Promise<void>;
 }
 
 export class ConnectionImpl implements Connection {
   readonly #connectionManager: ConnectionManager;
   readonly #lc: LogContext;
   readonly #source: ConnectionSource;
-  readonly #setAuth: (auth: string | null | undefined) => void;
+  readonly #setAuth: (auth: string) => void;
 
   constructor(
     connectionManager: ConnectionManager,
     lc: LogContext,
-    setAuth: (auth: string | null | undefined) => void,
+    setAuth: (auth: string) => void,
   ) {
     this.#connectionManager = connectionManager;
     this.#lc = lc;
@@ -121,7 +129,7 @@ export class ConnectionImpl implements Connection {
     return this.#source;
   }
 
-  async connect(opts?: {auth: string | null | undefined}): Promise<void> {
+  async connect(opts?: {auth: string}): Promise<void> {
     const lc = this.#lc.withContext('connect');
 
     if (opts && 'auth' in opts) {

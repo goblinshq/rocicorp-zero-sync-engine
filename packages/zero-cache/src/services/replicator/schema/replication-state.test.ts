@@ -2,10 +2,7 @@ import {beforeEach, describe, expect, test} from 'vitest';
 import {createSilentLogContext} from '../../../../../shared/src/logging-test-utils.ts';
 import {Database} from '../../../../../zqlite/src/db.ts';
 import {StatementRunner} from '../../../db/statements.ts';
-import {
-  expectMatchingObjectsInTables,
-  expectTables,
-} from '../../../test/lite.ts';
+import {expectMatchingObjectsInTables} from '../../../test/lite.ts';
 import {
   getAscendingEvents,
   getReplicationState,
@@ -41,6 +38,7 @@ describe('replicator/schema/replication-state', () => {
         {
           lock: 1,
           stateVersion: '0a',
+          writeTimeMs: expect.any(Number),
         },
       ],
       ['_zero.runtimeEvents']: [
@@ -50,6 +48,15 @@ describe('replicator/schema/replication-state', () => {
         },
       ],
     });
+
+    // The change log lives in its own database as of replica schema v16, so
+    // initial sync neither creates nor seeds a copy here.
+    expect(
+      db.db
+        .prepare(/*sql*/ `SELECT "name" FROM "sqlite_master"
+                     WHERE "tbl_name" = '_zero.changeLogStream'`)
+        .all(),
+    ).toEqual([]);
   });
 
   test('runtime events', () => {
@@ -94,11 +101,12 @@ describe('replicator/schema/replication-state', () => {
 
   test('update watermark state', () => {
     updateReplicationWatermark(db, '0f');
-    expectTables(db.db, {
+    expectMatchingObjectsInTables(db.db, {
       ['_zero.replicationState']: [
         {
           lock: 1,
           stateVersion: '0f',
+          writeTimeMs: expect.any(Number),
         },
       ],
     });
@@ -113,11 +121,12 @@ describe('replicator/schema/replication-state', () => {
     });
 
     updateReplicationWatermark(db, '0r');
-    expectTables(db.db, {
+    expectMatchingObjectsInTables(db.db, {
       ['_zero.replicationState']: [
         {
           lock: 1,
           stateVersion: '0r',
+          writeTimeMs: expect.any(Number),
         },
       ],
     });

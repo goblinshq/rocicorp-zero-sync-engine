@@ -13,6 +13,7 @@ import {
 import * as v from '../../../../../shared/src/valita.ts';
 import type {Database} from '../../../../../zqlite/src/db.ts';
 import type {StatementRunner} from '../../../db/statements.ts';
+import {CREATE_BACKFILLING_TABLE} from './backfilling.ts';
 import {CREATE_CHANGELOG_SCHEMA} from './change-log.ts';
 import {CREATE_COLUMN_METADATA_TABLE} from './column-metadata.ts';
 import {ZERO_VERSION_COLUMN_NAME} from './constants.ts';
@@ -57,17 +58,20 @@ const CREATE_REPLICATION_STATE_SCHEMA =
   //                    `replicaVersion` and moving forward to each subsequent commit watermark
   //                    (e.g. corresponding to a Postgres LSN). Versions are represented as
   //                    lexicographically sortable watermarks (e.g. LexiVersions).
+  // writeTimeMs      : The millisecond epoch at which this version was written to the replica.
   //
-  `
+  /*sql*/ `
   CREATE TABLE "_zero.replicationState" (
     stateVersion TEXT NOT NULL,
+    writeTimeMs INTEGER NOT NULL,
     lock INTEGER PRIMARY KEY DEFAULT 1 CHECK (lock=1)
   );
   ` +
   CREATE_CHANGELOG_SCHEMA +
   CREATE_RUNTIME_EVENTS_TABLE +
   CREATE_COLUMN_METADATA_TABLE +
-  CREATE_TABLE_METADATA_TABLE;
+  CREATE_TABLE_METADATA_TABLE +
+  CREATE_BACKFILLING_TABLE;
 
 const stringArray = v.array(v.string());
 
@@ -130,11 +134,10 @@ export function initReplicationState(
     JSON.stringify(publications.sort()),
     stringify(initialSyncContext),
   );
-  db.prepare(
-    `
-    INSERT INTO "_zero.replicationState" (stateVersion) VALUES (?)
-    `,
-  ).run(watermark);
+  db.prepare(/*sql*/ `
+    INSERT INTO "_zero.replicationState" (stateVersion, writeTimeMs) 
+      VALUES (?, unixepoch('subsec') * 1000)
+    `).run(watermark);
   recordEvent(db, 'sync');
 }
 
@@ -195,8 +198,24 @@ export function getSubscriptionStateAndContext(
 export function updateReplicationWatermark(
   db: StatementRunner,
   watermark: string,
+  writeTimeMs?: number | undefined,
 ) {
-  db.run(`UPDATE "_zero.replicationState" SET stateVersion=?`, watermark);
+  if (writeTimeMs === undefined) {
+    db.run(
+      /*sql*/ `
+      UPDATE "_zero.replicationState"
+        SET stateVersion=?, writeTimeMs=unixepoch('subsec') * 1000`,
+      watermark,
+    );
+  } else {
+    db.run(
+      /*sql*/ `
+      UPDATE "_zero.replicationState"
+        SET stateVersion=?, writeTimeMs=?`,
+      watermark,
+      writeTimeMs,
+    );
+  }
 }
 
 export function getReplicationState(db: StatementRunner): ReplicationState {

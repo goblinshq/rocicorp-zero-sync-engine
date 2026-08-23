@@ -1,23 +1,28 @@
 {
   "name": "client-simulator",
-  "private": true,
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "go": "tsx src/main.ts",
+    "go": "node src/main.ts",
     "check-types": "tsc",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
     "@dotenvx/dotenvx": "^1.39.0",
-    "@rocicorp/logger": "^5.4.0",
+    "@rocicorp/logger": "^6.1.0",
     "nanoid": "^5.1.2",
     "ws": "^8.18.1"
   },
   "devDependencies": {
-    "shared": "0.0.0",
-    "zero-protocol": "0.0.0"
-  }
+    "@types/ws": "^8.5.12",
+    "oxfmt": "^0.45.0",
+    "shared": "workspace:*",
+    "zero-protocol": "workspace:*"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

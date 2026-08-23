@@ -411,15 +411,19 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "a": {
+              "optional": true,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "number",
             },
             "c": {
+              "optional": true,
               "type": "number",
             },
             "d": {
+              "optional": true,
               "type": "number",
             },
           },
@@ -494,15 +498,19 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "a": {
+              "optional": true,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "number",
             },
             "c": {
+              "optional": true,
               "type": "number",
             },
             "d": {
+              "optional": true,
               "type": "number",
             },
           },
@@ -511,10 +519,10 @@ describe('computeZqlSpec', () => {
     `);
   });
 
-  test('unsupported columns (MACADDR8) are excluded', () => {
+  test('unsupported columns (BYTEA) are excluded', () => {
     expect(
       t(`
-    CREATE TABLE foo(a INT, b "TEXT|NOT_NULL", c MACADDR8, d BYTEA);
+    CREATE TABLE foo(a INT, b "TEXT|NOT_NULL", c BYTEA);
     CREATE UNIQUE INDEX foo_pkey ON foo(b ASC);
     `),
     ).toMatchInlineSnapshot(`
@@ -558,9 +566,11 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "a": {
+              "optional": true,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "string",
             },
           },
@@ -569,10 +579,38 @@ describe('computeZqlSpec', () => {
     `);
   });
 
-  test('indexes with unsupported columns (MACADDR8) are excluded', () => {
+  test('timetz columns are synced as numbers', () => {
+    const spec = must(
+      t(`
+    CREATE TABLE foo(id "TEXT|NOT_NULL", time_tz "timetz|NOT_NULL");
+    CREATE UNIQUE INDEX foo_pkey ON foo(id ASC);
+    `)[0],
+    );
+
+    expect(spec.tableSpec.columns.time_tz?.dataType).toBe('timetz|NOT_NULL');
+    expect(spec.zqlSpec.time_tz).toEqual({type: 'number', optional: false});
+  });
+
+  test('text-represented scalar columns can be used as primary keys', () => {
+    const spec = must(
+      t(`
+    CREATE TABLE foo(id "MACADDR8|NOT_NULL", ip INET, book ISBN13);
+    CREATE UNIQUE INDEX foo_pkey ON foo(id ASC);
+    `)[0],
+    );
+
+    expect(spec.tableSpec.primaryKey).toEqual(['id']);
+    expect(spec.zqlSpec).toEqual({
+      id: {type: 'string', optional: false},
+      ip: {type: 'string', optional: true},
+      book: {type: 'string', optional: true},
+    });
+  });
+
+  test('indexes with unsupported columns (BYTEA) are excluded', () => {
     expect(
       t(`
-    CREATE TABLE foo(a "INT|NOT_NULL", b "TEXT|NOT_NULL", c "MACADDR8|NOT_NULL", d "TEXT|NOT_NULL");
+    CREATE TABLE foo(a "INT|NOT_NULL", b "TEXT|NOT_NULL", c "BYTEA|NOT_NULL", d "TEXT|NOT_NULL");
     CREATE UNIQUE INDEX foo_pkey ON foo(a ASC, c DESC);
     CREATE UNIQUE INDEX foo_other_key ON foo(b ASC, d ASC, a DESC);
     `),
@@ -582,9 +620,9 @@ describe('computeZqlSpec', () => {
           "tableSpec": {
             "allPotentialPrimaryKeys": [
               [
-                "a",
                 "b",
                 "d",
+                "a",
               ],
             ],
             "backfilling": [],
@@ -617,15 +655,15 @@ describe('computeZqlSpec', () => {
             "minRowVersion": null,
             "name": "foo",
             "primaryKey": [
-              "a",
               "b",
               "d",
+              "a",
             ],
             "uniqueKeys": [
               [
-                "a",
                 "b",
                 "d",
+                "a",
               ],
               [
                 "a",
@@ -635,12 +673,15 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "a": {
+              "optional": false,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "string",
             },
             "d": {
+              "optional": false,
               "type": "string",
             },
           },
@@ -662,9 +703,9 @@ describe('computeZqlSpec', () => {
           "tableSpec": {
             "allPotentialPrimaryKeys": [
               [
-                "a",
                 "b",
                 "d",
+                "a",
               ],
             ],
             "backfilling": [],
@@ -705,15 +746,15 @@ describe('computeZqlSpec', () => {
             "minRowVersion": null,
             "name": "foo",
             "primaryKey": [
-              "a",
               "b",
               "d",
+              "a",
             ],
             "uniqueKeys": [
               [
-                "a",
                 "b",
                 "d",
+                "a",
               ],
               [
                 "a",
@@ -723,15 +764,19 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "a": {
+              "optional": false,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "string",
             },
             "c": {
+              "optional": true,
               "type": "string",
             },
             "d": {
+              "optional": false,
               "type": "string",
             },
           },
@@ -752,9 +797,9 @@ describe('computeZqlSpec', () => {
           "tableSpec": {
             "allPotentialPrimaryKeys": [
               [
+                "d",
                 "a",
                 "c",
-                "d",
               ],
             ],
             "backfilling": [],
@@ -795,35 +840,53 @@ describe('computeZqlSpec', () => {
             "minRowVersion": null,
             "name": "foo",
             "primaryKey": [
+              "d",
               "a",
               "c",
-              "d",
             ],
             "uniqueKeys": [
               [
+                "d",
                 "a",
                 "c",
-                "d",
               ],
             ],
           },
           "zqlSpec": {
             "a": {
+              "optional": false,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "number",
             },
             "c": {
+              "optional": false,
               "type": "number",
             },
             "d": {
+              "optional": false,
               "type": "number",
             },
           },
         },
       ]
     `);
+  });
+
+  test('compound key preserves index column order', () => {
+    // Regression test: compound primary key columns should preserve the
+    // order defined in the index (d, a, c), not be alphabetically sorted
+    // (a, c, d). Alphabetical sorting causes incorrect ORDER BY and index
+    // usage downstream.
+    // See: https://bugs.rocicorp.dev/p/zero/issue/246641
+    const result = t(`
+    CREATE TABLE foo(a "INT|NOT_NULL", b "INT|NOT_NULL", c "INT|NOT_NULL", d "INT|NOT_NULL");
+    CREATE UNIQUE INDEX foo_pkey ON foo(d ASC, a ASC, c ASC);
+    `);
+    const tableSpec = result[0].tableSpec;
+    expect(tableSpec.primaryKey).toEqual(['d', 'a', 'c']);
   });
 
   test('additional unique key', () => {
@@ -842,8 +905,8 @@ describe('computeZqlSpec', () => {
                 "b",
               ],
               [
-                "a",
                 "c",
+                "a",
               ],
             ],
             "backfilling": [],
@@ -891,22 +954,26 @@ describe('computeZqlSpec', () => {
                 "b",
               ],
               [
-                "a",
                 "c",
+                "a",
               ],
             ],
           },
           "zqlSpec": {
             "a": {
+              "optional": false,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "number",
             },
             "c": {
+              "optional": false,
               "type": "number",
             },
             "d": {
+              "optional": true,
               "type": "number",
             },
           },
@@ -987,15 +1054,19 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "a": {
+              "optional": true,
               "type": "number",
             },
             "b": {
+              "optional": false,
               "type": "number",
             },
             "c": {
+              "optional": false,
               "type": "number",
             },
             "d": {
+              "optional": false,
               "type": "number",
             },
           },
@@ -1113,21 +1184,27 @@ describe('computeZqlSpec', () => {
           },
           "zqlSpec": {
             "createdAt": {
+              "optional": false,
               "type": "number",
             },
             "id": {
+              "optional": false,
               "type": "string",
             },
             "name": {
+              "optional": false,
               "type": "string",
             },
             "order": {
+              "optional": false,
               "type": "number",
             },
             "title": {
+              "optional": true,
               "type": "string",
             },
             "updatedAt": {
+              "optional": false,
               "type": "number",
             },
           },
@@ -1307,9 +1384,11 @@ describe('metadata table integration', () => {
         },
         "zqlSpec": {
           "id": {
+            "optional": false,
             "type": "number",
           },
           "name": {
+            "optional": true,
             "type": "string",
           },
         },
@@ -1370,12 +1449,15 @@ describe('metadata table integration', () => {
         },
         "zqlSpec": {
           "blob": {
+            "optional": true,
             "type": "string",
           },
           "id": {
+            "optional": false,
             "type": "number",
           },
           "name": {
+            "optional": true,
             "type": "string",
           },
         },
@@ -1498,12 +1580,15 @@ describe('metadata table integration', () => {
         },
         "zqlSpec": {
           "blob": {
+            "optional": true,
             "type": "string",
           },
           "id": {
+            "optional": false,
             "type": "number",
           },
           "name": {
+            "optional": true,
             "type": "string",
           },
         },

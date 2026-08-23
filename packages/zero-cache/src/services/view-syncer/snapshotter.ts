@@ -100,7 +100,7 @@ export class Snapshotter {
     lc: LogContext,
     dbFile: string,
     {appID}: AppID,
-    pageCacheSizeKib?: number | undefined,
+    pageCacheSizeKib?: number,
   ) {
     this.#lc = lc;
     this.#dbFile = dbFile;
@@ -255,11 +255,20 @@ export interface SnapshotDiff extends Iterable<Change> {
  * change or truncate is encountered, which result in aborting the
  * advancement and resetting / rehydrating the pipelines.
  */
+export type ResetPipelinesReason =
+  | 'advancement-timeout'
+  | 'scalar-subquery'
+  | 'schema-change'
+  | 'truncation'
+  | 'permissions-change';
+
 export class ResetPipelinesSignal extends Error {
   readonly name = 'ResetPipelinesSignal';
+  readonly reason: ResetPipelinesReason;
 
-  constructor(msg: string) {
+  constructor(msg: string, reason: ResetPipelinesReason) {
     super(msg);
+    this.reason = reason;
   }
 }
 
@@ -278,9 +287,10 @@ class Snapshot {
     const [{journal_mode: mode}] = conn.pragma('journal_mode') as [
       {journal_mode: string},
     ];
-    // The Snapshotter operates on the replica file with BEGIN CONCURRENT,
-    // which must be used in concert with the replicator using BEGIN CONCURRENT
-    // on a db in the wal2 journal_mode.
+    // BEGIN CONCURRENT lets the Snapshotter simulate changes on a historic
+    // snapshot without taking the WAL writer lock. These private changes are
+    // always rolled back; the replicator is the only committer and can use
+    // BEGIN IMMEDIATE on the same WAL2 database.
     assert(
       mode === 'wal2',
       `replica db must be in wal2 mode (current: ${mode})`,
@@ -436,12 +446,14 @@ class Diff implements SnapshotDiff {
               // The current map of `TableSpec`s may not have the correct or complete information.
               throw new ResetPipelinesSignal(
                 `schema for table ${table} has changed`,
+                'schema-change',
               );
             }
             if (op === TRUNCATE_OP) {
               // Truncates are also processed by rehydrating pipelines at current.
               throw new ResetPipelinesSignal(
                 `table ${table} has been truncated`,
+                'truncation',
               );
             }
             const specs = this.#syncableTables.get(table);
@@ -497,7 +509,7 @@ class Diff implements SnapshotDiff {
 
             if (
               table === this.#permissionsTable &&
-              prevValues.find(
+              prevValues.some(
                 prevValue => prevValue.permissions !== nextValue.permissions,
               )
             ) {
@@ -508,6 +520,7 @@ class Diff implements SnapshotDiff {
                       prevValue.permissions !== nextValue.permissions,
                   ).hash
                 } => ${nextValue.hash}`,
+                'permissions-change',
               );
             }
 

@@ -1,6 +1,7 @@
 import {logs} from '@opentelemetry/api-logs';
 import {getNodeAutoInstrumentations} from '@opentelemetry/auto-instrumentations-node';
 import {resourceFromAttributes} from '@opentelemetry/resources';
+import {AggregationType, InstrumentType} from '@opentelemetry/sdk-metrics';
 import {NodeSDK} from '@opentelemetry/sdk-node';
 import {ATTR_SERVICE_VERSION} from '@opentelemetry/semantic-conventions';
 import type {LogContext} from '@rocicorp/logger';
@@ -10,7 +11,8 @@ import {
   otelMetricsEnabled,
   otelTracesEnabled,
 } from '../../../otel/src/enabled.ts';
-import {setupOtelDiagnosticLogger} from './otel-diag-logger.js';
+import {NATIVE_HISTOGRAM_INSTRUMENT_NAMES} from '../observability/metrics.ts';
+import {setupOtelDiagnosticLogger} from './otel-diag-logger.ts';
 
 class OtelManager {
   static #instance: OtelManager;
@@ -25,7 +27,11 @@ class OtelManager {
     return OtelManager.#instance;
   }
 
-  startOtelAuto(lc?: LogContext) {
+  startOtelAuto(
+    lc: LogContext | undefined,
+    workerName: string,
+    workerIndex: number,
+  ) {
     if (this.#started || !otelEnabled()) {
       return;
     }
@@ -43,6 +49,15 @@ class OtelManager {
 
     const resource = resourceFromAttributes({
       [ATTR_SERVICE_VERSION]: process.env.ZERO_SERVER_VERSION ?? 'unknown',
+      // Tag every metric/trace/log with the worker name and index so each
+      // worker process in a multi-worker pod is distinguishable. Without
+      // this, N syncer workers sharing the same pod labels clobber each
+      // other in the OTel collector on every scrape interval.
+      // These mirror the 'worker' and 'workerIndex' keys in every log
+      // context so logs and metrics can be correlated on the same fields.
+      // Using a stable index instead of PID avoids label churn in Prometheus.
+      'process.worker': workerName,
+      'process.worker_index': workerIndex,
     });
 
     // Set defaults to be backwards compatible with the previously
@@ -57,6 +72,11 @@ class OtelManager {
     const sdk = new NodeSDK({
       resource,
       autoDetectResources: true,
+      views: NATIVE_HISTOGRAM_INSTRUMENT_NAMES.map(instrumentName => ({
+        instrumentName,
+        instrumentType: InstrumentType.HISTOGRAM,
+        aggregation: {type: AggregationType.EXPONENTIAL_HISTOGRAM},
+      })),
       instrumentations:
         process.env.OTEL_NODE_ENABLED_INSTRUMENTATIONS ||
         process.env.OTEL_NODE_DISABLED_INSTRUMENTATIONS
@@ -80,5 +100,8 @@ class OtelManager {
   }
 }
 
-export const startOtelAuto = (lc?: LogContext) =>
-  OtelManager.getInstance().startOtelAuto(lc);
+export const startOtelAuto = (
+  lc: LogContext | undefined,
+  workerName: string,
+  workerIndex: number,
+) => OtelManager.getInstance().startOtelAuto(lc, workerName, workerIndex);

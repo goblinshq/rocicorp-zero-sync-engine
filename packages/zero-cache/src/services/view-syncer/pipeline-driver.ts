@@ -2,6 +2,7 @@ import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
 import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
 import {must} from '../../../../shared/src/must.ts';
+import {randInt} from '../../../../shared/src/rand.ts';
 import type {AST, LiteralValue} from '../../../../zero-protocol/src/ast.ts';
 import type {ClientSchema} from '../../../../zero-protocol/src/client-schema.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
@@ -11,18 +12,26 @@ import {
   Debug,
   runtimeDebugFlags,
 } from '../../../../zql/src/builder/debug-delegate.ts';
+import {ChangeIndex} from '../../../../zql/src/ivm/change-index.ts';
+import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
 import type {Change} from '../../../../zql/src/ivm/change.ts';
 import type {Node} from '../../../../zql/src/ivm/data.ts';
 import {
   skipYields,
+  throwOutput,
+  type FetchRequest,
   type Input,
+  type Output,
   type Storage,
 } from '../../../../zql/src/ivm/operator.ts';
 import type {SourceSchema} from '../../../../zql/src/ivm/schema.ts';
-import type {
-  Source,
-  SourceChange,
-  SourceInput,
+import {
+  type Source,
+  type SourceChange,
+  type SourceInput,
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
 } from '../../../../zql/src/ivm/source.ts';
 import type {ConnectionCostModel} from '../../../../zql/src/planner/planner-connection.ts';
 import {MeasurePushOperator} from '../../../../zql/src/query/measure-push-operator.ts';
@@ -31,6 +40,7 @@ import type {Database} from '../../../../zqlite/src/db.ts';
 import {
   resolveSimpleScalarSubqueries,
   type CompanionSubquery,
+  type IgnoredScalarHint,
 } from '../../../../zqlite/src/resolve-scalar-subqueries.ts';
 import {createSQLiteCostModel} from '../../../../zqlite/src/sqlite-cost-model.ts';
 import {TableSource} from '../../../../zqlite/src/table-source.ts';
@@ -43,42 +53,33 @@ import {computeZqlSpecs, mustGetTableSpec} from '../../db/lite-tables.ts';
 import type {LiteAndZqlSpec, LiteTableSpec} from '../../db/specs.ts';
 import {
   getOrCreateCounter,
-  getOrCreateHistogram,
+  getOrCreateLatencyHistogram,
 } from '../../observability/metrics.ts';
 import type {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import {type RowKey} from '../../types/row-key.ts';
-import {upstreamSchema, type ShardID} from '../../types/shards.ts';
+import {type ShardID} from '../../types/shards.ts';
 import {
   getSubscriptionState,
   ZERO_VERSION_COLUMN_NAME,
 } from '../replicator/schema/replication-state.ts';
 import {checkClientSchema} from './client-schema.ts';
+import {rowIDSignatureUnit} from './row-set-signature.ts';
 import type {Snapshotter} from './snapshotter.ts';
 import {ResetPipelinesSignal, type SnapshotDiff} from './snapshotter.ts';
 
-export type RowAdd = {
-  readonly type: 'add';
+type RowOp<Op extends Omit<ChangeType, ChangeType.CHILD>> = {
+  readonly type: Op;
   readonly queryID: string;
   readonly table: string;
   readonly rowKey: Row;
   readonly row: Row;
 };
 
-export type RowRemove = {
-  readonly type: 'remove';
-  readonly queryID: string;
-  readonly table: string;
-  readonly rowKey: Row;
-  readonly row: undefined;
-};
+export type RowAdd = RowOp<ChangeType.ADD>;
 
-export type RowEdit = {
-  readonly type: 'edit';
-  readonly queryID: string;
-  readonly table: string;
-  readonly rowKey: Row;
-  readonly row: Row;
-};
+export type RowRemove = RowOp<ChangeType.REMOVE>;
+
+export type RowEdit = RowOp<ChangeType.EDIT>;
 
 export type RowChange = RowAdd | RowRemove | RowEdit;
 
@@ -91,20 +92,63 @@ type CompanionPipeline = {
 type Pipeline = {
   readonly input: Input;
   readonly hydrationTimeMs: number;
+  readonly hydrationRowCount: number;
+  readonly hydrationReason: PipelineHydrationReason;
+  readonly pipelineRunID: string;
+  readonly pipelineReadyAtMs: number;
   readonly transformedAst: AST;
   readonly transformationHash: string;
+  readonly queryName?: string | undefined;
   readonly companions: readonly CompanionPipeline[];
 };
 
 type QueryInfo = {
   readonly transformedAst: AST;
   readonly transformationHash: string;
+  readonly queryName?: string | undefined;
+};
+
+type QueryLogInfo = {
+  readonly queryHash: string;
+  readonly transformationHash: string;
+  readonly queryName?: string | undefined;
+};
+
+type QueryPipelineLifecycleEvent =
+  | 'query-pipeline-hydrate-start'
+  | 'query-pipeline-hydrate-finish'
+  | 'query-pipeline-hydrate-failed'
+  | 'query-pipeline-hydrate-aborted'
+  | 'query-pipeline-stop';
+
+export type PipelineHydrationReason =
+  | 'query-set-sync'
+  | 'unchanged-query-rehydrate';
+
+type PipelineStopReason =
+  | 'replace-query'
+  | 'remove-query'
+  | 'reset'
+  | 'destroy';
+
+type QueryPipelineLifecycleLog = {
+  readonly zeroEvent: QueryPipelineLifecycleEvent;
+  readonly pipelineRunID: string;
+  readonly queryHash: string;
+  readonly transformationHash: string;
+  readonly queryName?: string | undefined;
+  readonly hydrationReason?: PipelineHydrationReason | undefined;
+  readonly stopReason?: PipelineStopReason | undefined;
+  readonly hydrationTimeMs?: number | undefined;
+  readonly hydrationRowCount?: number | undefined;
+  readonly pipelineLifetimeMs?: number | undefined;
 };
 
 type AdvanceContext = {
   readonly timer: Timer;
   readonly totalHydrationTimeMs: number;
   readonly numChanges: number;
+  currentChangeStartMs: number | undefined;
   pos: number;
 };
 
@@ -122,6 +166,85 @@ export type Timer = {
  * complete before doing a pipeline reset.
  */
 const MIN_ADVANCEMENT_TIME_LIMIT_MS = 50;
+const MIN_PROJECTED_ADVANCEMENT_SAMPLE_CHANGES = 8;
+const PROJECTED_ADVANCEMENT_SAMPLE_FRACTION = 0.25;
+const MAX_PROJECTED_ADVANCEMENT_SAMPLE_CHANGES = 50;
+const MIN_PROJECTED_ADVANCEMENT_SAMPLE_MS = 5;
+const MIN_PROJECTED_ADVANCEMENT_CHANGES = 16;
+const PROJECTED_ADVANCEMENT_RESET_MULTIPLIER = 1.5;
+const LATE_ADVANCEMENT_FINISH_PROGRESS = 0.8;
+
+function randomID() {
+  return randInt(1, Number.MAX_SAFE_INTEGER).toString(36);
+}
+
+function projectedAdvancementTimeMs(
+  elapsedMs: number,
+  processedChanges: number,
+  numChanges: number,
+): number | undefined {
+  if (processedChanges <= 0 || numChanges <= 0) {
+    return undefined;
+  }
+  return (elapsedMs / processedChanges) * numChanges;
+}
+
+function advancementResetTimeLimitMs(totalHydrationTimeMs: number): number {
+  return Math.max(totalHydrationTimeMs, 1);
+}
+
+function minProjectedAdvancementSampleChanges(numChanges: number): number {
+  return Math.max(
+    MIN_PROJECTED_ADVANCEMENT_SAMPLE_CHANGES,
+    Math.min(
+      MAX_PROJECTED_ADVANCEMENT_SAMPLE_CHANGES,
+      Math.ceil(numChanges * PROJECTED_ADVANCEMENT_SAMPLE_FRACTION),
+    ),
+  );
+}
+
+function shouldResetProjectedAdvancement(
+  elapsedMs: number,
+  projectedTotalTimeMs: number | undefined,
+  processedChanges: number,
+  numChanges: number,
+  totalHydrationTimeMs: number,
+): boolean {
+  if (
+    projectedTotalTimeMs === undefined ||
+    numChanges < MIN_PROJECTED_ADVANCEMENT_CHANGES ||
+    processedChanges < minProjectedAdvancementSampleChanges(numChanges) ||
+    elapsedMs < MIN_PROJECTED_ADVANCEMENT_SAMPLE_MS
+  ) {
+    return false;
+  }
+
+  return (
+    projectedTotalTimeMs >
+    advancementResetTimeLimitMs(totalHydrationTimeMs) *
+      PROJECTED_ADVANCEMENT_RESET_MULTIPLIER
+  );
+}
+
+function shouldFinishLateAdvancement(
+  processedChanges: number,
+  numChanges: number,
+): boolean {
+  return (
+    numChanges > 0 &&
+    processedChanges / numChanges >= LATE_ADVANCEMENT_FINISH_PROGRESS
+  );
+}
+
+function shouldResetSlowCurrentChange(
+  currentChangeElapsedMs: number,
+  totalHydrationTimeMs: number,
+): boolean {
+  return (
+    currentChangeElapsedMs > MIN_ADVANCEMENT_TIME_LIMIT_MS &&
+    currentChangeElapsedMs > advancementResetTimeLimitMs(totalHydrationTimeMs)
+  );
+}
 
 /**
  * Manages the state of IVM pipelines for a given ViewSyncer (i.e. client group).
@@ -130,6 +253,15 @@ export class PipelineDriver {
   readonly #tables = new Map<string, TableSource>();
   // Query id to pipeline
   readonly #pipelines = new Map<string, Pipeline>();
+  /**
+   * XOR signature of the set of rows currently attached to each active
+   * query, maintained as RowChanges are yielded from {@link addQuery} and
+   * {@link advance}. ADDs / REMOVEs XOR the row's unit in (XOR is
+   * self-inverse, so one op serves both directions); EDITs are no-ops.
+   * Hydration implicitly reseeds from `0n` because {@link addQuery} calls
+   * {@link removeQuery} first, which deletes the entry.
+   */
+  readonly #rowSetSignatures = new Map<string, bigint>();
 
   readonly #lc: LogContext;
   readonly #snapshotter: Snapshotter;
@@ -148,11 +280,11 @@ export class PipelineDriver {
   #primaryKeys: Map<string, PrimaryKey> | null = null;
   #permissions: LoadedPermissions | null = null;
 
-  readonly #advanceTime = getOrCreateHistogram('sync', 'ivm.advance-time', {
-    description:
-      'Time to advance all queries for a given client group for in response to a single change.',
-    unit: 's',
-  });
+  readonly #advanceTime = getOrCreateLatencyHistogram(
+    'sync',
+    'ivm.advance-time',
+    'Time to advance all queries for a given client group in response to a single change.',
+  );
 
   readonly #conflictRowsDeleted = getOrCreateCounter(
     'sync',
@@ -171,8 +303,8 @@ export class PipelineDriver {
     clientGroupID: string,
     inspectorDelegate: InspectorDelegate,
     yieldThresholdMs: () => number,
-    enablePlanner?: boolean | undefined,
-    config?: ZeroConfig | undefined,
+    enablePlanner?: boolean,
+    config?: ZeroConfig,
   ) {
     this.#lc = lc.withContext('clientGroupID', clientGroupID);
     this.#snapshotter = snapshotter;
@@ -210,15 +342,13 @@ export class PipelineDriver {
    * as TableSources need to be recomputed.
    */
   reset(clientSchema: ClientSchema) {
-    for (const pipeline of this.#pipelines.values()) {
-      pipeline.input.destroy();
-      for (const companion of pipeline.companions) {
-        companion.input.destroy();
-      }
+    for (const [queryID, pipeline] of this.#pipelines) {
+      this.#pipelines.delete(queryID);
+      this.#destroyPipeline(queryID, pipeline, 'reset');
     }
-    this.#pipelines.clear();
     this.#tables.clear();
     this.#allTableNames.clear();
+    this.#rowSetSignatures.clear();
     this.#initAndResetCommon(clientSchema);
   }
 
@@ -246,9 +376,7 @@ export class PipelineDriver {
     this.#primaryKeys = primaryKeys;
     primaryKeys.clear();
     for (const [table, spec] of this.#tableSpecs.entries()) {
-      if (table.startsWith(upstreamSchema(this.#shardID))) {
-        primaryKeys.set(table, spec.tableSpec.primaryKey);
-      }
+      primaryKeys.set(table, spec.tableSpec.primaryKey);
     }
     buildPrimaryKeys(clientSchema, primaryKeys);
     const {replicaVersion} = getSubscriptionState(db);
@@ -318,6 +446,11 @@ export class PipelineDriver {
    * PipelineDriver will no longer be used.
    */
   destroy() {
+    for (const [queryID, pipeline] of this.#pipelines) {
+      this.#pipelines.delete(queryID);
+      this.#destroyPipeline(queryID, pipeline, 'destroy');
+    }
+    this.#rowSetSignatures.clear();
     this.#storage.destroy();
     this.#snapshotter.destroy();
   }
@@ -335,11 +468,70 @@ export class PipelineDriver {
     return total;
   }
 
+  #logQueryPipelineLifecycle({
+    zeroEvent,
+    pipelineRunID,
+    queryHash,
+    transformationHash,
+    queryName,
+    hydrationReason,
+    stopReason,
+    hydrationTimeMs,
+    hydrationRowCount,
+    pipelineLifetimeMs,
+  }: QueryPipelineLifecycleLog): void {
+    let lc = this.#lc
+      .withContext('zeroEvent', zeroEvent)
+      .withContext('pipelineRunID', pipelineRunID)
+      .withContext('queryHash', queryHash)
+      .withContext('transformationHash', transformationHash);
+    if (queryName !== undefined) {
+      lc = lc.withContext('queryName', queryName);
+    }
+    if (hydrationReason !== undefined) {
+      lc = lc.withContext('hydrationReason', hydrationReason);
+    }
+    if (stopReason !== undefined) {
+      lc = lc.withContext('stopReason', stopReason);
+    }
+    if (hydrationTimeMs !== undefined) {
+      lc = lc.withContext('hydrationTimeMs', hydrationTimeMs);
+    }
+    if (hydrationRowCount !== undefined) {
+      lc = lc.withContext('hydrationRowCount', hydrationRowCount);
+    }
+    if (pipelineLifetimeMs !== undefined) {
+      lc = lc.withContext('pipelineLifetimeMs', pipelineLifetimeMs);
+    }
+    lc.info?.('query pipeline lifecycle');
+  }
+
+  /**
+   * A `{scalar: true}` that cannot be honored degrades silently to a plain
+   * EXISTS, so the author gets none of the plan they asked for and no signal
+   * that they didn't. Say so, with the unique keys that were actually
+   * available — the client schema knows only primary keys, so this is the only
+   * place the advice can be correct.
+   */
+  #warnIgnoredScalarHints(queryID: string, hints: IgnoredScalarHint[]): void {
+    for (const {table, uniqueKeys} of hints) {
+      const keys = uniqueKeys.map(k => `(${k.join(', ')})`).join(', ');
+      this.#lc.warn?.(
+        `Ignoring {scalar: true} on the "${table}" subquery of query ` +
+          `${queryID}: it does not constrain every column of any unique key ` +
+          `${keys.length > 0 ? `[${keys}]` : '(none on this table)'} to a ` +
+          `literal with "=", so it is not provably limited to one row. ` +
+          `The gate runs as a plain EXISTS.`,
+      );
+    }
+  }
+
   #resolveScalarSubqueries(ast: AST): {
     ast: AST;
     companionRows: {table: string; row: Row}[];
     companions: CompanionSubquery[];
     companionInputs: Input[];
+    ignoredScalarHints: IgnoredScalarHint[];
   } {
     const companionRows: {table: string; row: Row}[] = [];
     const companionInputs: Input[] = [];
@@ -378,12 +570,18 @@ export class PipelineDriver {
       return (node.row[childField] as LiteralValue) ?? null;
     };
 
-    const {ast: resolved, companions} = resolveSimpleScalarSubqueries(
-      ast,
-      this.#tableSpecs,
-      executor,
-    );
-    return {ast: resolved, companionRows, companions, companionInputs};
+    const {
+      ast: resolved,
+      companions,
+      ignoredScalarHints,
+    } = resolveSimpleScalarSubqueries(ast, this.#tableSpecs, executor);
+    return {
+      ast: resolved,
+      companionRows,
+      companions,
+      companionInputs,
+      ignoredScalarHints,
+    };
   }
 
   /**
@@ -401,17 +599,48 @@ export class PipelineDriver {
    *        when yielding the thread for time-slicing).
    * @return The rows from the initial hydration of the query.
    */
-  *addQuery(
+  addQuery(
     transformationHash: string,
     queryID: string,
     query: AST,
     timer: Timer,
+    queryName?: string,
+    hydrationReason: PipelineHydrationReason = 'query-set-sync',
+  ): Iterable<RowChange | 'yield'> {
+    return this.#trackRowSetSignatures(
+      this.#addQueryImpl(
+        transformationHash,
+        queryID,
+        query,
+        timer,
+        queryName,
+        hydrationReason,
+      ),
+    );
+  }
+
+  *#addQueryImpl(
+    transformationHash: string,
+    queryID: string,
+    query: AST,
+    timer: Timer,
+    queryName?: string,
+    hydrationReason: PipelineHydrationReason = 'query-set-sync',
   ): Iterable<RowChange | 'yield'> {
     assert(
       this.initialized(),
       'Pipeline driver must be initialized before adding queries',
     );
-    this.removeQuery(queryID);
+    this.removeQuery(queryID, 'replace-query');
+    const pipelineRunID = randomID();
+    this.#logQueryPipelineLifecycle({
+      zeroEvent: 'query-pipeline-hydrate-start',
+      pipelineRunID,
+      queryHash: queryID,
+      transformationHash,
+      queryName,
+      hydrationReason,
+    });
     const debugDelegate = runtimeDebugFlags.trackRowsVended
       ? new Debug()
       : undefined;
@@ -427,13 +656,19 @@ export class PipelineDriver {
     this.#hydrateContext = {
       timer,
     };
+    let hydrationFinished = false;
+    let hydrationFailed = false;
+    let hydrationRowCount = 0;
     try {
       const {
         ast: resolvedQuery,
         companionRows,
         companions: companionMeta,
         companionInputs,
+        ignoredScalarHints,
       } = this.#resolveScalarSubqueries(query);
+
+      this.#warnIgnoredScalarHints(queryID, ignoredScalarHints);
 
       const input = buildPipeline(
         resolvedQuery,
@@ -444,7 +679,13 @@ export class PipelineDriver {
           createStorage: () => this.#createStorage(),
           decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
             new MeasurePushOperator(
-              input,
+              new QueryFailureLoggingOperator(
+                this.#lc,
+                input,
+                queryID,
+                transformationHash,
+                queryName,
+              ),
               queryID,
               this.#inspectorDelegate,
               'query-update-server',
@@ -466,17 +707,23 @@ export class PipelineDriver {
         },
       });
 
-      yield* hydrateInternal(
+      for (const change of hydrateInternal(
         input,
         queryID,
         must(this.#primaryKeys),
         this.#tableSpecs,
-      );
+      )) {
+        if (change !== 'yield') {
+          hydrationRowCount++;
+        }
+        yield change;
+      }
 
       for (const {table, row} of companionRows) {
         const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+        hydrationRowCount++;
         yield {
-          type: 'add',
+          type: ChangeType.ADD,
           queryID,
           table,
           rowKey: getRowKey(primaryKey, row),
@@ -516,22 +763,24 @@ export class PipelineDriver {
         companionInput.setOutput({
           push: (change: Change) => {
             let newValue: LiteralValue | null | undefined;
-            switch (change.type) {
-              case 'add':
-              case 'edit':
+            switch (change[ChangeIndex.TYPE]) {
+              case ChangeType.ADD:
+              case ChangeType.EDIT:
                 newValue =
-                  (change.node.row[childField] as LiteralValue) ?? null;
+                  (change[ChangeIndex.NODE].row[childField] as LiteralValue) ??
+                  null;
                 break;
-              case 'remove':
+              case ChangeType.REMOVE:
                 newValue = undefined;
                 break;
-              case 'child':
+              case ChangeType.CHILD:
                 return [];
             }
             if (!scalarValuesEqual(newValue, resolvedValue)) {
               throw new ResetPipelinesSignal(
                 `Scalar subquery value changed for ${meta.ast.table}: ` +
                   `${String(resolvedValue)} -> ${String(newValue)}`,
+                'scalar-subquery',
               );
             }
             const streamer = this.#streamer;
@@ -549,14 +798,62 @@ export class PipelineDriver {
       // Note: This hydrationTime is a wall-clock overestimate, as it does
       // not take time slicing into account. The view-syncer resets this
       // to a more precise processing-time measurement with setHydrationTime().
+      const pipelineReadyAtMs = Date.now();
       this.#pipelines.set(queryID, {
         input,
         hydrationTimeMs,
+        hydrationRowCount,
+        hydrationReason,
+        pipelineRunID,
+        pipelineReadyAtMs,
         transformedAst: resolvedQuery,
         transformationHash,
+        ...(queryName !== undefined && {queryName}),
         companions: liveCompanions,
       });
+      hydrationFinished = true;
+      this.#logQueryPipelineLifecycle({
+        zeroEvent: 'query-pipeline-hydrate-finish',
+        pipelineRunID,
+        queryHash: queryID,
+        transformationHash,
+        queryName,
+        hydrationReason,
+        hydrationTimeMs,
+        hydrationRowCount,
+      });
+    } catch (e) {
+      hydrationFailed = true;
+      this.#logQueryPipelineLifecycle({
+        zeroEvent: 'query-pipeline-hydrate-failed',
+        pipelineRunID,
+        queryHash: queryID,
+        transformationHash,
+        queryName,
+        hydrationReason,
+        hydrationTimeMs: timer.totalElapsed(),
+        hydrationRowCount,
+      });
+      logQueryFailure(
+        this.#lc,
+        {queryHash: queryID, transformationHash, queryName},
+        'query hydration failed',
+        e,
+      );
+      throw e;
     } finally {
+      if (!hydrationFinished && !hydrationFailed) {
+        this.#logQueryPipelineLifecycle({
+          zeroEvent: 'query-pipeline-hydrate-aborted',
+          pipelineRunID,
+          queryHash: queryID,
+          transformationHash,
+          queryName,
+          hydrationReason,
+          hydrationTimeMs: timer.totalElapsed(),
+          hydrationRowCount,
+        });
+      }
       this.#hydrateContext = null;
     }
   }
@@ -565,14 +862,70 @@ export class PipelineDriver {
    * Removes the pipeline for the query. This is a no-op if the query
    * was not added.
    */
-  removeQuery(queryID: string) {
+  removeQuery(
+    queryID: string,
+    stopReason: PipelineStopReason = 'remove-query',
+  ) {
     const pipeline = this.#pipelines.get(queryID);
     if (pipeline) {
       this.#pipelines.delete(queryID);
-      pipeline.input.destroy();
-      for (const companion of pipeline.companions) {
-        companion.input.destroy();
+      this.#destroyPipeline(queryID, pipeline, stopReason);
+    }
+    this.#rowSetSignatures.delete(queryID);
+  }
+
+  #destroyPipeline(
+    queryID: string,
+    pipeline: Pipeline,
+    stopReason: PipelineStopReason,
+  ): void {
+    this.#logQueryPipelineLifecycle({
+      zeroEvent: 'query-pipeline-stop',
+      pipelineRunID: pipeline.pipelineRunID,
+      queryHash: queryID,
+      transformationHash: pipeline.transformationHash,
+      queryName: pipeline.queryName,
+      hydrationReason: pipeline.hydrationReason,
+      stopReason,
+      hydrationTimeMs: pipeline.hydrationTimeMs,
+      hydrationRowCount: pipeline.hydrationRowCount,
+      pipelineLifetimeMs: Date.now() - pipeline.pipelineReadyAtMs,
+    });
+    pipeline.input.destroy();
+    for (const companion of pipeline.companions) {
+      companion.input.destroy();
+    }
+  }
+
+  /**
+   * Current XOR signature of the row-set attached to `queryID`, or
+   * `undefined` if no pipeline for the query is currently active.
+   * Maintained incrementally by {@link addQuery} and {@link advance}.
+   */
+  rowSetSignature(queryID: string): bigint | undefined {
+    return this.#rowSetSignatures.get(queryID);
+  }
+
+  /**
+   * Wraps an iterable of RowChanges, XORing each row's unit hash into the
+   * query's signature (ADDs and REMOVEs share the same op; EDITs are no-ops).
+   * Used to intercept the yield streams from {@link addQuery} and
+   * {@link advance}.
+   */
+  *#trackRowSetSignatures(
+    changes: Iterable<RowChange | 'yield'>,
+  ): Iterable<RowChange | 'yield'> {
+    for (const change of changes) {
+      if (change !== 'yield' && change.type !== ChangeType.EDIT) {
+        const cur = this.#rowSetSignatures.get(change.queryID) ?? 0n;
+        const unit = rowIDSignatureUnit({
+          schema: '',
+          table: change.table,
+          rowKey: change.rowKey as RowKey,
+        });
+        this.#rowSetSignatures.set(change.queryID, cur ^ unit);
       }
+      yield change;
     }
   }
 
@@ -619,7 +972,7 @@ export class PipelineDriver {
     return {
       version: curr.version,
       numChanges: changes,
-      changes: this.#advance(diff, timer, changes),
+      changes: this.#trackRowSetSignatures(this.#advance(diff, timer, changes)),
     };
   }
 
@@ -637,9 +990,10 @@ export class PipelineDriver {
       timer,
       totalHydrationTimeMs,
       numChanges,
+      currentChangeStartMs: undefined,
       pos: 0,
     };
-    this.#lc.info?.(
+    this.#lc.debug?.(
       `starting pipeline advancement of ${numChanges} changes with an ` +
         `advancement time limited based on total hydration time of ` +
         `${totalHydrationTimeMs} ms.`,
@@ -654,55 +1008,62 @@ export class PipelineDriver {
           yield 'yield';
         }
         const start = timer.totalElapsed();
+        const advanceContext = must(this.#advanceContext);
+        advanceContext.currentChangeStartMs = start;
 
         let type;
         try {
-          const tableSource = this.#tables.get(table);
-          if (!tableSource) {
-            // no pipelines read from this table, so no need to process the change
-            continue;
-          }
-          const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
-          let editOldRow: Row | undefined = undefined;
-          for (const prevValue of prevValues) {
-            if (
-              nextValue &&
-              deepEqual(
-                getRowKey(primaryKey, prevValue as Row) as JSONValue,
-                getRowKey(primaryKey, nextValue as Row) as JSONValue,
-              )
-            ) {
-              editOldRow = prevValue;
-            } else {
-              if (nextValue) {
-                this.#conflictRowsDeleted.add(1);
+          try {
+            const tableSource = this.#tables.get(table);
+            if (!tableSource) {
+              // no pipelines read from this table, so no need to process the change
+              continue;
+            }
+            const primaryKey = mustGetPrimaryKey(this.#primaryKeys, table);
+            let editOldRow: Row | undefined = undefined;
+            for (const prevValue of prevValues) {
+              if (
+                nextValue &&
+                deepEqual(
+                  getRowKey(primaryKey, prevValue as Row) as JSONValue,
+                  getRowKey(primaryKey, nextValue as Row) as JSONValue,
+                )
+              ) {
+                editOldRow = prevValue;
+              } else {
+                if (nextValue) {
+                  this.#conflictRowsDeleted.add(1);
+                }
+                yield* this.#push(
+                  tableSource,
+                  makeSourceChangeRemove(prevValue as Row),
+                );
               }
-              yield* this.#push(tableSource, {
-                type: 'remove',
-                row: prevValue,
-              });
             }
-          }
-          if (nextValue) {
-            if (editOldRow) {
-              yield* this.#push(tableSource, {
-                type: 'edit',
-                row: nextValue,
-                oldRow: editOldRow,
-              });
-            } else {
-              yield* this.#push(tableSource, {
-                type: 'add',
-                row: nextValue,
-              });
+            if (nextValue) {
+              if (editOldRow) {
+                yield* this.#push(
+                  tableSource,
+                  makeSourceChangeEdit(nextValue as Row, editOldRow),
+                );
+              } else {
+                yield* this.#push(
+                  tableSource,
+                  makeSourceChangeAdd(nextValue as Row),
+                );
+              }
             }
+          } finally {
+            advanceContext.pos++;
           }
+
+          this.#shouldAdvanceYieldMaybeAbortAdvance(false);
         } finally {
-          this.#advanceContext.pos++;
+          advanceContext.currentChangeStartMs = undefined;
         }
 
         const elapsed = timer.totalElapsed() - start;
-        this.#advanceTime.record(elapsed / 1000, {
+        this.#advanceTime.recordMs(elapsed, {
           table,
           type,
         });
@@ -756,27 +1117,62 @@ export class PipelineDriver {
   }
 
   /**
-   * Cancel the advancement processing, by throwing a ResetPipelinesSignal, if
-   * it has taken longer than half the total hydration time to make it through
-   * half of the advancement, or if processing time exceeds total hydration
-   * time.  This serves as both a circuit breaker for very large transactions,
-   * as well as a bound on the amount of time the previous connection locks
-   * the inactive WAL file (as the lock prevents WAL2 from switching to the
-   * free WAL when the current one is over the size limit, which can make
-   * the WAL grow continuously and compound slowness).
-   * This is checked:
-   * 1. before starting to process each change in an advancement is processed
-   * 2. whenever a row is fetched from a TableSource during push processing
+   * Cancel advancement processing when either the whole batch projects to be
+   * more expensive than hydration, or the current source change alone exceeds
+   * the hydration budget. The late-finish exception only applies to batch-level
+   * checks; a single pathological push always resets.
    */
-  #shouldAdvanceYieldMaybeAbortAdvance(): boolean {
+  #shouldAdvanceYieldMaybeAbortAdvance(checkYield = true): boolean {
     const {
+      currentChangeStartMs,
       pos,
       numChanges,
       timer: advanceTimer,
       totalHydrationTimeMs,
     } = must(this.#advanceContext);
     const elapsed = advanceTimer.totalElapsed();
+    const currentChangeElapsedMs =
+      currentChangeStartMs === undefined
+        ? undefined
+        : elapsed - currentChangeStartMs;
     if (
+      currentChangeElapsedMs !== undefined &&
+      shouldResetSlowCurrentChange(currentChangeElapsedMs, totalHydrationTimeMs)
+    ) {
+      this.#throwSlowCurrentChangeReset(
+        pos,
+        numChanges,
+        elapsed,
+        currentChangeElapsedMs,
+        totalHydrationTimeMs,
+      );
+    }
+    const projectedTotalTimeMs = projectedAdvancementTimeMs(
+      elapsed,
+      pos,
+      numChanges,
+    );
+    const shouldFinish = shouldFinishLateAdvancement(pos, numChanges);
+    if (
+      !shouldFinish &&
+      shouldResetProjectedAdvancement(
+        elapsed,
+        projectedTotalTimeMs,
+        pos,
+        numChanges,
+        totalHydrationTimeMs,
+      )
+    ) {
+      this.#throwProjectedAdvancementReset(
+        pos,
+        numChanges,
+        elapsed,
+        projectedTotalTimeMs,
+        totalHydrationTimeMs,
+      );
+    }
+    if (
+      !shouldFinish &&
       elapsed > MIN_ADVANCEMENT_TIME_LIMIT_MS &&
       (elapsed > totalHydrationTimeMs ||
         (elapsed > totalHydrationTimeMs / 2 && pos <= numChanges / 2))
@@ -785,9 +1181,47 @@ export class PipelineDriver {
         `Advancement exceeded timeout at ${pos} of ${numChanges} changes ` +
           `after ${elapsed} ms. Advancement time limited based on total ` +
           `hydration time of ${totalHydrationTimeMs} ms.`,
+        'advancement-timeout',
       );
     }
-    return advanceTimer.elapsedLap() > this.#yieldThresholdMs();
+    return checkYield && advanceTimer.elapsedLap() > this.#yieldThresholdMs();
+  }
+
+  #throwSlowCurrentChangeReset(
+    pos: number,
+    numChanges: number,
+    elapsed: number,
+    currentChangeElapsedMs: number,
+    totalHydrationTimeMs: number,
+  ): never {
+    throw new ResetPipelinesSignal(
+      `Advancement exceeded timeout processing current change at ${pos} of ` +
+        `${numChanges} changes after ${currentChangeElapsedMs} ms ` +
+        `(${elapsed} ms total). Advancement time limited based on total ` +
+        `hydration time of ${totalHydrationTimeMs} ms.`,
+      'advancement-timeout',
+    );
+  }
+
+  #throwProjectedAdvancementReset(
+    pos: number,
+    numChanges: number,
+    elapsed: number,
+    projectedTotalTimeMs: number | undefined,
+    totalHydrationTimeMs: number,
+  ): never {
+    const projection =
+      projectedTotalTimeMs === undefined
+        ? ''
+        : ` Projected total advancement time is ${projectedTotalTimeMs} ms.`;
+    throw new ResetPipelinesSignal(
+      `Advancement projected to exceed hydration time at ${pos} of ` +
+        `${numChanges} changes after ${elapsed} ms.` +
+        projection +
+        ` Advancement time limited based on total hydration time of ` +
+        `${totalHydrationTimeMs} ms.`,
+      'advancement-timeout',
+    );
   }
 
   /** Implements `BuilderDelegate.createStorage()` */
@@ -819,7 +1253,12 @@ export class PipelineDriver {
 
   #startAccumulating() {
     assert(this.#streamer === null, 'Streamer already started');
-    this.#streamer = new Streamer(must(this.#primaryKeys), this.#tableSpecs);
+    this.#streamer = new Streamer(
+      must(this.#primaryKeys),
+      this.#tableSpecs,
+      (queryID, error) =>
+        this.#logQueryFailure(queryID, 'query pipeline failed', error),
+    );
   }
 
   #stopAccumulating(): Streamer {
@@ -828,18 +1267,35 @@ export class PipelineDriver {
     this.#streamer = null;
     return streamer;
   }
+
+  #logQueryFailure(queryID: string, message: string, error: unknown): void {
+    const pipeline = this.#pipelines.get(queryID);
+    const queryInfo = pipeline
+      ? {
+          queryHash: queryID,
+          transformationHash: pipeline.transformationHash,
+          queryName: pipeline.queryName,
+        }
+      : undefined;
+    logQueryFailure(this.#lc, queryInfo, message, error);
+  }
 }
 
 class Streamer {
   readonly #primaryKeys: Map<string, PrimaryKey>;
   readonly #tableSpecs: Map<string, LiteAndZqlSpec>;
+  readonly #logQueryFailure:
+    | ((queryID: string, error: unknown) => void)
+    | undefined;
 
   constructor(
     primaryKeys: Map<string, PrimaryKey>,
     tableSpecs: Map<string, LiteAndZqlSpec>,
+    logQueryFailure?: (queryID: string, error: unknown) => void,
   ) {
     this.#primaryKeys = primaryKeys;
     this.#tableSpecs = tableSpecs;
+    this.#logQueryFailure = logQueryFailure;
   }
 
   readonly #changes: [
@@ -859,7 +1315,12 @@ class Streamer {
 
   *stream(): Iterable<RowChange | 'yield'> {
     for (const [queryID, schema, changes] of this.#changes) {
-      yield* this.#streamChanges(queryID, schema, changes);
+      try {
+        yield* this.#streamChanges(queryID, schema, changes);
+      } catch (e) {
+        this.#logQueryFailure?.(queryID, e);
+        throw e;
+      }
     }
   }
 
@@ -879,16 +1340,18 @@ class Streamer {
         yield change;
         continue;
       }
-      const {type} = change;
-
+      const type = change[ChangeIndex.TYPE];
       switch (type) {
-        case 'add':
-        case 'remove': {
-          yield* this.#streamNodes(queryID, schema, type, () => [change.node]);
+        case ChangeType.REMOVE:
+        case ChangeType.ADD: {
+          yield* this.#streamNodes(queryID, schema, type, () => [
+            change[ChangeIndex.NODE],
+          ]);
           break;
         }
-        case 'child': {
-          const {child} = change;
+
+        case ChangeType.CHILD: {
+          const child = change[ChangeIndex.CHILD_DATA];
           const childSchema = must(
             schema.relationships[child.relationshipName],
           );
@@ -896,13 +1359,13 @@ class Streamer {
           yield* this.#streamChanges(queryID, childSchema, [child.change]);
           break;
         }
-        case 'edit':
+        case ChangeType.EDIT:
           yield* this.#streamNodes(queryID, schema, type, () => [
-            {row: change.node.row, relationships: {}},
+            {row: change[ChangeIndex.NODE].row, relationships: {}},
           ]);
           break;
         default:
-          unreachable(type);
+          unreachable(change[ChangeIndex.TYPE]);
       }
     }
   }
@@ -910,7 +1373,7 @@ class Streamer {
   *#streamNodes(
     queryID: string,
     schema: SourceSchema,
-    op: 'add' | 'remove' | 'edit',
+    op: ChangeType.ADD | ChangeType.REMOVE | ChangeType.EDIT,
     nodes: () => Iterable<Node | 'yield'>,
   ): Iterable<RowChange | 'yield'> {
     const {tableName: table, system} = schema;
@@ -932,7 +1395,7 @@ class Streamer {
       const {relationships} = node;
       let {row} = node;
       const rowKey = getRowKey(primaryKey, row);
-      if (op !== 'remove') {
+      if (op !== ChangeType.REMOVE) {
         const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
         if (
           typeof rowVersion === 'string' &&
@@ -947,7 +1410,7 @@ class Streamer {
         queryID,
         table,
         rowKey,
-        row: op === 'remove' ? undefined : row,
+        row: op === ChangeType.REMOVE ? undefined : row,
       } as RowChange;
 
       for (const [relationship, children] of Object.entries(relationships)) {
@@ -958,13 +1421,92 @@ class Streamer {
   }
 }
 
+class QueryFailureLoggingOperator implements Input, Output {
+  readonly #lc: LogContext;
+  readonly #input: Input;
+  readonly #queryHash: string;
+  readonly #transformationHash: string;
+  readonly #queryName: string | undefined;
+  #output: Output = throwOutput;
+
+  constructor(
+    lc: LogContext,
+    input: Input,
+    queryHash: string,
+    transformationHash: string,
+    queryName?: string,
+  ) {
+    this.#lc = lc;
+    this.#input = input;
+    this.#queryHash = queryHash;
+    this.#transformationHash = transformationHash;
+    this.#queryName = queryName;
+    input.setOutput(this);
+  }
+
+  setOutput(output: Output): void {
+    this.#output = output;
+  }
+
+  getSchema(): SourceSchema {
+    return this.#input.getSchema();
+  }
+
+  destroy(): void {
+    this.#input.destroy();
+  }
+
+  fetch(req: FetchRequest): Iterable<Node | 'yield'> {
+    return this.#input.fetch(req);
+  }
+
+  *push(change: Change): Iterable<'yield'> {
+    try {
+      yield* this.#output.push(change, this);
+    } catch (e) {
+      logQueryFailure(
+        this.#lc,
+        {
+          queryHash: this.#queryHash,
+          transformationHash: this.#transformationHash,
+          queryName: this.#queryName,
+        },
+        'query pipeline failed',
+        e,
+      );
+      throw e;
+    }
+  }
+}
+
+function logQueryFailure(
+  lc: LogContext,
+  queryInfo: QueryLogInfo | undefined,
+  message: string,
+  error: unknown,
+): void {
+  if (error instanceof ResetPipelinesSignal) {
+    return;
+  }
+  let queryLC = lc;
+  if (queryInfo) {
+    queryLC = queryLC
+      .withContext('queryHash', queryInfo.queryHash)
+      .withContext('transformationHash', queryInfo.transformationHash);
+    if (queryInfo.queryName !== undefined) {
+      queryLC = queryLC.withContext('queryName', queryInfo.queryName);
+    }
+  }
+  queryLC.error?.(message, error);
+}
+
 function* toAdds(nodes: Iterable<Node | 'yield'>): Iterable<Change | 'yield'> {
   for (const node of nodes) {
     if (node === 'yield') {
       yield node;
       continue;
     }
-    yield {type: 'add', node};
+    yield [ChangeType.ADD, node, null];
   }
 }
 
@@ -974,8 +1516,8 @@ function getRowKey(cols: PrimaryKey, row: Row): RowKey {
 
 /**
  * Core hydration logic used by {@link PipelineDriver#addQuery}, extracted to a
- * function for reuse by bin-analyze so that bin-analyze's hydration logic
- * is as close as possible to zero-cache's real hydration logic.
+ * function for reuse by the analyze-query RPC path so that analysis hydrates
+ * queries the same way the view-syncer does in production.
  */
 export function* hydrate(
   input: Input,
@@ -1022,11 +1564,15 @@ function mustGetPrimaryKey(
 ): PrimaryKey {
   const pKeys = must(primaryKeys, 'primaryKey map must be non-null');
 
-  return must(
-    pKeys.get(table),
-    `table '${table}' is not one of: ${[...pKeys.keys()].sort()}. ` +
+  const rv = pKeys.get(table);
+  assert(
+    rv,
+    () =>
+      // oxlint-disable-next-line e18e/prefer-array-to-sorted
+      `table '${table}' is not one of: ${[...pKeys.keys()].sort()}. ` +
       `Check the spelling and ensure that the table has a primary key.`,
   );
+  return rv;
 }
 
 /**

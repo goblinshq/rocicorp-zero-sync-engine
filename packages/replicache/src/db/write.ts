@@ -1,3 +1,4 @@
+import '../process-env.ts';
 import type {LogContext} from '@rocicorp/logger';
 import {assert} from '../../../shared/src/asserts.ts';
 import type {Enum} from '../../../shared/src/enum.ts';
@@ -10,7 +11,6 @@ import type {Write as DagWrite} from '../dag/store.ts';
 import * as FormatVersion from '../format-version-enum.ts';
 import type {FrozenJSONValue} from '../frozen-json.ts';
 import {type Hash, emptyHash} from '../hash.ts';
-import {lazy} from '../lazy.ts';
 import type {DiffComputationConfig} from '../sync/diff.ts';
 import {DiffsMap} from '../sync/diff.ts';
 import type {ClientID} from '../sync/ids.ts';
@@ -84,10 +84,37 @@ export class Write extends Read {
     key: string,
     value: FrozenJSONValue,
   ): Promise<void> {
-    const oldVal = lazy(() => this.map.get(key));
-    await updateIndexes(lc, this.indexes, key, oldVal, value);
-
+    if (!process.env.DISABLE_REPLICACHE_INDEXES && this.indexes.size > 0) {
+      await updateIndexes(lc, this.map, this.indexes, key, value);
+    }
     await this.map.put(key, value);
+  }
+
+  /**
+   * Inserts or updates multiple entries in a single bulk operation. More
+   * efficient than calling {@link put} in a loop because it uses
+   * {@link BTreeWrite.putMany} to build or merge tree nodes in one pass.
+   *
+   * `entries` must be sorted in ascending key order.
+   */
+  async putMany(
+    lc: LogContext,
+    entries: ReadonlyArray<readonly [string, FrozenJSONValue]>,
+  ): Promise<void> {
+    if (entries.length === 0) {
+      return;
+    }
+
+    // Update indexes for all entries
+    if (!process.env.DISABLE_REPLICACHE_INDEXES && this.indexes.size > 0) {
+      // TODO(arv): Indexes can use the optimizePatch pattern too.
+      for (const [key, value] of entries) {
+        await updateIndexes(lc, this.map, this.indexes, key, value);
+      }
+    }
+
+    // BTreeWrite.putMany handles both empty and non-empty trees optimally
+    await this.map.putMany(entries);
   }
 
   getMutationID(): Promise<number> {
@@ -95,10 +122,8 @@ export class Write extends Read {
   }
 
   async del(lc: LogContext, key: string): Promise<boolean> {
-    // TODO(arv): This does the binary search twice. We can do better.
-    const oldVal = lazy(() => this.map.get(key));
-    if (oldVal !== undefined) {
-      await updateIndexes(lc, this.indexes, key, oldVal, undefined);
+    if (!process.env.DISABLE_REPLICACHE_INDEXES && this.indexes.size > 0) {
+      await updateIndexes(lc, this.map, this.indexes, key, undefined);
     }
     return this.map.del(key);
   }
@@ -215,6 +240,9 @@ export class Write extends Read {
       valueDiff = await diff(basisMap, this.map);
     }
     diffsMap.set('', valueDiff);
+    if (process.env.DISABLE_REPLICACHE_INDEXES) {
+      return diffsMap;
+    }
     let basisIndexes: Map<string, IndexRead>;
     if (this.#basis) {
       basisIndexes = readIndexesForRead(
@@ -322,16 +350,18 @@ export async function newWriteSnapshotDD31(
 
 export async function updateIndexes(
   lc: LogContext,
+  map: BTreeRead,
   indexes: Map<string, IndexWrite>,
   key: string,
-  oldValGetter: () => Promise<FrozenJSONValue | undefined>,
   newVal: FrozenJSONValue | undefined,
 ): Promise<void> {
+  let oldValPromise: Promise<FrozenJSONValue | undefined> | undefined;
+
   const ps: Promise<void>[] = [];
   for (const idx of indexes.values()) {
     const {keyPrefix} = idx.meta.definition;
     if (!keyPrefix || key.startsWith(keyPrefix)) {
-      const oldVal = await oldValGetter();
+      const oldVal = await (oldValPromise ??= map.get(key));
       if (oldVal !== undefined) {
         ps.push(
           indexValue(
@@ -368,7 +398,10 @@ export function readIndexesForWrite(
   dagWrite: DagWrite,
   formatVersion: FormatVersion,
 ): Map<string, IndexWrite> {
-  const m = new Map();
+  const m: Map<string, IndexWrite> = new Map();
+  if (process.env.DISABLE_REPLICACHE_INDEXES) {
+    return m;
+  }
   for (const index of commit.indexes) {
     m.set(
       index.definition.name,

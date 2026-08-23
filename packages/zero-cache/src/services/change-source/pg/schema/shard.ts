@@ -14,7 +14,10 @@ import type {PostgresDB, PostgresTransaction} from '../../../../types/pg.ts';
 import type {AppID, ShardConfig, ShardID} from '../../../../types/shards.ts';
 import {appSchema, check, upstreamSchema} from '../../../../types/shards.ts';
 import {id} from '../../../../types/sql.ts';
-import {createEventTriggerStatements} from './ddl.ts';
+import {
+  createEventFunctionStatements,
+  createEventTriggerStatements,
+} from './ddl.ts';
 import {
   getPublicationInfo,
   publishedSchema,
@@ -69,10 +72,6 @@ export function replicationSlotExpression(shard: ShardID) {
   // Underscores have a special meaning in LIKE values
   // so they have to be escaped.
   return `${replicationSlotPrefix(shard)}%`.replaceAll('_', '\\_');
-}
-
-export function newReplicationSlot(shard: ShardID) {
-  return replicationSlotPrefix(shard) + Date.now();
 }
 
 function defaultPublicationName(appID: string, shardID: string | number) {
@@ -163,7 +162,7 @@ export function shardSetup(
   const app = id(appSchema(shardConfig));
   const shard = id(upstreamSchema(shardConfig));
 
-  const pubs = [...shardConfig.publications].sort();
+  const pubs = shardConfig.publications.toSorted();
   assert(
     pubs.includes(metadataPublication),
     () => `Publications must include ${metadataPublication}`,
@@ -196,9 +195,16 @@ export function shardSetup(
     );
 
   CREATE TABLE ${shard}.replicas (
-    "slot"               TEXT PRIMARY KEY,
+    -- The DEFAULT exists purely for backwards compatibility support.
+    -- New code always specifies a value based on Date.now().
+    "id"                 TEXT PRIMARY KEY DEFAULT replace(gen_random_uuid()::text, '-', ''),
+    "rank"               BIGSERIAL,
+    "slot"               TEXT NOT NULL,
     "version"            TEXT NOT NULL,
-    "initialSchema"      JSON NOT NULL,
+    "generation"         TEXT,  -- to replace version, NULL-able in the interim
+    "backupPath"         TEXT,  -- subpath within the litestream backup URL
+    "backupV5"           BOOL DEFAULT false,
+    "initialSchema"      JSON,  -- set after initial sync
     "initialSyncContext" JSON,
     "subscriberContext"  JSON
   );
@@ -226,15 +232,44 @@ const internalShardConfigSchema = v.object({
 
 export type InternalShardConfig = v.Infer<typeof internalShardConfigSchema>;
 
-const replicaSchema = internalShardConfigSchema.extend({
+const replicaInfoSchema = v.object({
+  id: v.string(),
+  rank: v.bigint(),
   slot: v.string(),
   version: v.string(),
+  generation: v.string().nullable(),
+  backupPath: v.string().nullable(),
+  backupV5: v.boolean(),
+});
+
+const fullReplicaRowSchema = replicaInfoSchema.extend({
   initialSchema: publishedSchema,
   initialSyncContext: jsonObjectSchema.nullable(),
   subscriberContext: jsonObjectSchema.nullable(),
 });
 
+const replicaSchema = internalShardConfigSchema
+  .extend(fullReplicaRowSchema.shape)
+  .map(replica => {
+    const {version, generation, ...r} = replica;
+    return {...r, generation: generation ?? version};
+  });
+
 export type Replica = v.Infer<typeof replicaSchema>;
+
+const replicationSlotStateSchema = v.object({
+  active: v.boolean(),
+  confirmedFlushLsn: v.string().nullable(),
+});
+
+const replicaStateSchema = replicaInfoSchema
+  .extend(replicationSlotStateSchema.shape)
+  .map(replica => {
+    const {version, generation, ...r} = replica;
+    return {...r, generation: generation ?? version};
+  });
+
+export type ReplicaState = v.Infer<typeof replicaStateSchema>;
 
 // triggerSetup is run separately in a sub-transaction (i.e. SAVEPOINT) so
 // that a failure (e.g. due to lack of superuser permissions) can be handled
@@ -247,48 +282,150 @@ function triggerSetup(shard: ShardConfig): string {
   );
 }
 
-// Called in initial-sync to store the exact schema that was initially synced.
-export async function addReplica(
+export type BackupOptions = {
+  backupPath: string | null;
+  backupV5: boolean;
+};
+
+/**
+ * Creates a new replica to mark it as the owner of a specified `slot`.
+ * This should be done with an advisory lock for replica/slot management
+ * to ensure that the slot does not get dropped by concurrent cleanup
+ * logic.
+ *
+ * Once initial sync is complete, {@link initReplica} should be called to
+ * make the replica usable for incremental sync.
+ */
+export async function createReplica(
   sql: PostgresDB,
   shard: ShardID,
+  id: string,
   slot: string,
   replicaVersion: string,
+  {backupPath, backupV5}: BackupOptions,
+) {
+  const schema = upstreamSchema(shard);
+  const values: Partial<v.Infer<typeof fullReplicaRowSchema>> = {
+    id,
+    slot,
+    version: replicaVersion,
+    generation: replicaVersion,
+    backupPath,
+    backupV5,
+  };
+  await sql`INSERT INTO ${sql(schema)}.replicas ${sql(values)}`;
+}
+
+// Called in initial-sync to store the exact schema that was initially synced.
+export async function initReplica(
+  sql: PostgresDB,
+  shard: ShardID,
+  id: string,
   {tables, indexes}: PublishedSchema,
   initialSyncContext: JSONObject,
 ) {
   const schema = upstreamSchema(shard);
   const synced: PublishedSchema = {tables, indexes};
-  await sql`
-    INSERT INTO ${sql(schema)}.replicas
-      ("slot", "version", "initialSchema", "initialSyncContext")
-      VALUES (${slot}, ${replicaVersion}, ${synced}, ${initialSyncContext})`;
+  const values = {initialSchema: synced, initialSyncContext};
+  await sql`UPDATE ${sql(schema)}.replicas SET ${sql(values)} WHERE id = ${id}`;
 }
 
+/**
+ * Gets at the given version and optional ID. If no ID is specified, gets
+ * the latest (i.e. highest rank) replica with that version.
+ */
 export async function getReplicaAtVersion(
   lc: LogContext,
   sql: PostgresDB,
   shard: ShardID,
   replicaVersion: string,
+  id: string | null = null,
   context?: JSONObject,
 ): Promise<Replica | null> {
   const schema = sql(upstreamSchema(shard));
   const result = await sql`
-    SELECT * FROM ${schema}.replicas JOIN ${schema}."shardConfig" ON true
-      WHERE version = ${replicaVersion};
+    SELECT
+      replicas."id",
+      replicas."rank",
+      replicas."slot",
+      replicas."version",
+      replicas."generation",
+      replicas."backupPath",
+      replicas."backupV5",
+      replicas."initialSchema",
+      replicas."initialSyncContext",
+      replicas."subscriberContext",
+      "shardConfig"."publications",
+      "shardConfig"."ddlDetection"
+    FROM ${schema}.replicas JOIN ${schema}."shardConfig" ON true
+      WHERE version = ${replicaVersion} AND "initialSyncContext" IS NOT NULL
+      AND id = COALESCE(${id}, id)
+      ORDER BY rank DESC LIMIT 1;
   `;
   if (result.length === 0) {
     // log out all the replicas and the joined shardConfig
     const allReplicas = await sql`
-      SELECT slot, version, "initialSyncContext", "subscriberContext" 
+      SELECT id, slot, version, "initialSyncContext", "subscriberContext" 
         FROM ${schema}.replicas`;
     lc.info?.(
-      `Replica ${replicaVersion} ` +
+      `Replica ${id}@${replicaVersion}` +
         (context ? `(context: ${stringify(context)}) ` : '') +
         `not found in: ${stringify(allReplicas)}`,
     );
     return null;
   }
   return v.parse(result[0], replicaSchema, 'passthrough');
+}
+
+export async function getActiveReplicas(
+  lc: LogContext,
+  sql: PostgresDB,
+  shard: ShardID,
+): Promise<ReplicaState[]> {
+  const schema = sql(upstreamSchema(shard));
+  const results = await sql`
+    SELECT
+      replicas."id",
+      replicas."rank",
+      replicas."slot",
+      replicas."version",
+      replicas."generation",
+      replicas."backupPath",
+      replicas."backupV5",
+      slots."active",
+      slots."confirmed_flush_lsn" as "confirmedFlushLsn"
+    FROM ${schema}.replicas JOIN pg_replication_slots slots ON slot = slot_name
+      WHERE "initialSyncContext" IS NOT NULL
+      ORDER BY generation DESC, confirmed_flush_lsn DESC;
+  `;
+  const replicas = v.parse(results, v.array(replicaStateSchema), 'passthrough');
+  lc.info?.(`current replicas`, {replicas});
+  return replicas;
+}
+
+export async function getReplicaState(
+  sql: PostgresDB,
+  shard: ShardID,
+  id: string,
+): Promise<ReplicaState | null> {
+  const schema = sql(upstreamSchema(shard));
+  const results = await sql`
+    SELECT
+      replicas."id",
+      replicas."rank",
+      replicas."slot",
+      replicas."version",
+      replicas."generation",
+      replicas."backupPath",
+      replicas."backupV5",
+      slots."active",
+      slots."confirmed_flush_lsn" as "confirmedFlushLsn"
+    FROM ${schema}.replicas JOIN pg_replication_slots slots ON slot = slot_name
+      WHERE "id" = ${id};
+  `;
+  return results.length
+    ? v.parse(results[0], replicaStateSchema, 'passthrough')
+    : null;
 }
 
 export async function getInternalShardConfig(
@@ -377,9 +514,23 @@ export async function setupTriggers(
   tx: PostgresTransaction,
   shard: ShardConfig,
 ) {
+  const schema = upstreamSchema(shard);
+  const [{ddlDetection}] = await tx<InternalShardConfig[]> /*sql*/ `
+    SELECT "ddlDetection" FROM ${tx(schema)}."shardConfig"`;
+
+  // The functions invoked by event triggers are installed even if
+  // event triggers are not supported/allowed by the db provider.
+  // This allows users to manually invoke the update_schemas() function
+  // as a workaround.
+  await tx.unsafe(createEventFunctionStatements(shard));
   try {
     await tx.savepoint(sub => sub.unsafe(triggerSetup(shard)));
   } catch (e) {
+    if (ddlDetection) {
+      // If ddlDetection has already been enabled, subsequent failures to
+      // upgrade the trigger should be propagated rather than swallowed.
+      throw e;
+    }
     if (
       !(
         e instanceof postgres.PostgresError &&
@@ -406,7 +557,7 @@ export function validatePublications(
   published.publications.forEach(pub => {
     if (
       !pub.pubinsert ||
-      !pub.pubtruncate ||
+      !pub.pubupdate ||
       !pub.pubdelete ||
       !pub.pubtruncate
     ) {

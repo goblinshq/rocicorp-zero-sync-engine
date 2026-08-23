@@ -48,6 +48,7 @@ export function* once<T>(stream: Iterable<T>): Iterable<T> {
 type IteratorWithHelpers<T> = Iterator<T> & {
   map<U>(f: (t: T, index: number) => U): IteratorWithHelpers<U>;
   filter(p: (t: T, index: number) => boolean): IteratorWithHelpers<T>;
+  some(p: (t: T, index: number) => boolean): boolean;
   [Symbol.iterator](): IteratorWithHelpers<T>;
 };
 
@@ -88,8 +89,39 @@ class IterWrapper<T> implements IteratorWithHelpers<T>, IterableIterator<T> {
   filter(p: (t: T, index: number) => boolean): IterWrapper<T> {
     return new IterWrapper(filterIter(this, p));
   }
+
+  some(p: (t: T, index: number) => boolean): boolean {
+    return some(this, p);
+  }
 }
 
 export function wrapIterable<T>(iter: Iterable<T>): IteratorWithHelpers<T> {
   return iteratorFrom(iter);
+}
+
+/**
+ * This will make a new array where the elements are the same as the iterable
+ * but sorted according to the compare function. If the compare function is not
+ * provided, it will sort the elements in JS standard way which is string
+ * compare.
+ */
+export function toSorted<T>(
+  iter: Iterable<T>,
+  compare?: (a: T, b: T) => number,
+): T[] {
+  // oxlint-disable-next-line e18e/prefer-array-to-sorted
+  return [...iter].sort(compare);
+}
+
+export function some<T>(
+  iterable: Iterable<T>,
+  predicate: (item: T, index: number) => boolean,
+): boolean {
+  let index = 0;
+  for (const item of iterable) {
+    if (predicate(item, index++)) {
+      return true;
+    }
+  }
+  return false;
 }

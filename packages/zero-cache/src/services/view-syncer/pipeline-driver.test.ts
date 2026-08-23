@@ -1,8 +1,11 @@
-import type {LogContext} from '@rocicorp/logger';
+import {LogContext} from '@rocicorp/logger';
 import {afterEach, beforeEach, describe, expect, test} from 'vitest';
 import {testLogConfig} from '../../../../otel/src/test-log-config.ts';
-import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
-import type {AST} from '../../../../zero-protocol/src/ast.ts';
+import {TestLogSink} from '../../../../shared/src/logging-test-utils.ts';
+import type {
+  AST,
+  CorrelatedSubqueryCondition,
+} from '../../../../zero-protocol/src/ast.ts';
 import {createSchema} from '../../../../zero-schema/src/builder/schema-builder.ts';
 import {
   boolean,
@@ -10,6 +13,7 @@ import {
   string,
   table,
 } from '../../../../zero-schema/src/builder/table-builder.ts';
+import {ChangeType} from '../../../../zql/src/ivm/change-type.ts';
 import {
   CREATE_STORAGE_TABLE,
   DatabaseStorage,
@@ -19,6 +23,7 @@ import {Database} from '../../../../zqlite/src/db.ts';
 import {listTables} from '../../db/lite-tables.ts';
 import {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import {DbFile} from '../../test/lite.ts';
+import type {RowKey} from '../../types/row-key.ts';
 import {upstreamSchema, type ShardID} from '../../types/shards.ts';
 import {populateFromExistingTables} from '../replicator/schema/column-metadata.ts';
 import {initReplicationState} from '../replicator/schema/replication-state.ts';
@@ -28,7 +33,9 @@ import {
   type FakeReplicator,
 } from '../replicator/test-utils.ts';
 import {getMutationResultsQuery} from './cvr.ts';
-import {PipelineDriver, type Timer} from './pipeline-driver.ts';
+import {PipelineDriver, type RowChange, type Timer} from './pipeline-driver.ts';
+import {rowIDSignatureUnit} from './row-set-signature.ts';
+import type {RowID} from './schema/types.ts';
 import {ResetPipelinesSignal, Snapshotter} from './snapshotter.ts';
 import {TimeSliceTimer} from './view-syncer.ts';
 
@@ -43,11 +50,13 @@ describe('view-syncer/pipeline-driver', () => {
   let dbFile: DbFile;
   let db: DB;
   let lc: LogContext;
+  let logSink: TestLogSink;
   let pipelines: PipelineDriver;
   let replicator: FakeReplicator;
 
   beforeEach(() => {
-    lc = createSilentLogContext();
+    logSink = new TestLogSink();
+    lc = new LogContext('error', undefined, logSink);
     dbFile = new DbFile('pipelines_test');
     dbFile.connect(lc).pragma('journal_mode = wal2');
 
@@ -79,7 +88,7 @@ describe('view-syncer/pipeline-driver', () => {
       CREATE TABLE issues (
         id TEXT PRIMARY KEY,
         closed BOOL,
-        ignored INET,
+        ignored BYTEA,
         _0_version TEXT NOT NULL
       );
       CREATE TABLE comments (
@@ -182,6 +191,10 @@ describe('view-syncer/pipeline-driver', () => {
 
   const clientSchema = createSchema({
     tables: [issues, comments, issueLabels, labels, uniques],
+  });
+
+  const subsetClientSchema = createSchema({
+    tables: [issues],
   });
 
   const ISSUES_AND_COMMENTS: AST = {
@@ -461,7 +474,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "3",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -474,7 +487,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "2",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -488,7 +501,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -502,7 +515,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "21",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -516,7 +529,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "20",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -529,7 +542,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -543,7 +556,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -569,7 +582,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "3",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -582,7 +595,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "2",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -596,7 +609,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -610,7 +623,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "21",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -624,7 +637,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "20",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -637,7 +650,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -651,10 +664,158 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
+  });
+
+  test('logs query identity when query hydration fails', () => {
+    pipelines.init(clientSchema);
+
+    expect(() => [
+      ...pipelines.addQuery(
+        'hash1',
+        'queryID1',
+        {table: 'doesNotExist'},
+        startTimer(),
+        'myQuery',
+      ),
+    ]).toThrowError(/doesNotExist/);
+
+    const failureLog = logSink.messages.find(
+      ([level, context, args]) =>
+        level === 'error' &&
+        context?.queryHash === 'queryID1' &&
+        args[0] === 'query hydration failed',
+    );
+    expect(failureLog?.[1]).toMatchObject({
+      queryHash: 'queryID1',
+      queryName: 'myQuery',
+      transformationHash: 'hash1',
+    });
+  });
+
+  test('logs query pipeline lifecycle', () => {
+    logSink.messages.length = 0;
+    lc = new LogContext(
+      'info',
+      {
+        taskID: 'task-a',
+        worker: 'syncer',
+        workerIndex: 2,
+        component: 'view-syncer',
+        clientGroupID: 'foo-client-group',
+        instance: 'view-syncer-instance',
+      },
+      logSink,
+    );
+
+    const storage = new Database(lc, ':memory:');
+    storage.prepare(CREATE_STORAGE_TABLE).run();
+    pipelines = new PipelineDriver(
+      lc,
+      testLogConfig,
+      new Snapshotter(lc, dbFile.path, {appID: shardID.appID}),
+      shardID,
+      new DatabaseStorage(storage).createClientGroupStorage('foo-client-group'),
+      'foo-client-group',
+      new InspectorDelegate(undefined),
+      () => 200 /** yield threshold */,
+    );
+    pipelines.init(clientSchema);
+
+    [
+      ...pipelines.addQuery(
+        'transformation-hash-1',
+        'queryID1',
+        ISSUES_AND_COMMENTS,
+        NO_TIME_ADVANCEMENT_TIMER,
+      ),
+    ];
+    [
+      ...pipelines.addQuery(
+        'transformation-hash-1',
+        'queryID2',
+        ISSUES_AND_COMMENTS,
+        NO_TIME_ADVANCEMENT_TIMER,
+      ),
+    ];
+    pipelines.removeQuery('queryID1');
+
+    const lifecycleContexts = logSink.messages
+      .filter(
+        ([level, context, args]) =>
+          level === 'info' &&
+          context?.zeroEvent !== undefined &&
+          args[0] === 'query pipeline lifecycle',
+      )
+      .map(([, context]) => context);
+
+    expect(lifecycleContexts.map(c => c?.zeroEvent)).toEqual([
+      'query-pipeline-hydrate-start',
+      'query-pipeline-hydrate-finish',
+      'query-pipeline-hydrate-start',
+      'query-pipeline-hydrate-finish',
+      'query-pipeline-stop',
+    ]);
+
+    const query1Start = lifecycleContexts.find(
+      c =>
+        c?.zeroEvent === 'query-pipeline-hydrate-start' &&
+        c.queryHash === 'queryID1',
+    );
+    const query1Finish = lifecycleContexts.find(
+      c =>
+        c?.zeroEvent === 'query-pipeline-hydrate-finish' &&
+        c.queryHash === 'queryID1',
+    );
+    const query1Stop = lifecycleContexts.find(
+      c => c?.zeroEvent === 'query-pipeline-stop' && c.queryHash === 'queryID1',
+    );
+    const query2Start = lifecycleContexts.find(
+      c =>
+        c?.zeroEvent === 'query-pipeline-hydrate-start' &&
+        c.queryHash === 'queryID2',
+    );
+    const query2Finish = lifecycleContexts.find(
+      c =>
+        c?.zeroEvent === 'query-pipeline-hydrate-finish' &&
+        c.queryHash === 'queryID2',
+    );
+
+    expect(query1Start).toMatchObject({
+      taskID: 'task-a',
+      worker: 'syncer',
+      workerIndex: 2,
+      component: 'view-syncer',
+      clientGroupID: 'foo-client-group',
+      instance: 'view-syncer-instance',
+      queryHash: 'queryID1',
+      transformationHash: 'transformation-hash-1',
+      hydrationReason: 'query-set-sync',
+    });
+    expect(query1Finish).toMatchObject({
+      queryHash: 'queryID1',
+      pipelineRunID: query1Start?.pipelineRunID,
+      hydrationRowCount: expect.any(Number),
+      hydrationTimeMs: expect.any(Number),
+    });
+    expect(query2Start).toMatchObject({
+      queryHash: 'queryID2',
+      transformationHash: 'transformation-hash-1',
+    });
+    expect(query2Finish).toMatchObject({
+      queryHash: 'queryID2',
+      pipelineRunID: query2Start?.pipelineRunID,
+    });
+    expect(query1Stop).toMatchObject({
+      zeroEvent: 'query-pipeline-stop',
+      queryHash: 'queryID1',
+      pipelineRunID: query1Start?.pipelineRunID,
+      stopReason: 'remove-query',
+      pipelineLifetimeMs: expect.any(Number),
+    });
   });
 
   test('insert', () => {
@@ -694,7 +855,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "31",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -707,7 +868,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "4",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -721,7 +882,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "41",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -753,7 +914,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -762,7 +923,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -771,7 +932,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "21",
           },
           "table": "comments",
-          "type": "remove",
+          "type": 1,
         },
       ]
     `);
@@ -818,7 +979,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -832,7 +993,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -856,10 +1017,189 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": "edit",
+          "type": 2,
         },
       ]
     `);
+  });
+
+  test('rowSetSignature reflects hydrate + advance deltas', () => {
+    const toID = (c: RowChange): RowID => ({
+      schema: '',
+      table: c.table,
+      rowKey: c.rowKey as RowKey,
+    });
+    const sigFromChanges = (changes: readonly RowChange[]) => {
+      let sig = 0n;
+      for (const c of changes) {
+        if (c.type === ChangeType.EDIT) continue;
+        sig ^= rowIDSignatureUnit(toID(c));
+      }
+      return sig;
+    };
+    const onlyRowChanges = (
+      xs: Iterable<RowChange | 'yield'>,
+    ): readonly RowChange[] =>
+      [...xs].filter((c): c is RowChange => c !== 'yield');
+
+    pipelines.init(clientSchema);
+    const hydrated = onlyRowChanges(
+      pipelines.addQuery(
+        'hash1',
+        'queryID1',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    );
+    expect(pipelines.rowSetSignature('queryID1')).toEqual(
+      sigFromChanges(hydrated),
+    );
+
+    // Delete issues/1 (cascades to comments/10) and insert a fresh issues/4.
+    replicator.processTransaction(
+      '134',
+      messages.delete('issues', {id: '1'}),
+      messages.insert('issues', {id: '4', closed: 0}),
+    );
+    const advanced = onlyRowChanges(changes());
+    expect(pipelines.rowSetSignature('queryID1')).toEqual(
+      sigFromChanges([...hydrated, ...advanced]),
+    );
+
+    // An update that doesn't touch relationship keys yields EDITs only;
+    // the signature must stay the same.
+    const sigBeforeEdit = pipelines.rowSetSignature('queryID1');
+    replicator.processTransaction(
+      '135',
+      messages.update('comments', {id: '22', issueID: '2', upvotes: 99}),
+    );
+    const afterEdit = onlyRowChanges(changes());
+    expect(afterEdit.length).toBeGreaterThan(0);
+    expect(afterEdit.every(c => c.type === ChangeType.EDIT)).toBe(true);
+    expect(pipelines.rowSetSignature('queryID1')).toEqual(sigBeforeEdit);
+
+    // removeQuery clears the entry.
+    pipelines.removeQuery('queryID1');
+    expect(pipelines.rowSetSignature('queryID1')).toBeUndefined();
+  });
+
+  test('rowSetSignature resets on re-execution (addQuery with same queryID)', () => {
+    const toID = (c: RowChange): RowID => ({
+      schema: '',
+      table: c.table,
+      rowKey: c.rowKey as RowKey,
+    });
+    const sigFromChanges = (changes: readonly RowChange[]) => {
+      let sig = 0n;
+      for (const c of changes) {
+        if (c.type === ChangeType.EDIT) continue;
+        sig ^= rowIDSignatureUnit(toID(c));
+      }
+      return sig;
+    };
+    const onlyRowChanges = (
+      xs: Iterable<RowChange | 'yield'>,
+    ): readonly RowChange[] =>
+      [...xs].filter((c): c is RowChange => c !== 'yield');
+
+    pipelines.init(clientSchema);
+
+    const firstChanges = onlyRowChanges(
+      pipelines.addQuery(
+        'hash1',
+        'queryID1',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    );
+    const firstSig = pipelines.rowSetSignature('queryID1');
+    expect(firstSig).toEqual(sigFromChanges(firstChanges));
+    expect(firstSig).not.toEqual(0n);
+
+    // Re-execute with a new transformation hash. addQuery internally calls
+    // removeQuery, which must reset the signature before hydration accumulates
+    // from 0. If it didn't, the second hydration's XORs would cancel the
+    // first's (same AST, same rows) and land at 0n.
+    const secondChanges = onlyRowChanges(
+      pipelines.addQuery(
+        'hash2',
+        'queryID1',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    );
+    expect(pipelines.rowSetSignature('queryID1')).toEqual(
+      sigFromChanges(secondChanges),
+    );
+    expect(pipelines.rowSetSignature('queryID1')).toEqual(firstSig);
+  });
+
+  test('rowSetSignature is maintained independently per query', () => {
+    const toID = (c: RowChange): RowID => ({
+      schema: '',
+      table: c.table,
+      rowKey: c.rowKey as RowKey,
+    });
+    const sigFromChanges = (changes: readonly RowChange[]) => {
+      let sig = 0n;
+      for (const c of changes) {
+        if (c.type === ChangeType.EDIT) continue;
+        sig ^= rowIDSignatureUnit(toID(c));
+      }
+      return sig;
+    };
+    const onlyRowChanges = (
+      xs: Iterable<RowChange | 'yield'>,
+    ): readonly RowChange[] =>
+      [...xs].filter((c): c is RowChange => c !== 'yield');
+
+    const ISSUES_ONLY: AST = {table: 'issues', orderBy: [['id', 'desc']]};
+
+    pipelines.init(clientSchema);
+
+    const commentedHydrated = onlyRowChanges(
+      pipelines.addQuery(
+        'hash-issues-comments',
+        'qIssuesComments',
+        ISSUES_AND_COMMENTS,
+        startTimer(),
+      ),
+    );
+    const issuesHydrated = onlyRowChanges(
+      pipelines.addQuery(
+        'hash-issues',
+        'qIssuesOnly',
+        ISSUES_ONLY,
+        startTimer(),
+      ),
+    );
+
+    expect(pipelines.rowSetSignature('qIssuesComments')).toEqual(
+      sigFromChanges(commentedHydrated),
+    );
+    expect(pipelines.rowSetSignature('qIssuesOnly')).toEqual(
+      sigFromChanges(issuesHydrated),
+    );
+
+    const issuesOnlySigBefore = pipelines.rowSetSignature('qIssuesOnly');
+
+    // Delete a comment: only qIssuesComments reads from the comments table,
+    // so only its signature should change. qIssuesOnly's pipeline never sees
+    // the event, so its signature is untouched.
+    replicator.processTransaction(
+      '134',
+      messages.delete('comments', {id: '22'}),
+    );
+    const advanced = onlyRowChanges(changes());
+    expect(advanced.length).toBeGreaterThan(0);
+    expect(advanced.every(c => c.queryID === 'qIssuesComments')).toBe(true);
+
+    expect(pipelines.rowSetSignature('qIssuesComments')).toEqual(
+      sigFromChanges([...commentedHydrated, ...advanced]),
+    );
+    expect(pipelines.rowSetSignature('qIssuesOnly')).toEqual(
+      issuesOnlySigBefore,
+    );
   });
 
   test('timeout on slow advancement', () => {
@@ -992,7 +1332,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "3",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1006,7 +1346,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "2",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1020,7 +1360,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "22",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1034,7 +1374,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "21",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1048,7 +1388,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "20",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1062,7 +1402,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1076,7 +1416,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1099,7 +1439,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "foo",
           },
           "table": "uniques",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1112,7 +1452,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "boo",
           },
           "table": "uniques",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1140,7 +1480,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "boo",
           },
           "table": "uniques",
-          "type": "edit",
+          "type": 2,
         },
       ]
     `);
@@ -1163,7 +1503,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "foo",
           },
           "table": "uniques",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1176,7 +1516,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "boo",
           },
           "table": "uniques",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1197,7 +1537,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "foo",
           },
           "table": "uniques",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -1210,7 +1550,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "baz",
           },
           "table": "uniques",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1223,7 +1563,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "foo",
           },
           "table": "uniques",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1258,7 +1598,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID",
@@ -1268,7 +1608,7 @@ describe('view-syncer/pipeline-driver', () => {
             "labelID": "1",
           },
           "table": "issueLabels",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID",
@@ -1277,7 +1617,63 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "labels",
-          "type": "remove",
+          "type": 1,
+        },
+      ]
+    `);
+  });
+
+  test('subset client schema can hydrate whereExists helper tables', () => {
+    pipelines.init(subsetClientSchema);
+
+    expect([
+      ...pipelines.addQuery(
+        'hash-subset-schema-exists',
+        'querySubsetSchemaExists',
+        ISSUES_QUERY_WITH_EXISTS,
+        startTimer(),
+      ),
+    ]).toMatchInlineSnapshot(`
+      [
+        {
+          "queryID": "querySubsetSchemaExists",
+          "row": {
+            "_0_version": "123",
+            "closed": false,
+            "id": "1",
+          },
+          "rowKey": {
+            "id": "1",
+          },
+          "table": "issues",
+          "type": 0,
+        },
+        {
+          "queryID": "querySubsetSchemaExists",
+          "row": {
+            "_0_version": "123",
+            "issueID": "1",
+            "labelID": "1",
+            "legacyID": "1-1",
+          },
+          "rowKey": {
+            "legacyID": "1-1",
+          },
+          "table": "issueLabels",
+          "type": 0,
+        },
+        {
+          "queryID": "querySubsetSchemaExists",
+          "row": {
+            "_0_version": "123",
+            "id": "1",
+            "name": "bug",
+          },
+          "rowKey": {
+            "id": "1",
+          },
+          "table": "labels",
+          "type": 0,
         },
       ]
     `);
@@ -1305,7 +1701,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1330,7 +1726,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID",
@@ -1345,7 +1741,7 @@ describe('view-syncer/pipeline-driver', () => {
             "labelID": "1",
           },
           "table": "issueLabels",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1478,7 +1874,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "2",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1493,7 +1889,7 @@ describe('view-syncer/pipeline-driver', () => {
             "labelID": "1",
           },
           "table": "issueLabels",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1506,7 +1902,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "labels",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1521,7 +1917,7 @@ describe('view-syncer/pipeline-driver', () => {
             "labelID": "1",
           },
           "table": "issueLabels",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryID1",
@@ -1534,7 +1930,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "labels",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1557,7 +1953,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "2",
           },
           "table": "issues",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -1567,7 +1963,7 @@ describe('view-syncer/pipeline-driver', () => {
             "labelID": "1",
           },
           "table": "issueLabels",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -1576,7 +1972,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "labels",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -1586,7 +1982,7 @@ describe('view-syncer/pipeline-driver', () => {
             "labelID": "1",
           },
           "table": "issueLabels",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -1595,7 +1991,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "labels",
-          "type": "remove",
+          "type": 1,
         },
       ]
     `);
@@ -1732,7 +2128,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "4",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1756,7 +2152,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "41",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1772,7 +2168,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "4",
           },
           "table": "issues",
-          "type": "remove",
+          "type": 1,
         },
         {
           "queryID": "queryID1",
@@ -1781,7 +2177,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "41",
           },
           "table": "comments",
-          "type": "remove",
+          "type": 1,
         },
       ]
     `);
@@ -1870,7 +2266,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryScalar",
@@ -1884,7 +2280,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -1892,6 +2288,58 @@ describe('view-syncer/pipeline-driver', () => {
     // The transformedAst should have the scalar subquery resolved to a simple condition
     expect(
       pipelines.queries().get('queryScalar')?.transformedAst.where,
+    ).toEqual({
+      type: 'simple',
+      op: '=',
+      left: {type: 'column', name: 'id'},
+      right: {type: 'literal', value: '1'},
+    });
+  });
+
+  test('subset client schema can hydrate scalar subquery companion tables', () => {
+    pipelines.init(subsetClientSchema);
+
+    expect([
+      ...pipelines.addQuery(
+        'hash-scalar-subset-schema',
+        'queryScalarSubsetSchema',
+        ISSUES_WITH_SCALAR_SUBQUERY,
+        startTimer(),
+      ),
+    ]).toMatchInlineSnapshot(`
+      [
+        {
+          "queryID": "queryScalarSubsetSchema",
+          "row": {
+            "_0_version": "123",
+            "closed": false,
+            "id": "1",
+          },
+          "rowKey": {
+            "id": "1",
+          },
+          "table": "issues",
+          "type": 0,
+        },
+        {
+          "queryID": "queryScalarSubsetSchema",
+          "row": {
+            "_0_version": "123",
+            "id": "10",
+            "issueID": "1",
+            "upvotes": 0,
+          },
+          "rowKey": {
+            "id": "10",
+          },
+          "table": "comments",
+          "type": 0,
+        },
+      ]
+    `);
+
+    expect(
+      pipelines.queries().get('queryScalarSubsetSchema')?.transformedAst.where,
     ).toEqual({
       type: 'simple',
       op: '=',
@@ -1922,6 +2370,134 @@ describe('view-syncer/pipeline-driver', () => {
       op: '=',
       left: {type: 'literal', value: 1},
       right: {type: 'literal', value: 0},
+    });
+  });
+
+  test('scalar NOT EXISTS subquery with no matching rows', () => {
+    pipelines.init(clientSchema);
+
+    // No comment has id='nonexistent', so nothing can satisfy the correlated
+    // EXISTS — its negation holds for every issue.
+    const results = [
+      ...pipelines.addQuery(
+        'hash-scalar-not-none',
+        'queryScalarNotNone',
+        {
+          ...ISSUES_WITH_NONEXISTENT_SCALAR_SUBQUERY,
+          where: {
+            ...(ISSUES_WITH_NONEXISTENT_SCALAR_SUBQUERY.where as CorrelatedSubqueryCondition),
+            op: 'NOT EXISTS',
+          },
+        },
+        startTimer(),
+      ),
+    ];
+
+    expect(results.filter(r => r !== 'yield').map(r => r.rowKey)).toEqual([
+      {id: '1'},
+      {id: '2'},
+      {id: '3'},
+    ]);
+
+    expect(
+      pipelines.queries().get('queryScalarNotNone')?.transformedAst.where,
+    ).toEqual({
+      type: 'simple',
+      op: '=',
+      left: {type: 'literal', value: 1},
+      right: {type: 'literal', value: 1},
+    });
+  });
+
+  describe('unhonored scalar hints are reported', () => {
+    // The driver is built at 'error' by default, which swallows warnings.
+    function warningsFrom(query: AST): string[] {
+      logSink.messages.length = 0;
+      const warnLc = new LogContext('warn', undefined, logSink);
+      const storage = new Database(warnLc, ':memory:');
+      storage.prepare(CREATE_STORAGE_TABLE).run();
+      pipelines = new PipelineDriver(
+        warnLc,
+        testLogConfig,
+        new Snapshotter(warnLc, dbFile.path, {appID: shardID.appID}),
+        shardID,
+        new DatabaseStorage(storage).createClientGroupStorage(
+          'foo-client-group',
+        ),
+        'pipeline-driver.test.ts',
+        new InspectorDelegate(undefined),
+        () => 200 /** yield threshold */,
+      );
+      pipelines.init(clientSchema);
+      [...pipelines.addQuery('hash-warn', 'queryWarn', query, startTimer())];
+      return logSink.messages
+        .filter(([level]) => level === 'warn')
+        .map(([, , args]) => String(args[0]));
+    }
+
+    test('an unpinned subquery warns, naming the table and its unique keys', () => {
+      const warnings = warningsFrom({
+        ...ISSUES_WITH_SCALAR_SUBQUERY,
+        where: {
+          ...(ISSUES_WITH_SCALAR_SUBQUERY.where as CorrelatedSubqueryCondition),
+          related: {
+            correlation: {parentField: ['id'], childField: ['issueID']},
+            subquery: {
+              table: 'comments',
+              // The gate survives as a real EXISTS, which needs an alias —
+              // the builder always emits one.
+              alias: 'zsubq_comments',
+              orderBy: [['id', 'asc']],
+              // `upvotes` is not unique, so this pins nothing.
+              where: {
+                type: 'simple',
+                op: '=',
+                left: {type: 'column', name: 'upvotes'},
+                right: {type: 'literal', value: 0},
+              },
+            },
+          },
+        },
+      });
+
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchInlineSnapshot(
+        `"Ignoring {scalar: true} on the "comments" subquery of query queryWarn: it does not constrain every column of any unique key [(id)] to a literal with "=", so it is not provably limited to one row. The gate runs as a plain EXISTS."`,
+      );
+    });
+
+    test('a subquery pinned on the primary key is silent', () => {
+      expect(warningsFrom(ISSUES_WITH_SCALAR_SUBQUERY)).toEqual([]);
+    });
+
+    test('a subquery pinned on a non-primary unique index is silent', () => {
+      // `uniques` has unique indexes on both `id` and `name`. Pinning `name`
+      // is honored, which the client schema — primary keys only — could not
+      // have known. This is why the check lives here and not in the builder.
+      expect(
+        warningsFrom({
+          table: 'issues',
+          orderBy: [['id', 'asc']],
+          where: {
+            type: 'correlatedSubquery',
+            op: 'EXISTS',
+            scalar: true,
+            related: {
+              correlation: {parentField: ['id'], childField: ['id']},
+              subquery: {
+                table: 'uniques',
+                orderBy: [['id', 'asc']],
+                where: {
+                  type: 'simple',
+                  op: '=',
+                  left: {type: 'column', name: 'name'},
+                  right: {type: 'literal', value: 'bar'},
+                },
+              },
+            },
+          },
+        }),
+      ).toEqual([]);
     });
   });
 
@@ -1988,7 +2564,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "add",
+          "type": 0,
         },
         {
           "queryID": "queryScalarAnd",
@@ -2002,7 +2578,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "add",
+          "type": 0,
         },
       ]
     `);
@@ -2063,7 +2639,44 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "1",
           },
           "table": "issues",
-          "type": "edit",
+          "type": 2,
+        },
+      ]
+    `);
+  });
+
+  test('subset client schema advances scalar companion tables', () => {
+    pipelines.init(subsetClientSchema);
+
+    [
+      ...pipelines.addQuery(
+        'hash-scalar-subset-schema',
+        'queryScalarSubsetSchema',
+        ISSUES_WITH_SCALAR_SUBQUERY,
+        startTimer(),
+      ),
+    ];
+
+    replicator.processTransaction(
+      '134',
+      messages.update('comments', {id: '10', issueID: '1', upvotes: 5}),
+    );
+
+    expect(changes()).toMatchInlineSnapshot(`
+      [
+        {
+          "queryID": "queryScalarSubsetSchema",
+          "row": {
+            "_0_version": "134",
+            "id": "10",
+            "issueID": "1",
+            "upvotes": 5,
+          },
+          "rowKey": {
+            "id": "10",
+          },
+          "table": "comments",
+          "type": 2,
         },
       ]
     `);
@@ -2125,7 +2738,7 @@ describe('view-syncer/pipeline-driver', () => {
             "id": "10",
           },
           "table": "comments",
-          "type": "edit",
+          "type": 2,
         },
       ]
     `);

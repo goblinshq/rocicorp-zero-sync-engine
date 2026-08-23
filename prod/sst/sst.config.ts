@@ -186,6 +186,8 @@ export default $config({
         ZERO_INITIAL_SYNC_PROFILE_COPY: 'true',
         ZERO_CHANGE_MAX_CONNS: '3',
         ZERO_NUM_SYNC_WORKERS: '0',
+        ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS: '15000',
+        ZERO_SHADOW_SYNC_ENABLED: 'true',
       },
       loadBalancer: {
         public: false,

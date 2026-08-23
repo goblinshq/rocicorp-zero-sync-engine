@@ -1,36 +1,42 @@
 import {
   PG_ADMIN_SHUTDOWN,
-  PG_OBJECT_IN_USE,
+  PG_INSUFFICIENT_PRIVILEGE,
 } from '@drdgvhbh/postgres-error-codes';
 import type {LogContext} from '@rocicorp/logger';
+import {nanoid} from 'nanoid';
 import postgres from 'postgres';
 import {AbortError} from '../../../../../shared/src/abort-error.ts';
+import {assert} from '../../../../../shared/src/asserts.ts';
 import {stringify} from '../../../../../shared/src/bigint-json.ts';
 import {deepEqual} from '../../../../../shared/src/json.ts';
 import {must} from '../../../../../shared/src/must.ts';
 import {mapValues} from '../../../../../shared/src/objects.ts';
-import {promiseVoid} from '../../../../../shared/src/resolved-promises.ts';
 import {
   equals,
   intersection,
   symmetricDifferences,
 } from '../../../../../shared/src/set-utils.ts';
-import {sleep} from '../../../../../shared/src/sleep.ts';
 import * as v from '../../../../../shared/src/valita.ts';
 import {Database} from '../../../../../zqlite/src/db.ts';
 import {
   mapPostgresToLiteColumn,
   UnsupportedColumnDefaultError,
 } from '../../../db/pg-to-lite.ts';
-import {runTx} from '../../../db/run-transaction.ts';
 import type {
   ColumnSpec,
   PublishedIndexSpec,
   PublishedTableSpec,
 } from '../../../db/specs.ts';
 import {StatementRunner} from '../../../db/statements.ts';
+import {getOrCreateCounter} from '../../../observability/metrics.ts';
 import {type LexiVersion} from '../../../types/lexi-version.ts';
-import {pgClient, type PostgresDB} from '../../../types/pg.ts';
+import {PG_17} from '../../../types/pg-versions.ts';
+import {
+  connectPgClient,
+  isPostgresError,
+  pgClient,
+  type PostgresDB,
+} from '../../../types/pg.ts';
 import {
   upstreamSchema,
   type ShardConfig,
@@ -44,7 +50,6 @@ import type {Sink} from '../../../types/streams.ts';
 import {AutoResetSignal} from '../../change-streamer/schema/tables.ts';
 import {
   getSubscriptionStateAndContext,
-  type SubscriptionState,
   type SubscriptionStateAndContext,
 } from '../../replicator/schema/replication-state.ts';
 import type {ChangeSource, ChangeStream} from '../change-source.ts';
@@ -53,8 +58,17 @@ import {
   ChangeStreamMultiplexer,
   type Listener,
 } from '../common/change-stream-multiplexer.ts';
+import {
+  restoreReplica,
+  type InitializeResult,
+  type RestoreOptions,
+} from '../common/replica-restore.ts';
 import {initReplica} from '../common/replica-schema.ts';
-import type {BackfillRequest, JSONObject} from '../protocol/current.ts';
+import type {
+  BackfillRequest,
+  DownstreamStatusMessage,
+  JSONObject,
+} from '../protocol/current.ts';
 import type {
   ColumnAdd,
   Identifier,
@@ -72,6 +86,7 @@ import {streamBackfill} from './backfill-stream.ts';
 import {
   initialSync,
   type InitialSyncOptions,
+  type ReplicaOptions,
   type ServerContext,
 } from './initial-sync.ts';
 import type {
@@ -79,10 +94,12 @@ import type {
   MessageMessage,
   MessageRelation as PostgresRelation,
 } from './logical-replication/pgoutput.types.ts';
-import {subscribe} from './logical-replication/stream.ts';
-import {fromBigInt, toStateVersionString, type LSN} from './lsn.ts';
-import {replicationEventSchema, type DdlUpdateEvent} from './schema/ddl.ts';
-import {updateShardSchema} from './schema/init.ts';
+import {subscribe, type StreamMessage} from './logical-replication/stream.ts';
+import {fromBigInt, toBigInt, toStateVersionString, type LSN} from './lsn.ts';
+import {registerReplicationSlotHealthMetrics} from './replication-slot-health.ts';
+import {dropOldReplicasAndSlots} from './replication-slots.ts';
+import {replicationEventSchema, type ReplicationEvent} from './schema/ddl.ts';
+import {ensureShardSchema} from './schema/init.ts';
 import {
   getPublicationInfo,
   type PublishedSchema,
@@ -90,16 +107,24 @@ import {
 } from './schema/published.ts';
 import {
   dropShard,
+  getActiveReplicas,
   getInternalShardConfig,
   getReplicaAtVersion,
   internalPublicationPrefix,
-  legacyReplicationSlot,
   replicaIdentitiesForTablesWithoutPrimaryKeys,
-  replicationSlotExpression,
+  replicationSlotPrefix,
+  type BackupOptions,
   type InternalShardConfig,
   type Replica,
+  type ReplicaState,
 } from './schema/shard.ts';
 import {validate} from './schema/validation.ts';
+
+const REPLICA_SLOT_CLEANUP_INTERVAL_MS = 30_000;
+
+interface PurgeLock {
+  release(): Promise<void>;
+}
 
 /**
  * Initializes a Postgres change source, including the initial sync of the
@@ -113,43 +138,145 @@ export async function initializePostgresChangeSource(
   replicaDbFile: string,
   syncOptions: InitialSyncOptions,
   context: ServerContext,
-): Promise<{subscriptionState: SubscriptionState; changeSource: ChangeSource}> {
-  await initReplica(
-    lc,
-    `replica-${shard.appID}-${shard.shardNum}`,
-    replicaDbFile,
-    (log, tx) => initialSync(log, shard, tx, upstreamURI, syncOptions, context),
-  );
-
-  const replica = new Database(lc, replicaDbFile);
-  const subscriptionState = getSubscriptionStateAndContext(
-    new StatementRunner(replica),
-  );
-  replica.close();
-
-  // Check that upstream is properly setup, and throw an AutoReset to re-run
-  // initial sync if not.
-  const db = pgClient(lc, upstreamURI);
+  lagReportIntervalMs = 0,
+  restoreOptions: RestoreOptions = {},
+  {backupV5}: ReplicaOptions = {backupV5: true},
+  purgeLock?: PurgeLock | null,
+  streamInboundTimeoutMs?: number | undefined,
+): Promise<InitializeResult> {
+  const db = await connectPgClient(lc, upstreamURI, 'change-source-init');
   try {
+    await ensureShardSchema(lc, db, shard);
+
+    const restoredReplica = await selectAndRestoreReplica(
+      lc,
+      db,
+      shard,
+      replicaDbFile,
+      restoreOptions,
+    );
+
+    let initialSyncedReplica: ReplicaState | undefined;
+    await initReplica(
+      lc,
+      `replica-${shard.appID}-${shard.shardNum}`,
+      replicaDbFile,
+      async (log, tx) => {
+        // In RMv1, the purge lock on the change-db must be released before performing
+        // initial sync; if the change-db and upstream are the same db, a lock-holding
+        // transaction will prevent a replication slot from being created. This awkward
+        // dependency can go away with RMv2.
+        void purgeLock?.release();
+        initialSyncedReplica = await initialSync(
+          log,
+          shard,
+          tx,
+          upstreamURI,
+          syncOptions,
+          context,
+          {backupV5},
+        );
+      },
+    );
+
+    const replica = new Database(lc, replicaDbFile);
+    const subscriptionState = getSubscriptionStateAndContext(
+      new StatementRunner(replica),
+    );
+    replica.close();
+
+    // Check that upstream is properly setup, and throw an AutoReset to re-run
+    // initial sync if not.
     const upstreamReplica = await checkAndUpdateUpstream(
       lc,
       db,
       shard,
       subscriptionState,
+      (initialSyncedReplica ?? restoredReplica)?.id,
     );
+
+    const backupPath = initialSyncedReplica
+      ? // If initial sync was performed, use that initial backupPath.
+        initialSyncedReplica.backupPath
+      : // Otherwise, use a new, unique path when backing up with litestream v5. This will be
+        // recorded in the replicas table by the PostgresChangeSource.
+        backupV5
+        ? String(Date.now())
+        : (restoredReplica?.backupPath ?? null);
 
     const changeSource = new PostgresChangeSource(
       lc,
       upstreamURI,
       shard,
       upstreamReplica,
+      {backupPath, backupV5},
       context,
+      lagReportIntervalMs,
+      syncOptions.textCopy,
+      streamInboundTimeoutMs,
     );
 
-    return {subscriptionState, changeSource};
+    const destinationBackupURL =
+      backupPath && restoreOptions.litestream?.backupURL
+        ? new URL(backupPath, restoreOptions.litestream.backupURL).toString()
+        : // For legacy RMv1 replicas (on litestream-v3), backup to the same location
+          restoreOptions.litestream?.backupURL;
+
+    return {
+      subscriptionState,
+      changeSource,
+      destinationBackupURL,
+      // The replica this change stream belongs to. It is part of the identity
+      // the SQLite change log records, because a generation (i.e.
+      // `replicaVersion`) is shared by every sibling of a forked replica and so
+      // cannot distinguish two siblings' logs.
+      replicaID: upstreamReplica.id,
+      waitForBackupBeforeServing:
+        // Wait for the first backup if there was an initial sync,
+        initialSyncedReplica !== undefined ||
+        // or if the destination differs from where it was restored
+        // (i.e. backupV5).
+        backupPath !== (restoredReplica?.backupPath ?? null),
+    };
   } finally {
     await db.end();
   }
+}
+
+async function selectAndRestoreReplica(
+  lc: LogContext,
+  sql: PostgresDB,
+  shard: ShardID,
+  replicaFile: string,
+  {litestream, constraints}: RestoreOptions,
+): Promise<ReplicaState | undefined> {
+  const replicas = (await getActiveReplicas(lc, sql, shard)).filter(
+    // filter to the generation specified by the constraints, if present
+    ({generation}) =>
+      generation === (constraints?.replicaVersion ?? generation),
+  );
+  if (replicas.length === 0) {
+    lc.info?.(`no suitable replicas to restore from`, {replicas});
+    return undefined;
+  }
+  const [replica] = replicas;
+
+  if (litestream?.backupURL) {
+    const {backupURL: backupBaseURL} = litestream;
+    const {slot, backupPath, confirmedFlushLsn} = replica;
+    const backupURL = new URL(backupPath ?? '', backupBaseURL).toString();
+    lc.info?.(
+      `restoring replica from ${backupURL} (${slot}@${confirmedFlushLsn})`,
+      {replicas},
+    );
+    await restoreReplica(
+      lc,
+      {...litestream, backupURL}, // includes the replica's backup sub-path
+      replicaFile,
+      constraints,
+    );
+  }
+  return replica;
 }
 
 async function checkAndUpdateUpstream(
@@ -161,25 +288,24 @@ async function checkAndUpdateUpstream(
     publications: subscribed,
     initialSyncContext,
   }: SubscriptionStateAndContext,
+  replicaID: string | undefined,
 ) {
-  // Perform any shard schema updates
-  await updateShardSchema(lc, sql, shard, replicaVersion);
-
   const upstreamReplica = await getReplicaAtVersion(
     lc,
     sql,
     shard,
     replicaVersion,
+    replicaID,
     initialSyncContext,
   );
   if (!upstreamReplica) {
     throw new AutoResetSignal(
-      `No replication slot for replica at version ${replicaVersion}`,
+      `No replication slot for replica at version ${replicaVersion} and id ${replicaID}}`,
     );
   }
 
   // Verify that the publications match what is being replicated.
-  const requested = [...shard.publications].sort();
+  const requested = shard.publications.toSorted();
   const replicated = upstreamReplica.publications
     .filter(p => !p.startsWith(internalPublicationPrefix(shard)))
     .sort();
@@ -214,9 +340,8 @@ async function checkAndUpdateUpstream(
   }
 
   const {slot} = upstreamReplica;
-  const result = await sql<
-    {restartLSN: LSN | null; walStatus: string | null}[]
-  > /*sql*/ `
+  const result = await sql<{restartLSN: LSN | null; walStatus: string | null}[]>
+  /*sql*/ `
     SELECT restart_lsn as "restartLSN", wal_status as "walStatus" FROM pg_replication_slots
       WHERE slot_name = ${slot}`;
   if (result.length === 0) {
@@ -244,54 +369,104 @@ type ReservationState = {
  */
 class PostgresChangeSource implements ChangeSource {
   readonly #lc: LogContext;
+  readonly #db: PostgresDB;
   readonly #upstreamUri: string;
   readonly #shard: ShardID;
   readonly #replica: Replica;
+  readonly #backupOptions: BackupOptions;
   readonly #context: ServerContext;
+  readonly #lagReporter: LagReporter | null;
+  readonly #textCopy: boolean;
+  readonly #streamInboundTimeoutMs: number | undefined;
+  #stopped = false;
 
   constructor(
     lc: LogContext,
     upstreamUri: string,
     shard: ShardID,
     replica: Replica,
+    backupOptions: BackupOptions,
     context: ServerContext,
+    lagReportIntervalMs: number,
+    textCopy?: boolean | undefined,
+    streamInboundTimeoutMs?: number | undefined,
   ) {
     this.#lc = lc.withContext('component', 'change-source');
+    this.#db = pgClient(lc, upstreamUri, 'replication-monitor', {
+      max: 1,
+      // used occasionally for schema changes, periodically for lag reporting
+      ['idle_timeout']: 60,
+    });
     this.#upstreamUri = upstreamUri;
     this.#shard = shard;
     this.#replica = replica;
+    this.#backupOptions = backupOptions;
     this.#context = context;
+    this.#textCopy = textCopy ?? false;
+    this.#streamInboundTimeoutMs = streamInboundTimeoutMs;
+    this.#lagReporter =
+      lagReportIntervalMs > 0
+        ? new LagReporter(
+            lc.withContext('component', 'lag-reporter'),
+            shard,
+            this.#db,
+            lagReportIntervalMs,
+          )
+        : null;
+    registerReplicationSlotHealthMetrics(
+      this.#lc,
+      this.#db,
+      replica.slot,
+      () => this.#stopped,
+    );
+  }
+
+  async stop(): Promise<void> {
+    this.#stopped = true;
+    this.#lagReporter?.stop();
+    clearTimeout(this.#cleanupTimer);
+    await this.#db.end();
+  }
+
+  async startLagReporter() {
+    if (this.#lagReporter) {
+      try {
+        return await this.#lagReporter.initiateLagReport(true);
+      } catch (e) {
+        if (isPostgresError(e, PG_INSUFFICIENT_PRIVILEGE)) {
+          const functionName =
+            (this.#lagReporter.pgVersion ?? 0) >= PG_17
+              ? 'pg_logical_emit_message(boolean, text, text, boolean)'
+              : 'pg_logical_emit_message(boolean, text, text)';
+          this.#lc.warn?.(
+            `\n\nUnable to initiate replication lag reports due to insufficient privileges.` +
+              `\nTo enable replication lag reporting, run:`,
+            `\n\tGRANT EXECUTE ON FUNCTION ${functionName} TO <your_db_user>;\n\n`,
+            e,
+          );
+        } else {
+          this.#lc.error?.(
+            `Unexpected error while initiating lag reports. Lag reports will be disabled.`,
+            e,
+          );
+        }
+      }
+    }
+    return null;
   }
 
   async startStream(
     clientWatermark: string,
     backfillRequests: BackfillRequest[] = [],
   ): Promise<ChangeStream> {
-    const db = pgClient(this.#lc, this.#upstreamUri);
+    await this.#takeoverReplicationSlot();
+    const config = await getInternalShardConfig(this.#db, this.#shard);
     const {slot} = this.#replica;
-
-    let cleanup = promiseVoid;
-    try {
-      ({cleanup} = await this.#stopExistingReplicationSlotSubscribers(
-        db,
-        slot,
-      ));
-      const config = await getInternalShardConfig(db, this.#shard);
-      this.#lc.info?.(`starting replication stream@${slot}`);
-      return await this.#startStream(
-        db,
-        slot,
-        clientWatermark,
-        config,
-        backfillRequests,
-      );
-    } finally {
-      void cleanup.then(() => db.end());
-    }
+    this.#lc.info?.(`starting replication stream@${slot}`);
+    return this.#startStream(slot, clientWatermark, config, backfillRequests);
   }
 
   async #startStream(
-    db: PostgresDB,
     slot: string,
     clientWatermark: string,
     shardConfig: InternalShardConfig,
@@ -300,10 +475,13 @@ class PostgresChangeSource implements ChangeSource {
     const clientStart = majorVersionFromString(clientWatermark) + 1n;
     const {messages, acks} = await subscribe(
       this.#lc,
-      db,
+      this.#db,
       slot,
       [...shardConfig.publications],
       clientStart,
+      undefined,
+      undefined,
+      this.#streamInboundTimeoutMs,
     );
     const acker = new Acker(acks);
 
@@ -312,7 +490,9 @@ class PostgresChangeSource implements ChangeSource {
     // BackfillManager.
     const changes = new ChangeStreamMultiplexer(this.#lc, clientWatermark);
     const backfillManager = new BackfillManager(this.#lc, changes, req =>
-      streamBackfill(this.#lc, this.#upstreamUri, this.#replica, req),
+      streamBackfill(this.#lc, this.#upstreamUri, this.#replica, req, {
+        textCopy: this.#textCopy,
+      }),
     );
     changes
       .addProducers(messages, backfillManager)
@@ -320,12 +500,44 @@ class PostgresChangeSource implements ChangeSource {
     backfillManager.run(clientWatermark, backfillRequests);
 
     const changeMaker = new ChangeMaker(
-      this.#lc,
       this.#shard,
       shardConfig,
+      this.#db,
       this.#replica.initialSchema,
-      this.#upstreamUri,
     );
+
+    /**
+     * Determines if the incoming message is transactional, otherwise handling
+     * non-transactional messages with a downstream status message.
+     */
+    const isTransactionalMessage = (
+      lsn: bigint,
+      msg: StreamMessage[1],
+    ): msg is Message => {
+      if (
+        msg.tag === 'message' &&
+        msg.prefix === this.#lagReporter?.messagePrefix
+      ) {
+        changes.pushStatus(this.#lagReporter.processLagReportMessage(msg));
+        return false;
+      }
+      // Checks if we are passed the LSN of the expected lag report, in which
+      // case a new one is initiated.
+      const status = this.#lagReporter?.checkCurrentLSN(lsn);
+      if (status) {
+        changes.pushStatus(status);
+      }
+
+      if (msg.tag === 'keepalive') {
+        changes.pushStatus([
+          'status',
+          {ack: msg.shouldRespond},
+          {watermark: majorVersionToString(lsn)},
+        ]);
+        return false;
+      }
+      return true;
+    };
 
     void (async () => {
       try {
@@ -333,17 +545,10 @@ class PostgresChangeSource implements ChangeSource {
         let inTransaction = false;
 
         for await (const [lsn, msg] of messages) {
-          // Note: no reservation is needed for pushStatus().
-          if (msg.tag === 'keepalive') {
-            changes.pushStatus([
-              'status',
-              {ack: msg.shouldRespond},
-              {watermark: majorVersionToString(lsn)},
-            ]);
-
+          if (!isTransactionalMessage(lsn, msg)) {
             // If we're not in a transaction but the last reservation was kept
-            // because of pending keepalives in the queue, release the
-            // reservation.
+            // because of pending keepalives or lag reports in the queue,
+            // release the reservation.
             if (!inTransaction && reservation?.lastWatermark) {
               changes.release(reservation.lastWatermark);
               reservation = null;
@@ -358,7 +563,11 @@ class PostgresChangeSource implements ChangeSource {
           }
 
           let lastChange: ChangeStreamMessage | undefined;
-          for (const change of await changeMaker.makeChanges(lsn, msg)) {
+          for (const change of await changeMaker.makeChanges(
+            this.#lc.withContext('lsn', fromBigInt(lsn)),
+            lsn,
+            msg,
+          )) {
             await changes.push(change); // Allow the change-streamer to push back.
             lastChange = change;
           }
@@ -400,7 +609,7 @@ class PostgresChangeSource implements ChangeSource {
 
     this.#lc.info?.(
       `started replication stream@${slot} from ${clientWatermark} (replicaVersion: ${
-        this.#replica.version
+        this.#replica.generation
       })`,
     );
 
@@ -411,139 +620,105 @@ class PostgresChangeSource implements ChangeSource {
   }
 
   async #logCurrentReplicaInfo() {
-    const db = pgClient(this.#lc, this.#upstreamUri);
     try {
       const replica = await getReplicaAtVersion(
         this.#lc,
-        db,
+        this.#db,
         this.#shard,
-        this.#replica.version,
+        this.#replica.generation,
+        this.#replica.id,
       );
       if (replica) {
         this.#lc.info?.(
-          `Shutdown signal from replica@${this.#replica.version}: ${stringify(replica.subscriberContext)}`,
+          `Shutdown signal from replica@${this.#replica.generation}: ${stringify(replica.subscriberContext)}`,
         );
       }
     } catch (e) {
       this.#lc.warn?.(`error logging replica info`, e);
-    } finally {
-      await db.end();
     }
   }
 
   /**
-   * Stops replication slots associated with this shard, and returns
-   * a `cleanup` task that drops any slot other than the specified
-   * `slotToKeep`.
+   * In RMv1, a single replication slot is taken over by the next
+   * replication-manager, signaling the old one to shut down.
    *
-   * Note that replication slots created after `slotToKeep` (as indicated by
-   * the timestamp suffix) are preserved, as those are newly syncing replicas
-   * that will soon take over the slot.
+   * With litestream v5, the two replication-managers must replicate to unique
+   * backupPaths, as is required by the LTX backup schema.
+   *
+   * Thus, in addition to taking over the replication slot, the
+   * replication-manager also updates the `replicas` table with its
+   * `backupPath` so that future RM's restore from that path instead
+   * of the vestigial path of the previous replication-manager.
+   *
+   * In RMv2, each replication-manager will have its own slot and
+   * row in the `replicas` table, so this "takeover" will be unnecessary
+   * (but a harmless no-op).
    */
-  async #stopExistingReplicationSlotSubscribers(
-    db: PostgresDB,
-    slotToKeep: string,
-  ): Promise<{cleanup: Promise<void>}> {
-    const slotExpression = replicationSlotExpression(this.#shard);
-    const legacySlotName = legacyReplicationSlot(this.#shard);
+  async #takeoverReplicationSlot() {
+    const sql = this.#db;
+    const {id: replicaID, slot} = this.#replica;
+    const replicasTable = `${upstreamSchema(this.#shard)}.replicas`;
 
-    const result = await runTx(db, async sql => {
-      // Note: `slot_name <= slotToKeep` uses a string compare of the millisecond
-      // timestamp, which works until it exceeds 13 digits (sometime in 2286).
-      const result = await sql<
-        {slot: string; pid: string | null; terminated: boolean | null}[]
-      > /*sql*/ `
-      SELECT slot_name as slot, pg_terminate_backend(active_pid) as terminated, active_pid as pid
-        FROM pg_replication_slots 
-        WHERE (slot_name LIKE ${slotExpression} OR slot_name = ${legacySlotName})
-              AND slot_name <= ${slotToKeep}`;
-      this.#lc.info?.(
-        `terminated replication slots: ${JSON.stringify(result)}`,
-      );
-      const replicasTable = `${upstreamSchema(this.#shard)}.replicas`;
-      const replicasBefore = await sql`
-        SELECT slot, version, "initialSyncContext", "subscriberContext" 
-          FROM ${sql(replicasTable)} ORDER BY slot`;
-
-      if (result.length === 0) {
-        const shardSlots = await sql`
+    const result = await sql`
+      SELECT pg_terminate_backend(active_pid) as terminated, active_pid as pid
+        FROM pg_replication_slots
+        WHERE slot_name = ${slot}
+    `;
+    if (result.length === 0) {
+      const slotExpression = replicationSlotPrefix(this.#shard);
+      const replicas = await sql`
+        SELECT id, rank, slot, generation, "initialSyncContext", "subscriberContext" 
+          FROM ${sql(replicasTable)} ORDER BY rank DESC`;
+      const slots = await sql`
         SELECT slot_name as slot, active, active_pid as pid
           FROM pg_replication_slots
-          WHERE slot_name LIKE ${slotExpression} OR slot_name = ${legacySlotName}
+          WHERE slot_name LIKE ${slotExpression}
           ORDER BY slot_name`;
-        this.#lc.warn?.(
-          `slot ${slotToKeep} not found while cleaning subscribers`,
-          {slots: shardSlots, replicas: replicasBefore},
-        );
-        throw new AbortError(
-          `replication slot ${slotToKeep} is missing. A different ` +
-            `replication-manager should now be running on a new ` +
-            `replication slot.`,
-        );
-      }
-      // Clear the state of the older replicas.
-      this.#lc.info?.(
-        `replicas before cleanup (slotToKeep=${slotToKeep}): ${JSON.stringify(
-          replicasBefore,
-        )}`,
+      this.#lc.warn?.(`slot ${slot} not found while cleaning subscribers`, {
+        slots,
+        replicas,
+      });
+      throw new AbortError(
+        `replication slot ${slot} is missing. A different ` +
+          `replication-manager should now be running on a new ` +
+          `replication slot.`,
       );
-      await sql`
-        DELETE FROM ${sql(replicasTable)} WHERE slot < ${slotToKeep}`;
-      await sql`
-        UPDATE ${sql(replicasTable)} 
-          SET "subscriberContext" = ${this.#context}
-          WHERE slot = ${slotToKeep}`;
-      const replicasAfter = await sql<{slot: string; version: string}[]>`
-      SELECT slot, version FROM ${sql(replicasTable)} ORDER BY slot`;
-      this.#lc.info?.(
-        `replicas after cleanup (slotToKeep=${slotToKeep}): ${JSON.stringify(
-          replicasAfter,
-        )}`,
-      );
-      return result;
-    });
-
-    const pids = result.filter(({pid}) => pid !== null).map(({pid}) => pid);
-    if (pids.length) {
-      this.#lc.info?.(`signaled subscriber ${pids} to shut down`);
     }
-    const otherSlots = result
-      .filter(({slot}) => slot !== slotToKeep)
-      .map(({slot}) => slot);
-    return {
-      cleanup: otherSlots.length
-        ? this.#dropReplicationSlots(db, otherSlots)
-        : promiseVoid,
-    };
+    this.#lc.info?.(`terminated replication slots: ${JSON.stringify(result)}`);
+    await sql`
+      UPDATE ${sql(replicasTable)} 
+        SET "subscriberContext" = ${this.#context},
+            "backupPath" = ${this.#backupOptions.backupPath},
+            "backupV5" = ${this.#backupOptions.backupV5}
+        WHERE id = ${replicaID}`;
+    void this.#cleanUpOlderReplicasAndSlots();
   }
 
-  async #dropReplicationSlots(sql: PostgresDB, slots: string[]) {
-    this.#lc.info?.(`dropping other replication slot(s) ${slots}`);
-    for (let i = 0; i < 5; i++) {
-      try {
-        await sql`
-          SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
-            WHERE slot_name IN ${sql(slots)}
-        `;
-        this.#lc.info?.(`successfully dropped ${slots}`);
+  #cleanupTimer: NodeJS.Timeout | undefined;
+
+  async #cleanUpOlderReplicasAndSlots() {
+    clearTimeout(this.#cleanupTimer);
+
+    try {
+      const result = await dropOldReplicasAndSlots(
+        this.#lc,
+        this.#db,
+        this.#shard,
+        this.#replica.rank,
+      );
+      if (result.draining === 0) {
+        this.#lc.info?.(`finished cleaning up replicas and slots`, {result});
         return;
-      } catch (e) {
-        // error: replication slot "zero_slot_change_source_test_id" is active for PID 268
-        if (
-          e instanceof postgres.PostgresError &&
-          e.code === PG_OBJECT_IN_USE
-        ) {
-          // The freeing up of the replication slot is not transactional;
-          // sometimes it takes time for Postgres to consider the slot
-          // inactive.
-          this.#lc.debug?.(`attempt ${i + 1}: ${String(e)}`, e);
-        } else {
-          this.#lc.warn?.(`error dropping ${slots}`, e);
-        }
-        await sleep(1000);
       }
+      this.#lc.info?.(`old slots still draining`, {result});
+    } catch (e) {
+      this.#lc.warn?.(`error dropping replication slots`, e);
     }
-    this.#lc.warn?.(`maximum attempts exceeded dropping ${slots}`);
+
+    this.#cleanupTimer = setTimeout(
+      () => this.#cleanUpOlderReplicasAndSlots(),
+      REPLICA_SLOT_CLEANUP_INTERVAL_MS,
+    );
   }
 }
 
@@ -610,6 +785,266 @@ export class Acker implements Listener {
   }
 }
 
+const lagReportSchema = v.object({
+  id: v.string(),
+  sendTimeMs: v.number(),
+  commitTimeMs: v.number(),
+});
+
+export type LagReport = v.Infer<typeof lagReportSchema>;
+
+type InitiatedLagReport = LagReport & {lsn: bigint};
+
+export class LagReporter {
+  static readonly MESSAGE_SUFFIX = '/lag-report/v1';
+
+  readonly #lc: LogContext;
+  readonly messagePrefix: string;
+
+  // oxlint-disable-next-line no-unused-private-class-members
+  readonly #db: PostgresDB;
+  readonly #lagIntervalMs: number;
+  readonly #lagReportRetries = getOrCreateCounter(
+    'replication',
+    'lag_report_retries',
+    {
+      description:
+        'Number of replication lag reports retried because the expected ' +
+        'report was not received before the next report interval.',
+      unit: '{report}',
+    },
+  );
+
+  #pgVersion: number | undefined;
+  #expectingLagReport: InitiatedLagReport | null = null;
+  #timer: NodeJS.Timeout | undefined;
+
+  constructor(
+    lc: LogContext,
+    shard: ShardID,
+    db: PostgresDB,
+    lagIntervalMs: number,
+  ) {
+    this.#lc = lc;
+    this.messagePrefix = `${shard.appID}/${shard.shardNum}${LagReporter.MESSAGE_SUFFIX}`;
+    this.#db = db;
+    this.#lagIntervalMs = lagIntervalMs;
+  }
+
+  async #getPgVersion() {
+    if (this.#pgVersion === undefined) {
+      const [{pgVersion}] = await this.#db<{pgVersion: number}[]> /*sql*/ `
+        SELECT current_setting('server_version_num')::int as "pgVersion"`;
+      this.#pgVersion = pgVersion;
+    }
+    return this.#pgVersion;
+  }
+
+  get pgVersion() {
+    return this.#pgVersion;
+  }
+
+  async initiateLagReport(log = false) {
+    const pgVersion = this.#pgVersion ?? (await this.#getPgVersion());
+    const now = Date.now();
+    const id = nanoid();
+
+    // lsn is filled in after the db call.
+    const lagReport = {id, sendTimeMs: now, commitTimeMs: now, lsn: 0n};
+    this.#expectingLagReport = lagReport;
+
+    let commitTimeMs: number;
+    let lsn: string;
+
+    try {
+      if (pgVersion >= PG_17) {
+        [{commitTimeMs, lsn}] = await this.#db /*sql*/ `
+          WITH CTE AS (SELECT extract(epoch from now()) * 1000 AS "commitTimeMs")
+          SELECT "commitTimeMs", pg_logical_emit_message(
+            false,
+            ${this.messagePrefix},
+            json_build_object(
+              'id', ${id}::text,
+              'sendTimeMs', ${now}::int8,
+              'commitTimeMs', "commitTimeMs"
+            )::text,
+            true
+          ) as lsn FROM CTE;
+      `;
+      } else {
+        // Versions before PG 17 do not support the final `flush` option of
+        // pg_logical_emit_message(). This results in an extra 50~100ms latency
+        // for replication reports when the db is idle, which is still
+        // acceptable for the purpose for alerting on pathological lag, for
+        // which the threshold is much higher (e.g. many seconds).
+        [{commitTimeMs, lsn}] = await this.#db /*sql*/ `
+          WITH CTE AS (SELECT extract(epoch from now()) * 1000 as "commitTimeMs")
+          SELECT "commitTimeMs", pg_logical_emit_message(
+            false,
+            ${this.messagePrefix},
+            json_build_object(
+              'id', ${id}::text,
+              'sendTimeMs', ${now}::int8,
+              'commitTimeMs', "commitTimeMs"
+            )::text
+          ) as lsn FROM CTE;
+      `;
+      }
+    } catch (e) {
+      if (this.#expectingLagReport?.id === id) {
+        this.#expectingLagReport = null;
+      }
+      throw e;
+    }
+
+    // Note: We don't know the lsn until after pg_logical_emit_message()
+    //       returns, at which point it is possible that the report has
+    //       already been sent through the replication stream, but this
+    //       is okay since this.#expectingLagReport will have be updated.
+    lagReport.lsn = toBigInt(lsn);
+    lagReport.commitTimeMs = commitTimeMs;
+    if (this.#expectingLagReport?.id === id) {
+      this.#scheduleMissingReportRetry(id);
+    }
+
+    if (log) {
+      this.#lc.info?.(`initiated lag report at lsn ${lsn}`, {
+        id,
+        lsn,
+        sendTimeMs: now,
+        commitTimeMs,
+      });
+    }
+    return {firstCommitTimeMs: commitTimeMs, nextSendTimeMs: now};
+  }
+
+  /**
+   * In Postgres < 17, the pg_logical_emit_message lacks an immediate "flush"
+   * option, which can cause messages to be missed when the replication stream
+   * starts up:
+   *
+   * ```
+   * * emit message → WAL write (buffered, not flushed)
+   * * walsender reads up to current flush LSN
+   * * emitted message's LSN is beyond flush LSN → not yet visible
+   * * stream feedback/acknowledgment advances slot
+   * * WAL eventually flushes → but slot has already moved past it
+   * ```
+   *
+   * This has been seen to happen for the initial `wal_writer_delay` interval
+   * of a replication session.
+   *
+   * To account for this, the last emitted lag report is considered "received"
+   * if the stream has advanced beyond the LSN of the report.
+   */
+  checkCurrentLSN(lsn: bigint): DownstreamStatusMessage | undefined {
+    if (this.#expectingLagReport?.lsn && lsn > this.#expectingLagReport.lsn) {
+      this.#lc.info?.(
+        `LSN ${fromBigInt(lsn)} is passed expected lag report ` +
+          `${fromBigInt(this.#expectingLagReport.lsn)}. Processing it as received.`,
+      );
+      return this.#processLagReport(
+        this.#expectingLagReport,
+        majorVersionToString(lsn),
+      );
+    }
+    return undefined;
+  }
+
+  stop() {
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+
+  #scheduleNextReport(delayMs: number) {
+    this.#expectingLagReport = null;
+    clearTimeout(this.#timer);
+    this.#timer = setTimeout(async () => {
+      this.#timer = undefined;
+      try {
+        await this.initiateLagReport();
+      } catch (e) {
+        this.#lc.warn?.(`error initiating lag report`, e);
+        this.#scheduleNextReport(this.#lagIntervalMs);
+      }
+    }, delayMs);
+  }
+
+  #scheduleMissingReportRetry(reportID: string) {
+    clearTimeout(this.#timer);
+    this.#timer = setTimeout(async () => {
+      this.#timer = undefined;
+      const missingReport = this.#expectingLagReport;
+      if (missingReport?.id !== reportID) {
+        return;
+      }
+
+      this.#lagReportRetries.add(1);
+      this.#lc.warn?.(`retrying missing lag report`, {
+        id: missingReport.id,
+        lsn: fromBigInt(missingReport.lsn),
+        sendTimeMs: missingReport.sendTimeMs,
+      });
+      try {
+        await this.initiateLagReport();
+      } catch (e) {
+        this.#lc.warn?.(`error retrying lag report`, e);
+        this.#scheduleNextReport(this.#lagIntervalMs);
+      }
+    }, this.#lagIntervalMs);
+  }
+
+  processLagReportMessage(msg: MessageMessage): DownstreamStatusMessage {
+    assert(
+      msg.prefix === this.messagePrefix,
+      `unexpected message prefix: ${msg.prefix}`,
+    );
+    const report = parseLogicalMessageContent(this.#lc, msg, lagReportSchema);
+    return this.#processLagReport(
+      report,
+      toStateVersionString(msg.messageLsn ?? '0/0'),
+    );
+  }
+
+  #processLagReport(
+    report: LagReport,
+    watermark: string,
+  ): DownstreamStatusMessage {
+    const now = Date.now();
+    const expectedReport = this.#expectingLagReport;
+    let nextSendTimeMs: number;
+    if (report.id === expectedReport?.id) {
+      nextSendTimeMs = Math.max(now, report.sendTimeMs + this.#lagIntervalMs);
+      this.#scheduleNextReport(nextSendTimeMs - now);
+    } else {
+      // Only schedule the next report when receiving the previous report.
+      // For historic reports in the WAL, or reports generated by other
+      // replication-managers, status messages are still sent downstream,
+      // but the next report is not actually scheduled.
+      this.#lc.debug?.(`received extraneous lag report`, {report});
+      nextSendTimeMs =
+        expectedReport?.sendTimeMs ??
+        Math.max(now, report.sendTimeMs + this.#lagIntervalMs);
+    }
+    const {sendTimeMs, commitTimeMs} = report;
+    return [
+      'status',
+      {
+        ack: false,
+        lagReport: {
+          lastTimings: {
+            sendTimeMs,
+            commitTimeMs,
+            receiveTimeMs: now,
+          },
+          nextSendTimeMs,
+        },
+      },
+      {watermark},
+    ];
+  }
+}
+
 type ReplicationError = {
   lsn: bigint;
   msg: Message;
@@ -620,49 +1055,47 @@ type ReplicationError = {
 const SET_REPLICA_IDENTITY_DELAY_MS = 50;
 
 class ChangeMaker {
-  readonly #lc: LogContext;
   readonly #shardPrefix: string;
   readonly #shardConfig: InternalShardConfig;
   readonly #initialSchema: PublishedSchema;
-  readonly #upstreamDB: PostgresDB;
+  readonly #db: PostgresDB;
 
   #replicaIdentityTimer: NodeJS.Timeout | undefined;
   #error: ReplicationError | undefined;
 
   constructor(
-    lc: LogContext,
     {appID, shardNum}: ShardID,
     shardConfig: InternalShardConfig,
+    db: PostgresDB,
     initialSchema: PublishedSchema,
-    upstreamURI: string,
   ) {
-    this.#lc = lc;
     // Note: This matches the prefix used in pg_logical_emit_message() in pg/schema/ddl.ts.
     this.#shardPrefix = `${appID}/${shardNum}`;
     this.#shardConfig = shardConfig;
     this.#initialSchema = initialSchema;
-    this.#upstreamDB = pgClient(lc, upstreamURI, {
-      ['idle_timeout']: 10, // only used occasionally
-      connection: {['application_name']: 'zero-schema-change-detector'},
-    });
+    this.#db = db;
   }
 
-  async makeChanges(lsn: bigint, msg: Message): Promise<ChangeStreamMessage[]> {
+  async makeChanges(
+    lc: LogContext,
+    lsn: bigint,
+    msg: Message,
+  ): Promise<ChangeStreamMessage[]> {
     if (this.#error) {
-      this.#logError(this.#error);
+      this.#logError(lc, this.#error);
       return [];
     }
     try {
-      return await this.#makeChanges(msg);
+      return await this.#makeChanges(lc, lsn, msg);
     } catch (err) {
       this.#error = {lsn, msg, err, lastLogTime: 0};
-      this.#logError(this.#error);
+      this.#logError(lc, this.#error);
 
       const message = `Unable to continue replication from LSN ${fromBigInt(lsn)}`;
       const errorDetails: JSONObject = {error: message};
       if (err instanceof UnsupportedSchemaChangeError) {
         errorDetails.reason = err.description;
-        errorDetails.context = err.ddlUpdate.context;
+        errorDetails.context = err.event.context;
       } else {
         errorDetails.reason = String(err);
       }
@@ -676,28 +1109,39 @@ class ChangeMaker {
     }
   }
 
-  #logError(error: ReplicationError) {
+  #logError(lc: LogContext, error: ReplicationError) {
     const {lsn, msg, err, lastLogTime} = error;
     const now = Date.now();
 
     // Output an error to logs as replication messages continue to be dropped,
     // at most once a minute.
     if (now - lastLogTime > 60_000) {
-      this.#lc.error?.(
+      lc.error?.(
         `Unable to continue replication from LSN ${fromBigInt(lsn)}: ${String(
           err,
         )}`,
-        err instanceof UnsupportedSchemaChangeError
-          ? err.ddlUpdate.context
-          : // 'content' can be a large byte Buffer. Exclude it from logging output.
-            {...msg, content: undefined},
+        {
+          // 'content' can be a large byte Buffer. Exclude it from logging output.
+          ...{change: {...msg, content: undefined}},
+          ...(err instanceof UnsupportedSchemaChangeError && {
+            context: err.event.context,
+          }),
+          ...(err instanceof Error && {
+            errorMsg: err.message,
+            name: err.name,
+            stack: err.stack,
+          }),
+        },
       );
       error.lastLogTime = now;
     }
   }
 
-  // oxlint-disable-next-line require-await
-  async #makeChanges(msg: Message): Promise<ChangeStreamData[]> {
+  async #makeChanges(
+    lc: LogContext,
+    lsn: bigint,
+    msg: Message,
+  ): Promise<ChangeStreamData[]> {
     switch (msg.tag) {
       case 'begin':
         return [
@@ -747,23 +1191,33 @@ class ChangeMaker {
         return [['data', {...msg, relations: msg.relations.map(makeRelation)}]];
 
       case 'message':
-        if (msg.prefix !== this.#shardPrefix) {
-          this.#lc.debug?.('ignoring message for different shard', msg.prefix);
+        if (!msg.prefix.startsWith(this.#shardPrefix)) {
+          lc.debug?.('ignoring message for different shard', msg.prefix);
           return [];
         }
-        return this.#handleCustomMessage(msg);
+        switch (msg.prefix.substring(this.#shardPrefix.length)) {
+          case '': // Legacy prefix
+          case '/ddl':
+            return this.#handleDdlMessage(lc, lsn, msg);
+          default:
+            lc.debug?.('ignoring unknown message type', msg.prefix);
+            return [];
+        }
 
       case 'commit':
         return [
           [
             'commit',
-            msg,
+            // `commitTime` is microseconds since the unix epoch. Carrying it
+            // as milliseconds gives the ViewSyncer the origin timestamp for
+            // the end-to-end serving lag histogram.
+            {...msg, commitTimeMs: Number(msg.commitTime / 1000n)},
             {watermark: toStateVersionString(must(msg.commitLsn))},
           ],
         ];
 
       case 'relation':
-        return this.#handleRelation(msg);
+        return await this.#handleRelation(msg);
       case 'type':
         return []; // Nothing need be done for custom types.
       case 'origin':
@@ -776,39 +1230,105 @@ class ChangeMaker {
     }
   }
 
-  #preSchema: PublishedSchema | undefined;
+  // The lastReplicationEvent is stored to understand the context
+  // of the next one.
+  #lastReplicationEvent: ReplicationEvent | undefined;
 
-  #handleCustomMessage(msg: MessageMessage) {
-    const event = this.#parseReplicationEvent(msg.content);
+  #handleDdlMessage(
+    lc: LogContext,
+    lsn: bigint,
+    msg: MessageMessage,
+  ): ChangeStreamData[] {
+    const event = parseLogicalMessageContent(lc, msg, replicationEventSchema);
+    lc = lc
+      .withContext('lsn', fromBigInt(lsn))
+      .withContext('tag', event.event.tag)
+      .withContext('query', event.context.query);
+
     // Cancel manual schema adjustment timeouts when an upstream schema change
     // is about to happen, so as to avoid interfering / redundant work.
     clearTimeout(this.#replicaIdentityTimer);
 
-    if (event.type === 'ddlStart') {
-      // Store the schema in order to diff it with a potential ddlUpdate.
-      this.#preSchema = event.schema;
+    const {type} = event;
+    switch (type) {
+      case 'ddlStart':
+      case 'schemaSnapshot':
+      case 'ddlUpdate':
+        break;
+      default: // Ignore unknown types for forwards compatibility
+        lc.info?.(`ignoring unknown ddl message type: ${type}`);
+        return [];
+    }
+
+    const prevEvent = this.#lastReplicationEvent;
+    // Store the new event to understand the context of the next event.
+    this.#lastReplicationEvent = event;
+
+    const {schema} = event;
+    if (schema === undefined) {
+      // A schema-less (protocol v2) ddlStart event signifies that there was
+      // no schema change; it is stored (above) only to provide the command
+      // tag context for a subsequent event with a schema change.
+      lc.debug?.(`received context-only ${msg.prefix}/${type} event`, {
+        event: summarizeReplicationEventForLog(event),
+      });
       return [];
     }
-    // ddlUpdate
+
+    const prevSchema =
+      event.previousSchema === undefined // pre-v21 event => use prevEvent
+        ? prevEvent?.schema
+        : event.previousSchema;
+    if (!prevSchema) {
+      lc.info?.(`received ${msg.prefix}/${type} event`, {
+        event: summarizeReplicationEventForLog(event),
+      });
+      return [];
+    }
+
+    // The tag (i.e. command) is used as an optimization to determine whether
+    // backfill is necessary (CREATE TABLE vs ALTER TABLE vs
+    // ALTER PUBLICATION). If the context is not available (rare), the tag
+    // falls back to 'UNKNOWN', which conservatively initiates a backfill.
+    //
+    // Because ddl events may be nested, e.g.
+    //
+    // ```
+    //          [1]          [2]        [3]          [4]        [5]
+    // ddl_start => ddl_start => ddl_end => ddl_start => ddl_end => ddl_end
+    // ```
+    //
+    // The effective tag is determined from the previous event if it is
+    // ddl_start (e.g. cases 1, 2, and 4), and from the current event
+    // if it is a ddl_end (case 5), and 'UNKNOWN' otherwise (case 3 and
+    // 'schemaSnapshot' workarounds).
+    const effectiveTag =
+      prevEvent?.type === 'ddlStart'
+        ? prevEvent.event.tag
+        : event.type === 'ddlUpdate'
+          ? event.event.tag
+          : 'UNKNOWN';
+    lc.info?.(`processing ${effectiveTag} command from ${msg.prefix}/${type}`, {
+      event: summarizeReplicationEventForLog(event),
+    });
     const changes = this.#makeSchemaChanges(
-      must(this.#preSchema, `ddlUpdate received without a ddlStart`),
+      lc,
+      prevSchema,
+      schema,
       event,
+      effectiveTag,
     ).map(change => ['data', change] satisfies Data);
 
-    this.#lc
-      .withContext('tag', event.event.tag)
-      .withContext('query', event.context.query)
-      .info?.(`${changes.length} schema change(s)`, {changes});
+    lc.info?.(`${changes.length} schema change(s)`, {changes});
 
-    const replicaIdentities = replicaIdentitiesForTablesWithoutPrimaryKeys(
-      event.schema,
-    );
+    const replicaIdentities =
+      replicaIdentitiesForTablesWithoutPrimaryKeys(schema);
     if (replicaIdentities) {
       this.#replicaIdentityTimer = setTimeout(async () => {
         try {
-          await replicaIdentities.apply(this.#lc, this.#upstreamDB);
+          await replicaIdentities.apply(lc, this.#db);
         } catch (err) {
-          this.#lc.warn?.(`error setting replica identities`, err);
+          lc.warn?.(`error setting replica identities`, err);
         }
       }, SET_REPLICA_IDENTITY_DELAY_MS);
     }
@@ -844,17 +1364,20 @@ class ChangeMaker {
    * the type of a column that's indexed.
    */
   #makeSchemaChanges(
+    lc: LogContext,
     preSchema: PublishedSchema,
-    update: DdlUpdateEvent,
+    nextSchema: PublishedSchema,
+    event: ReplicationEvent,
+    tag: string,
   ): SchemaChange[] {
     try {
       const [prevTbl, prevIdx] = specsByID(preSchema);
-      const [nextTbl, nextIdx] = specsByID(update.schema);
+      const [nextTbl, nextIdx] = specsByID(nextSchema);
       const changes: SchemaChange[] = [];
 
       // Validate the new table schemas
       for (const table of nextTbl.values()) {
-        validate(this.#lc, table);
+        validate(lc, table);
       }
 
       const [droppedIdx, createdIdx] = symmetricDifferences(prevIdx, nextIdx);
@@ -896,9 +1419,10 @@ class ChangeMaker {
       for (const id of tables) {
         changes.push(
           ...this.#getTableChanges(
+            lc,
             must(prevTbl.get(id)),
             must(nextTbl.get(id)),
-            update.event.tag,
+            tag,
           ),
         );
       }
@@ -910,9 +1434,15 @@ class ChangeMaker {
           spec,
           metadata: getMetadata(spec),
         };
-        if (!update.event.tag.startsWith('CREATE')) {
-          // Tables introduced to the publication via ALTER statements
-          // must be backfilled.
+        // Only tables introduced by a `CREATE` statement can skip backfill.
+        // All other scenarios in which tables are introduced into the
+        // schema, e.g.
+        // * ALTER PUBLICATION statements
+        // * COMMENT statements
+        // * MANUAL snapshots
+        // * UNKNOWN command tags
+        // must be backfilled.
+        if (!tag.startsWith('CREATE')) {
           createTable.backfill = mapValues(spec.columns, ({pos: attNum}) => ({
             attNum,
           })) satisfies Record<string, ColumnMetadata>;
@@ -928,11 +1458,12 @@ class ChangeMaker {
       }
       return changes;
     } catch (e) {
-      throw new UnsupportedSchemaChangeError(String(e), update, {cause: e});
+      throw new UnsupportedSchemaChangeError(String(e), event, {cause: e});
     }
   }
 
   #getTableChanges(
+    lc: LogContext,
     oldTable: PublishedTableWithReplicaIdentity,
     newTable: PublishedTableWithReplicaIdentity,
     ddlTag: string,
@@ -992,10 +1523,15 @@ class ChangeMaker {
       }
     }
 
-    // All columns introduced by a publication change require backfill.
-    // Columns created by ALTER TABLE, on the other hand, only require
-    // backfill if they have non-constant defaults.
-    const alwaysBackfill = ddlTag === 'ALTER PUBLICATION';
+    // Only columns introduced by `ALTER TABLE` statements can potentially
+    // skip backfill if they have non-constant defaults. All other scenarios
+    // in which columns are introduced, e.g.
+    // * ALTER PUBLICATION
+    // * COMMENT
+    // * MANUAL
+    // * UNKNOWN
+    // must be backfilled.
+    const alwaysBackfill = ddlTag !== 'ALTER TABLE';
 
     // ADD
     for (const id of added) {
@@ -1026,9 +1562,7 @@ class ChangeMaker {
           // upstream. Note that this does require that the table have a valid
           // REPLICA IDENTITY, since backfill relies on merging new data with
           // an existing row.
-          this.#lc.info?.(
-            `Backfilling column ${table.name}.${name}: ${String(e)}`,
-          );
+          lc.info?.(`Backfilling column ${table.name}.${name}: ${String(e)}`);
           addColumn.column.spec.dflt = null;
           addColumn.backfill = {attNum: spec.pos} satisfies ColumnMetadata;
         }
@@ -1036,15 +1570,6 @@ class ChangeMaker {
       changes.push(addColumn);
     }
     return changes;
-  }
-
-  #parseReplicationEvent(content: Uint8Array) {
-    const str =
-      content instanceof Buffer
-        ? content.toString('utf-8')
-        : new TextDecoder().decode(content);
-    const json = JSON.parse(str);
-    return v.parse(json, replicationEventSchema, 'passthrough');
   }
 
   /**
@@ -1070,10 +1595,7 @@ class ChangeMaker {
     if (ddlDetection) {
       return [];
     }
-    const currentSchema = await getPublicationInfo(
-      this.#upstreamDB,
-      publications,
-    );
+    const currentSchema = await getPublicationInfo(this.#db, publications);
     const difference = getSchemaDifference(this.#initialSchema, currentSchema);
     if (difference !== null) {
       throw new MissingEventTriggerSupport(difference);
@@ -1322,14 +1844,34 @@ function makeRelation(relation: PostgresRelation): MessageRelation {
   };
 }
 
+function summarizeSchemaForLog(schema: PublishedSchema) {
+  return {
+    tables: schema.tables.length,
+    indexes: schema.indexes.length,
+  };
+}
+
+function summarizeReplicationEventForLog(event: ReplicationEvent): JSONObject {
+  const {schema, ...rest} = event;
+  const {previousSchema, ...eventWithoutSchemas} = rest;
+  return {
+    ...eventWithoutSchemas,
+    ...(schema !== undefined && {schema: summarizeSchemaForLog(schema)}),
+    ...(previousSchema !== undefined && {
+      previousSchema:
+        previousSchema === null ? null : summarizeSchemaForLog(previousSchema),
+    }),
+  };
+}
+
 class UnsupportedSchemaChangeError extends Error {
   readonly name = 'UnsupportedSchemaChangeError';
   readonly description: string;
-  readonly ddlUpdate: DdlUpdateEvent;
+  readonly event: ReplicationEvent;
 
   constructor(
     description: string,
-    ddlUpdate: DdlUpdateEvent,
+    event: ReplicationEvent,
     options?: ErrorOptions,
   ) {
     super(
@@ -1337,7 +1879,7 @@ class UnsupportedSchemaChangeError extends Error {
       options,
     );
     this.description = description;
-    this.ddlUpdate = ddlUpdate;
+    this.event = event;
   }
 }
 
@@ -1362,5 +1904,26 @@ class ShutdownSignal extends AbortError {
         cause,
       },
     );
+  }
+}
+
+function parseLogicalMessageContent<T>(
+  lc: LogContext,
+  msg: MessageMessage,
+  schema: v.Type<T>,
+) {
+  const {content} = msg;
+  const str =
+    content instanceof Buffer
+      ? content.toString('utf-8')
+      : new TextDecoder().decode(content);
+  try {
+    const json = JSON.parse(str);
+    return v.parse(json, schema, 'passthrough');
+  } catch (e) {
+    lc.error?.(`unable to parse logical message content: ${String(e)}`, {
+      message: {...msg, content: str},
+    });
+    throw e;
   }
 }

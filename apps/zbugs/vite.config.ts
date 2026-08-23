@@ -1,8 +1,7 @@
-import react from '@vitejs/plugin-react';
 import {fileURLToPath, URL} from 'node:url';
+import react from '@vitejs/plugin-react';
 import {defineConfig, type PluginOption, type ViteDevServer} from 'vite';
 import svgr from 'vite-plugin-svgr';
-import tsconfigPaths from 'vite-tsconfig-paths';
 import {makeDefine} from '../../packages/shared/src/build.ts';
 import {fastify} from './api/index.ts';
 
@@ -13,10 +12,18 @@ const zeroPath = fileURLToPath(
   new URL('../../packages/zero/src/zero.ts', import.meta.url),
 );
 
+function isFastifyPath(url: string): boolean {
+  const pathname = url.split('?')[0];
+  return (
+    pathname.startsWith('/api') ||
+    (pathname.startsWith('/p/') && pathname.endsWith('.md'))
+  );
+}
+
 async function configureServer(server: ViteDevServer) {
   await fastify.ready();
   server.middlewares.use((req, res, next) => {
-    if (!req.url?.startsWith('/api')) {
+    if (!req.url || !isFastifyPath(req.url)) {
       return next();
     }
     fastify.server.emit('request', req, res);
@@ -29,6 +36,7 @@ export default defineConfig({
   // `@rocicorp/zero-virtual` against a different module instance, which breaks
   // Zero context/query internals checks in dev.
   resolve: {
+    tsconfigPaths: true,
     dedupe: ['@rocicorp/zero', '@rocicorp/zero/react'],
     alias: [
       {find: '@rocicorp/zero/react', replacement: zeroReactPath},
@@ -43,7 +51,6 @@ export default defineConfig({
     ],
   },
   plugins: [
-    tsconfigPaths(),
     svgr() as unknown as PluginOption,
     react() as unknown as PluginOption,
     {

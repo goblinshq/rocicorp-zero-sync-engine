@@ -8,6 +8,7 @@ import type {UpQueriesPatch} from '../../../../zero-protocol/src/queries-patch.t
 import type {InspectorDelegate} from '../../server/inspector-delegate.ts';
 import {type PgTest, test} from '../../test/db.ts';
 import type {DbFile} from '../../test/lite.ts';
+import type {ViewSyncerDownstream} from '../../types/downstream.ts';
 import type {PostgresDB} from '../../types/pg.ts';
 import type {Source} from '../../types/streams.ts';
 import type {Subscription} from '../../types/subscription.ts';
@@ -57,10 +58,11 @@ let connectWithQueueAndSource: (
   activeClients?: string[],
 ) => {
   queue: Queue<Downstream>;
-  source: Source<Downstream>;
+  source: Source<ViewSyncerDownstream>;
 };
 let setTimeoutFn: Mock<typeof setTimeout>;
 let inspectorDelegate: InspectorDelegate;
+let clearMocks: () => void;
 
 function callNextSetTimeout(delta: number, expectedDelay?: number) {
   // Sanity check that the system time is the mocked time.
@@ -85,6 +87,7 @@ const SYNC_CONTEXT: SyncContext = {
   httpCookie: undefined,
   origin: undefined,
   userID: 'bar',
+  auth: undefined,
 };
 
 beforeEach<PgTest>(async ({testDBs}) => {
@@ -100,6 +103,7 @@ beforeEach<PgTest>(async ({testDBs}) => {
     connectWithQueueAndSource,
     setTimeoutFn,
     inspectorDelegate,
+    clearMocks,
   } = await setup(testDBs, 'view_syncer_ttl_test', permissionsAll));
   inspectorDelegate.setAuthenticated(serviceID);
 
@@ -107,6 +111,7 @@ beforeEach<PgTest>(async ({testDBs}) => {
     inspectorDelegate.clearAuthenticated(serviceID);
 
     vi.useRealTimers();
+    clearMocks();
     await vs.stop();
     await viewSyncerDone;
     await testDBs.drop(cvrDB, upstreamDb);
@@ -811,7 +816,7 @@ describe('ttl', () => {
           expect.objectContaining({
             queryID: 'query-hash1',
             metrics: expect.objectContaining({
-              'query-materialization-server': expect.arrayContaining([
+              'query-update-server': expect.arrayContaining([
                 expect.any(Number),
               ]),
             }),

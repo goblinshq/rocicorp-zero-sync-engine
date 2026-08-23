@@ -300,7 +300,7 @@ export class QueryImpl<
             },
             this.customQueryID,
             relationship,
-          ),
+          ) as AnyQuery,
         ),
       );
 
@@ -354,12 +354,16 @@ export class QueryImpl<
     throw new Error(`Invalid relationship ${relationship}`);
   };
 
+  // The declared return is the *bottom* of the pinned dimension, which is
+  // assignable to every `where` overload's declared return. The overloads
+  // refine `TPinned` for callers only; a single non-generic implementation
+  // signature cannot express that refinement.
   where = function (
     this: QueryImpl<TTable, TSchema, TReturn>,
     fieldOrExpressionFactory: string | ExpressionFactory<TTable, TSchema>,
     opOrValue?: SimpleOperator | GetFilterTypeAny | Parameter,
     value?: GetFilterTypeAny | Parameter,
-  ): Query<TTable, TSchema, TReturn> {
+  ): Query<TTable, TSchema, TReturn, any> {
     let cond: Condition;
 
     if (typeof fieldOrExpressionFactory === 'function') {
@@ -391,7 +395,7 @@ export class QueryImpl<
       this.format,
       this.customQueryID,
       this.#currentJunction,
-    );
+    ) as unknown as Query<TTable, TSchema, TReturn, any>;
   }.bind(this);
 
   start = (
@@ -487,7 +491,7 @@ export class QueryImpl<
             defaultFormat,
             this.customQueryID,
             undefined,
-          ),
+          ) as AnyQuery,
         ),
       );
       return {
@@ -505,8 +509,6 @@ export class QueryImpl<
         ...(scalar !== undefined ? {scalar} : {}),
       };
     }
-
-    assert(!scalar, 'scalar option only supports one-hop relationships');
 
     if (isTwoHop(related)) {
       const [firstRelation, secondRelation] = related;
@@ -552,6 +554,7 @@ export class QueryImpl<
               },
               op: 'EXISTS',
               ...(flip !== undefined ? {flip} : {}),
+              ...(scalar !== undefined ? {scalar} : {}),
             },
           },
         },
@@ -567,8 +570,12 @@ export class QueryImpl<
     return this.#ast;
   }
 
-  expressionBuilder() {
-    return new ExpressionBuilder(this.#exists);
+  expressionBuilder(): ExpressionBuilder<TTable, TSchema> {
+    return new ExpressionBuilder<TTable, TSchema>(
+      this.#exists as ConstructorParameters<
+        typeof ExpressionBuilder<TTable, TSchema>
+      >[0],
+    );
   }
 }
 

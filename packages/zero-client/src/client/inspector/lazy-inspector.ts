@@ -12,7 +12,6 @@ import type {ReplicacheImpl} from '../../../../replicache/src/replicache-impl.ts
 import {withRead} from '../../../../replicache/src/with-transactions.ts';
 import {assert} from '../../../../shared/src/asserts.ts';
 import type {ReadonlyJSONValue} from '../../../../shared/src/json.ts';
-import {mapValues} from '../../../../shared/src/objects.ts';
 import {TDigest, type ReadonlyTDigest} from '../../../../shared/src/tdigest.ts';
 import * as valita from '../../../../shared/src/valita.ts';
 import type {AnalyzeQueryResult} from '../../../../zero-protocol/src/analyze-query-result.ts';
@@ -26,7 +25,7 @@ import {
   inspectVersionDownSchema,
   type InspectDownBody,
   type InspectQueryRow,
-  type ServerMetrics as ServerMetricsJSON,
+  type QueryServerMetrics as QueryServerMetricsJSON,
 } from '../../../../zero-protocol/src/inspect-down.ts';
 import type {
   AnalyzeQueryOptions,
@@ -129,22 +128,39 @@ function rpcNoAuthTry<T extends InspectDownBody>(
 } // T extends forces T to be resolved
 
 export function mergeMetrics(
-  clientMetrics: ClientMetrics | undefined,
-  serverMetrics: ServerMetricsJSON | null | undefined,
+  clientMetrics: QueryClientMetrics | undefined,
+  serverMetrics: QueryServerMetricsJSON | null | undefined,
 ): ClientMetrics & ServerMetrics {
+  const cm = clientMetrics ?? newClientMetrics();
   return {
-    ...(clientMetrics ?? newClientMetrics()),
+    ...convertClientMetrics(cm),
     ...(serverMetrics
       ? convertServerMetrics(serverMetrics)
       : newServerMetrics()),
   };
 }
 
-function newClientMetrics(): ClientMetrics {
+function newClientMetrics(): QueryClientMetrics {
   return {
-    'query-materialization-client': new TDigest(),
-    'query-materialization-end-to-end': new TDigest(),
+    'query-materialization-client': undefined,
+    'query-materialization-end-to-end': undefined,
     'query-update-client': new TDigest(),
+  };
+}
+
+function convertClientMetrics(metrics: QueryClientMetrics): ClientMetrics {
+  const hydrateDigest = new TDigest();
+  if (metrics['query-materialization-client'] !== undefined) {
+    hydrateDigest.add(metrics['query-materialization-client']);
+  }
+  const totalDigest = new TDigest();
+  if (metrics['query-materialization-end-to-end'] !== undefined) {
+    totalDigest.add(metrics['query-materialization-end-to-end']);
+  }
+  return {
+    'query-materialization-client': hydrateDigest,
+    'query-materialization-end-to-end': totalDigest,
+    'query-update-client': metrics['query-update-client'] as TDigest,
   };
 }
 
@@ -155,8 +171,16 @@ function newServerMetrics(): ServerMetrics {
   };
 }
 
-function convertServerMetrics(metrics: ServerMetricsJSON): ServerMetrics {
-  return mapValues(metrics, v => TDigest.fromJSON(v));
+function convertServerMetrics(metrics: QueryServerMetricsJSON): ServerMetrics {
+  const hydrateMs = metrics['query-hydration-server-ms'];
+  const hydrateDigest = new TDigest();
+  if (hydrateMs !== undefined) {
+    hydrateDigest.add(hydrateMs);
+  }
+  return {
+    'query-materialization-server': hydrateDigest,
+    'query-update-server': TDigest.fromJSON(metrics['query-update-server']),
+  };
 }
 
 export async function inspectorMetrics(
@@ -168,7 +192,15 @@ export async function inspectorMetrics(
     {op: 'metrics'},
     inspectMetricsDownSchema,
   );
-  return mergeMetrics(clientMetrics, serverMetricsJSON);
+  return {
+    ...(clientMetrics ?? newClientMetrics()),
+    'query-materialization-server': TDigest.fromJSON(
+      serverMetricsJSON['query-materialization-server'],
+    ),
+    'query-update-server': TDigest.fromJSON(
+      serverMetricsJSON['query-update-server'],
+    ),
+  };
 }
 
 export function inspectorClients(
@@ -356,13 +388,58 @@ export async function analyzeQuery(
   );
 }
 
+export async function analyzeServerAST(
+  delegate: ExtendedInspectorDelegate,
+  ast: AST,
+  options?: AnalyzeQueryOptions,
+): Promise<AnalyzeQueryResult> {
+  return rpc(
+    await delegate.getSocket(),
+    {op: 'analyze-query', ast, options},
+    inspectAnalyzeQueryDownSchema,
+  );
+}
+
+export async function analyzeNamedQuery(
+  delegate: ExtendedInspectorDelegate,
+  name: string,
+  args: ReadonlyArray<ReadonlyJSONValue>,
+  options?: AnalyzeQueryOptions,
+): Promise<AnalyzeQueryResult> {
+  return rpc(
+    await delegate.getSocket(),
+    {op: 'analyze-query', name, args, options},
+    inspectAnalyzeQueryDownSchema,
+  );
+}
+
+/**
+ * Sends an `authenticate` op to the server. Returns `true` if the password
+ * is accepted (or the server is in a development mode that bypasses the
+ * check). Use this from Node contexts where the default interactive HTML
+ * prompt used by other inspector RPCs is not available.
+ */
+export async function authenticate(
+  delegate: ExtendedInspectorDelegate,
+  password: string,
+): Promise<boolean> {
+  return rpc(
+    await delegate.getSocket(),
+    {op: 'authenticate', value: password},
+    inspectAuthenticatedDownSchema,
+  );
+}
+
 class UnauthenticatedError extends Error {}
 
 export interface InspectorDelegate {
-  getQueryMetrics(hash: string): ClientMetrics | undefined;
+  getQueryMetrics(hash: string): QueryClientMetrics | undefined;
   getAST(queryID: string): AST | undefined;
   readonly metrics: ClientMetrics;
   mapClientASTToServer(ast: AST): AST;
+  setQueryEvictedCallback(
+    cb: (hash: string, ast: AST, metrics: QueryClientMetrics) => void,
+  ): void;
 }
 
 export interface ExtendedInspectorDelegate extends InspectorDelegate {
@@ -373,6 +450,12 @@ export interface ExtendedInspectorDelegate extends InspectorDelegate {
 }
 
 export type Rep = ReplicacheImpl<MutatorDefs>;
+
+export type QueryClientMetrics = {
+  readonly 'query-materialization-client': number | undefined;
+  readonly 'query-materialization-end-to-end': number | undefined;
+  readonly 'query-update-client': ReadonlyTDigest;
+};
 
 export type ClientMetrics = {
   readonly [K in keyof ClientMetricMap]: ReadonlyTDigest;

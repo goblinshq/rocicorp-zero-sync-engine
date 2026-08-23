@@ -1,6 +1,6 @@
+import {Worker} from 'worker_threads';
 import {resolver} from '@rocicorp/resolver';
 import {afterEach, beforeEach, describe, expect, test} from 'vitest';
-import {Worker} from 'worker_threads';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import {DbFile} from '../test/lite.ts';
 
@@ -80,17 +80,19 @@ describe('db/wal-checkpoint', () => {
       worker.once('message', setRunning);
       await inTransaction;
 
+      if (transaction === 'CONCURRENT') {
+        // With a BEGIN CONCURRENT, the checkpoint fails without waiting. Note
+        // that if this were litestream, this would result in a deadlock as
+        // litestream does not set a busy_timeout.
+        const [result] = writer.pragma('wal_checkpoint(RESTART)') as Checkpoint;
+        expect(result).toEqual({busy: 1, log: 10, checkpointed: 10});
+        worker.postMessage('commit');
+        return;
+      }
+
       // Signal the worker to proceed and immediately force a wal_checkpoint.
       worker.postMessage('commit');
       const [result] = writer.pragma('wal_checkpoint(RESTART)') as Checkpoint;
-
-      if (transaction === 'CONCURRENT') {
-        // With a BEGIN CONCURRENT, the checkpoint fails. Note that if this were
-        // litestream, this would result in a deadlock as litestream does not
-        // set a busy_timeout.
-        expect(result).toEqual({busy: 1, log: 10, checkpointed: 10});
-        return;
-      }
       // With normal transactions, the wal_checkpoint waits for a write to finish.
       expect(result).toEqual({busy: 0, log: 11, checkpointed: 11});
 

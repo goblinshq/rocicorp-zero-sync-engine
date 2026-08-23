@@ -1,5 +1,4 @@
-import {bench, run, summary} from 'mitata';
-import {expect, test} from 'vitest';
+import {bench, describe} from '../../shared/src/bench.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
 import {must} from '../../shared/src/must.ts';
 import {computeZqlSpecs} from '../../zero-cache/src/db/lite-tables.ts';
@@ -30,7 +29,10 @@ const {dbs, delegates, queries} = await bootstrap({
   pgContent,
 });
 
-// Run ANALYZE to populate SQLite statistics for cost model
+dbs.sqlite.exec('CREATE INDEX IF NOT EXISTS idx_album_title ON album(title)');
+dbs.sqlite.exec('CREATE INDEX IF NOT EXISTS idx_genre_name ON genre(name)');
+
+// Run ANALYZE after index creation to populate SQLite statistics for cost model.
 dbs.sqlite.exec('ANALYZE;');
 
 const tables: {[key: string]: TableSchema} = schema.tables;
@@ -54,7 +56,7 @@ const serverToClientMapper = serverToClient(schema.tables);
 function createQuery(tableName: string, queryAST: AST): AnyQuery {
   return newQueryImpl(
     schema,
-    tableName as keyof typeof schema.tables & string,
+    tableName as keyof typeof schema.tables,
     queryAST,
     defaultFormat,
     'test',
@@ -80,7 +82,7 @@ function benchmarkQuery(name: string, query: AnyQuery) {
   const unplannedQuery = createQuery(tableName, unplannedAST);
   const plannedQuery = createQuery(tableName, plannedClientAST);
 
-  summary(() => {
+  describe(name, () => {
     bench(`unplanned: ${name}`, async () => {
       await delegate.run(unplannedQuery);
     });
@@ -128,24 +130,3 @@ benchmarkQuery(
     ),
   ),
 );
-
-// Check if JSON output is requested via environment variable
-const format = process.env.BENCH_OUTPUT_FORMAT;
-
-if (format === 'json') {
-  // Output JSON without samples for smaller, cleaner output
-  await run({
-    format: {
-      json: {
-        samples: false,
-        debug: false,
-      },
-    },
-  });
-} else {
-  await run();
-}
-
-test('no-op', () => {
-  expect(true).toBe(true);
-});

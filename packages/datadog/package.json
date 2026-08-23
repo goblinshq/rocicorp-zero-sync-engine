@@ -3,21 +3,26 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "devDependencies": {
-    "@rocicorp/lock": "^1.0.4",
-    "@rocicorp/logger": "^5.4.0",
-    "@vitest/runner": "4.0.15",
-    "shared": "0.0.0",
-    "typescript": "~5.9.3",
-    "vitest": "4.0.15"
-  },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "check-types": "tsc",
     "check-types:watch": "tsc --watch",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
-  }
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts src/",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
+  },
+  "devDependencies": {
+    "@rocicorp/lock": "^1.0.4",
+    "@rocicorp/logger": "^6.1.0",
+    "@rocicorp/resolver": "^1.0.2",
+    "@vitest/runner": "^4.1.6",
+    "oxfmt": "^0.45.0",
+    "shared": "workspace:*",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.6"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

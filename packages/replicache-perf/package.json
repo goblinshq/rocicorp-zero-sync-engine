@@ -1,31 +1,39 @@
 {
   "name": "replicache-perf",
   "private": true,
+  "type": "module",
   "scripts": {
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
     "check-types": "tsc",
     "check-types:watch": "tsc --watch",
-    "lint": "oxlint --type-aware src/",
-    "build": "tsx tool/build.ts",
-    "perf": "npm run build && tsx src/runner.ts"
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts src/",
+    "build": "node tool/build.ts",
+    "perf": "pnpm run build && node src/runner.ts",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
-  "type": "module",
   "dependencies": {
+    "@rocicorp/resolver": "^1.0.2",
     "@types/command-line-args": "^5.2.3",
-    "@types/command-line-usage": "^5.0.2",
+    "@types/command-line-usage": "^5.0.4",
     "command-line-args": "^6.0.1",
     "command-line-usage": "^7.0.3",
-    "esbuild": "^0.25.10",
+    "compare-utf8": "^0.2.0",
+    "esbuild": "0.27.7",
     "get-port": "^7.0.0",
     "hash-wasm": "^4.9.0",
     "idb": "^7.0.1",
-    "playwright": "^1.53.2",
-    "replicache": "15.2.1",
-    "shared": "0.0.0",
-    "tsx": "^4.21.0",
-    "typescript": "~5.9.3",
-    "vite": "7.2.7",
+    "playwright": "^1.60.0",
+    "playwright-core": "1.53.2",
+    "replicache": "workspace:*",
+    "shared": "workspace:*",
+    "typescript": "~6.0.2",
+    "vite": "^8.0.13",
     "xbytes": "^1.7.0"
-  }
+  },
+  "devDependencies": {
+    "oxfmt": "^0.45.0"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

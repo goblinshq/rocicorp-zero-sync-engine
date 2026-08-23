@@ -6,38 +6,106 @@ on:
     paths:
       - 'packages/replicache/**'
       - 'packages/replicache-perf/**'
+      - '.github/**'
+      - 'pnpm-lock.yaml'
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
+  playwright-install:
+    name: Install Playwright
+    runs-on: [self-hosted, benchmark] # zizmor: ignore[self-hosted-runner] Benchmark jobs require dedicated hardware.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.11.0
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+
+        with:
+          node-version: 24.x
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/playwright-install
+
   benchmark:
     name: Performance regression check
-    runs-on: self-hosted
+    needs: playwright-install
+    permissions:
+      contents: read
+    runs-on: [self-hosted, benchmark] # zizmor: ignore[self-hosted-runner] Benchmark jobs require dedicated hardware.
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22.x
-          cache: 'npm'
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.11.0
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+
+        with:
+          node-version: 24.x
+          cache: 'pnpm'
       # Clear out potential user data dirs left over from previous failures.
       - run: rm -rf /tmp/replicache-playwright-*
-      - run: npm ci
-      - name: Install Playwright
-        run: npx playwright install --with-deps
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install
 
-      - run: npm run build
+      - run: pnpm run build
         working-directory: packages/replicache-perf
 
       # Run benchmark and stores the output to a file
       - name: Run benchmark
         working-directory: packages/replicache-perf
         run: |
-          npm run build
-          npx tsx src/runner.ts --format=json | tee perf-temp-output.json
-          npx tsx tool/split-perf.ts perf-temp-output.json perf-v2-output.json perf-v2-p95-output.json
+          pnpm run build
+          node src/runner.ts --format=json | tee perf-temp-output.json
+          node tool/split-perf.ts perf-temp-output.json perf-v2-output.json perf-v2-p95-output.json
         shell: bash
+
+      - name: Upload benchmark outputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-v2-results
+          path: |
+            packages/replicache-perf/perf-v2-output.json
+            packages/replicache-perf/perf-v2-p95-output.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish performance results
+    needs: benchmark
+    permissions:
+      contents: write # Required by github-action-benchmark to push gh-pages data.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download benchmark outputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: perf-v2-results
+          path: packages/replicache-perf
+
+      # Disable git hooks so github-action-benchmark can commit to gh-pages
+      # (the pre-commit hook references tools/ which doesn't exist on gh-pages)
+      - run: git config core.hooksPath /dev/null
 
       # Run `github-action-benchmark` action
       - name: Store benchmark result
-        uses: rhysd/github-action-benchmark@v1
+        uses: rhysd/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           # What benchmark tool the output.json came from
           tool: 'customSmallerIsBetter'
@@ -45,14 +113,14 @@ jobs:
           output-file-path: packages/replicache-perf/perf-v2-output.json
           # Workflow will fail when an alert happens
           fail-on-alert: true
-          github-token: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
+          github-token: ${{ github.token }}
           benchmark-data-dir-path: perf-v2
           auto-push: true
           alert-threshold: '130%'
           comment-on-alert: true
 
       - name: Store benchmark result p95
-        uses: rhysd/github-action-benchmark@v1
+        uses: rhysd/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           # What benchmark tool the output.json came from
           tool: 'customSmallerIsBetter'
@@ -60,7 +128,7 @@ jobs:
           output-file-path: packages/replicache-perf/perf-v2-p95-output.json
           # Workflow will NOT fail when an alert happens
           fail-on-alert: false
-          github-token: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
+          github-token: ${{ github.token }}
           benchmark-data-dir-path: perf-v2/p95
           auto-push: true
           alert-threshold: '1000%'

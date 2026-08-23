@@ -57,7 +57,11 @@ const label = table('label')
     id: string(),
     name: string(),
   })
-  .primaryKey('id');
+  .primaryKey('id')
+  // Matches the unique keys the zqlite resolver tests hand the server
+  // (`label: [['id'], ['name']]`), so a scalar gate pinned on `name` is
+  // provable on the client too.
+  .unique('name');
 
 const revision = table('revision')
   .columns({
@@ -82,6 +86,11 @@ const issueRelationships = relationships(issue, ({one, many}) => ({
   oneComment: one({
     sourceField: ['id'],
     destField: ['issueId'],
+    destSchema: comment,
+  }),
+  ownerComments: many({
+    sourceField: ['ownerId'],
+    destField: ['authorId'],
     destSchema: comment,
   }),
   labels: many(

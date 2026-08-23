@@ -1,5 +1,7 @@
 import {defineConfig, mergeConfig} from 'vitest/config';
-import config, {CI} from '../shared/src/tool/vitest-config.ts';
+import config, {benchConfig, CI} from '../shared/src/tool/vitest-config.ts';
+
+const coverageInclude = ['src/**/*.{js,jsx,ts,tsx,mjs,mts,cjs,cts}'];
 
 function nameFromURL(url: string) {
   // importer looks like file://....../packages/NAME/... and we want the NAME
@@ -7,7 +9,7 @@ function nameFromURL(url: string) {
 }
 
 export function configForVersion(version: number, url: string) {
-  const TIMEOUT = (CI ? 2 : 1) * 20_000;
+  const TIMEOUT = (CI ? 2 : 1) * 30_000;
   const name = nameFromURL(url);
   const merged = mergeConfig(config, {
     test: {
@@ -18,10 +20,12 @@ export function configForVersion(version: number, url: string) {
       coverage: {
         enabled: !CI, // Don't run coverage in continuous integration.
         reporter: [['html'], ['clover', {file: 'coverage.xml'}]],
-        include: ['src/**'],
+        include: coverageInclude,
       },
+      retry: CI ? 2 : 0,
       testTimeout: TIMEOUT,
       hookTimeout: TIMEOUT,
+      slowTestThreshold: TIMEOUT / 10,
     },
   });
   // Override include to only pg tests (mergeConfig merges arrays, we want to replace)
@@ -42,17 +46,33 @@ export function configForNoPg(url: string) {
       coverage: {
         enabled: !CI, // Don't run coverage in continuous integration.
         reporter: [['html'], ['clover', {file: 'coverage.xml'}]],
-        include: ['src/**'],
+        include: coverageInclude,
       },
     },
   });
+}
+
+export function configForPgBench(url: string) {
+  const name = nameFromURL(url);
+  const merged = mergeConfig(benchConfig, {
+    test: {
+      name: `${name}/bench-pg`,
+      globalSetup: ['../zero-cache/test/pg-17.ts'],
+      browser: {enabled: false},
+      testTimeout: 300_000,
+      hookTimeout: 300_000,
+    },
+  });
+  // Override include to only pg benchmarks (mergeConfig merges arrays).
+  merged.test.include = ['src/**/*.bench.pg.?(c|m)[jt]s?(x)'];
+  return merged;
 }
 
 // To run tests against a custom Postgres instance (e.g. Aurora), specify
 // the connection string in the CUSTOM_PG environment variable, and optionally
 // limit the test runner to the "custom-pg" project:
 //
-// CUSTOM_PG=postgresql://... npm run test -- --project custom-pg
+// CUSTOM_PG=postgresql://... pnpm run test --project custom-pg
 export function configForCustomPg(url: string) {
   if (process.env['CUSTOM_PG']) {
     const name = nameFromURL(url);
@@ -77,6 +97,11 @@ export function configForCustomPg(url: string) {
 
 export default defineConfig({
   test: {
-    projects: ['vitest.config.*.ts', ...configForCustomPg(import.meta.url)],
+    projects: [
+      'vitest.config.*.ts',
+      '!vitest.config.bench.ts',
+      '!vitest.config.bench.*.ts',
+      ...configForCustomPg(import.meta.url),
+    ],
   },
 });

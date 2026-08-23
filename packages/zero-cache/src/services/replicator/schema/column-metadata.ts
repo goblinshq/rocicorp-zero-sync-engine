@@ -142,19 +142,19 @@ export class ColumnMetadataStore {
    * Returns `undefined` if the metadata table doesn't exist yet.
    */
   static getInstance(db: Database): ColumnMetadataStore | undefined {
-    // Check if table exists
-    const tableExists = db
-      .prepare(
-        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_zero.column_metadata'`,
-      )
-      .get();
-
-    if (!tableExists) {
-      return undefined;
-    }
-
     let instance = ColumnMetadataStore.#instances.get(db);
     if (!instance) {
+      // Check if table exists
+      const tableExists = db
+        .prepare(
+          `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_zero.column_metadata'`,
+        )
+        .get();
+
+      if (!tableExists) {
+        return undefined;
+      }
+
       instance = new ColumnMetadataStore(db);
       ColumnMetadataStore.#instances.set(db, instance);
     }
@@ -165,7 +165,7 @@ export class ColumnMetadataStore {
     tableName: string,
     columnName: string,
     spec: ColumnSpec,
-    backfill?: BackfillID | undefined,
+    backfill?: BackfillID,
   ): void {
     const metadata = pgColumnSpecToMetadata(spec);
     this.#insertMetadata(tableName, columnName, metadata, backfill);
@@ -175,7 +175,7 @@ export class ColumnMetadataStore {
     tableName: string,
     columnName: string,
     metadata: Omit<ColumnMetadata, 'isBackfilling'>,
-    backfill?: BackfillID | undefined,
+    backfill?: BackfillID,
   ): void {
     this.#insertStmt.run(
       tableName,

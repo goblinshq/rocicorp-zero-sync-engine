@@ -5,11 +5,16 @@ import {assert} from '../../../shared/src/asserts.ts';
 import {h128} from '../../../shared/src/hash.ts';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import {must} from '../../../shared/src/must.ts';
+import {
+  ANYONE_CAN,
+  ANYONE_CAN_DO_ANYTHING,
+  definePermissions,
+} from '../../../zero-permissions/src/permissions.ts';
 import type {
   DeleteOp,
   InsertOp,
   UpdateOp,
-} from '../../../zero-protocol/src/push.ts';
+} from '../../../zero-protocol/src/mutation.ts';
 import {relationships} from '../../../zero-schema/src/builder/relationship-builder.ts';
 import {createSchema} from '../../../zero-schema/src/builder/schema-builder.ts';
 import {
@@ -18,11 +23,6 @@ import {
   string,
   table,
 } from '../../../zero-schema/src/builder/table-builder.ts';
-import {
-  ANYONE_CAN,
-  ANYONE_CAN_DO_ANYTHING,
-  definePermissions,
-} from '../../../zero-schema/src/permissions.ts';
 import type {ValueType} from '../../../zero-schema/src/table-schema.ts';
 import type {Schema as ZeroSchema} from '../../../zero-types/src/schema.ts';
 import {
@@ -30,7 +30,7 @@ import {
   buildPipeline,
 } from '../../../zql/src/builder/builder.ts';
 import {Catch, type CaughtNode} from '../../../zql/src/ivm/catch.ts';
-import type {Source} from '../../../zql/src/ivm/source.ts';
+import {type Source, makeSourceChangeAdd} from '../../../zql/src/ivm/source.ts';
 import {consume} from '../../../zql/src/ivm/stream.ts';
 import type {ExpressionBuilder} from '../../../zql/src/query/expression.ts';
 import {QueryDelegateBase} from '../../../zql/src/query/query-delegate-base.ts';
@@ -588,84 +588,44 @@ test('cannot create an issue with the wrong creatorId, even if admin', async () 
 
 function addUser(user: Row<Schema['tables']['user']>) {
   const userSource = must(queryDelegate.getSource('user'));
-  consume(
-    userSource.push({
-      type: 'add',
-      row: user,
-    }),
-  );
+  consume(userSource.push(makeSourceChangeAdd(user)));
 }
 
 function addProject(project: Row<Schema['tables']['project']>) {
   const projectSource = must(queryDelegate.getSource('project'));
-  consume(
-    projectSource.push({
-      type: 'add',
-      row: project,
-    }),
-  );
+  consume(projectSource.push(makeSourceChangeAdd(project)));
 }
 
 function addProjectMember(
   projectMember: Row<Schema['tables']['projectMember']>,
 ) {
   const projectMemberSource = must(queryDelegate.getSource('projectMember'));
-  consume(
-    projectMemberSource.push({
-      type: 'add',
-      row: projectMember,
-    }),
-  );
+  consume(projectMemberSource.push(makeSourceChangeAdd(projectMember)));
 }
 
 function addIssue(issue: Row<Schema['tables']['issue']>) {
   const issueSource = must(queryDelegate.getSource('issue'));
-  consume(
-    issueSource.push({
-      type: 'add',
-      row: issue,
-    }),
-  );
+  consume(issueSource.push(makeSourceChangeAdd(issue)));
 }
 
 function addComment(comment: Row<Schema['tables']['comment']>) {
   const commentSource = must(queryDelegate.getSource('comment'));
-  consume(
-    commentSource.push({
-      type: 'add',
-      row: comment,
-    }),
-  );
+  consume(commentSource.push(makeSourceChangeAdd(comment)));
 }
 
 function addLabel(label: Row<Schema['tables']['label']>) {
   const labelSource = must(queryDelegate.getSource('label'));
-  consume(
-    labelSource.push({
-      type: 'add',
-      row: label,
-    }),
-  );
+  consume(labelSource.push(makeSourceChangeAdd(label)));
 }
 
 function addIssueLabel(issueLabel: Row<Schema['tables']['issueLabel']>) {
   const issueLabelSource = must(queryDelegate.getSource('issueLabel'));
-  consume(
-    issueLabelSource.push({
-      type: 'add',
-      row: issueLabel,
-    }),
-  );
+  consume(issueLabelSource.push(makeSourceChangeAdd(issueLabel)));
 }
 
 function addViewState(viewState: Row<Schema['tables']['viewState']>) {
   const viewStateSource = must(queryDelegate.getSource('viewState'));
-  consume(
-    viewStateSource.push({
-      type: 'add',
-      row: viewState,
-    }),
-  );
+  consume(viewStateSource.push(makeSourceChangeAdd(viewState)));
 }
 
 test('cannot create an issue unless you are a project member', async () => {

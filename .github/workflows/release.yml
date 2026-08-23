@@ -1,0 +1,426 @@
+name: Release Zero
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Release mode
+        required: true
+        type: choice
+        options:
+          - canary
+          - stable
+      release_branch:
+        description: Branch to release from
+        required: true
+        type: string
+        default: main
+  # Every commit to main publishes a head release (npm dist-tag `head` +
+  # ghcr.io/rocicorp/zero, no Docker Hub, no git tag).
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  # Push events have no inputs, so fall back to the head-release group. Bursts
+  # of merges coalesce: GitHub keeps only the newest queued run per group and
+  # cancel-in-progress: false protects the in-flight publish.
+  group: zero-release-${{ inputs.release_branch || 'main' }}-${{ inputs.mode || 'head' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      release_branch: ${{ steps.plan.outputs.release_branch }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      is_canary: ${{ steps.plan.outputs.is_canary }}
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+
+      - name: Plan release
+        id: plan
+        env:
+          MODE: ${{ github.event_name == 'push' && 'head' || inputs.mode }}
+          RELEASE_BRANCH: ${{ github.event_name == 'push' && 'main' || inputs.release_branch }}
+          WORKFLOW_REF_NAME: ${{ github.ref_name }}
+          # Pin push-triggered runs to the commit that triggered them so a
+          # queued run does not re-release a newer commit under a second
+          # version.
+          SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
+        run: node scripts/src/release-plan.ts
+
+  archive-cloudzero-source:
+    name: Archive source for Cloud Zero (${{ matrix.stage }})
+    runs-on: ubuntu-latest
+    needs: plan
+    environment: ${{ matrix.stage }}-source-archive
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - stage: staging
+            account_id: '946232032425'
+          - stage: production
+            account_id: '360831509486'
+    permissions:
+      contents: read
+      id-token: write # Required for OIDC authentication to AWS.
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Configure archive credentials
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        with:
+          role-to-assume: arn:aws:iam::${{ matrix.account_id }}:role/github-archive-zero-source
+          role-session-name: archive-zero-source-${{ github.run_id }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+          unset-current-credentials: true
+
+      - name: Archive source revision
+        env:
+          SOURCE_ARCHIVE_BUCKET: cloudzero-source-archives-${{ matrix.account_id }}
+          SOURCE_REPOSITORY: rocicorp/mono
+          SOURCE_REVISION: ${{ needs.plan.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse --verify "${SOURCE_REVISION}^{commit}")
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$revision" != "$SOURCE_REVISION" ]; then
+            echo "Expected exact commit SHA, got $SOURCE_REVISION -> $revision" >&2
+            exit 1
+          fi
+          archive="$RUNNER_TEMP/source.tar.gz"
+          git archive --format=tar "$revision" | gzip -n > "$archive"
+          key="repositories/$SOURCE_REPOSITORY/$revision/source.tar.gz"
+          if aws s3api head-object --bucket "$SOURCE_ARCHIVE_BUCKET" --key "$key" >/dev/null 2>&1; then
+            echo "Already archived $SOURCE_REPOSITORY@$revision"
+          else
+            aws s3api put-object \
+              --bucket "$SOURCE_ARCHIVE_BUCKET" \
+              --key "$key" \
+              --body "$archive" \
+              --content-type application/gzip \
+              --checksum-algorithm SHA256 >/dev/null
+          fi
+
+  build:
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    needs: plan
+    permissions:
+      contents: read
+    outputs:
+      tarball_name: ${{ steps.pack.outputs.filename }}
+    env:
+      SCRIPTS: ${{ github.workspace }}/ci/scripts/src
+      SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Checkout workflow scripts
+        # Trusted release tooling from the workflow ref (`main`), not the release
+        # source branch. This job has no secrets and runs all install/build code.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          path: ci
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: source
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.11.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+          cache: 'pnpm'
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Set release version
+        working-directory: source
+        run: node "$SCRIPTS/release-set-version.ts" "$VERSION"
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Zero
+        working-directory: source
+        run: pnpm --filter @rocicorp/zero run build
+
+      - name: Pack Zero
+        id: pack
+        working-directory: source/packages/zero
+        env:
+          PACK_DEST: ${{ runner.temp }}/npm
+        run: node "$SCRIPTS/release-pack.ts"
+
+      - name: Verify npm tarball
+        working-directory: source
+        env:
+          TARBALL: ${{ runner.temp }}/npm/${{ steps.pack.outputs.filename }}
+        run: node "$SCRIPTS/release-verify-tarball.ts" "$TARBALL" "$VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build Docker image archive
+        env:
+          TARBALL: ${{ steps.pack.outputs.filename }}
+          TARBALL_PATH: ${{ runner.temp }}/npm/${{ steps.pack.outputs.filename }}
+          IMAGE_ARCHIVE: ${{ runner.temp }}/docker/zero-image.tar
+        run: |
+          set -euo pipefail
+          mkdir -p source/packages/zero/pkgs "$(dirname "$IMAGE_ARCHIVE")"
+          cp "$TARBALL_PATH" "source/packages/zero/pkgs/$TARBALL"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-context monogo=source/go \
+            --build-arg ZERO_VERSION="$VERSION" \
+            --build-arg ZERO_PACKAGE="$TARBALL" \
+            --label org.opencontainers.image.revision="$SOURCE_SHA" \
+            --label org.opencontainers.image.version="$VERSION" \
+            --sbom=true \
+            --provenance=mode=max \
+            --output=type=oci,dest="$IMAGE_ARCHIVE" \
+            source/packages/zero
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zero-npm-${{ needs.plan.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          path: ${{ runner.temp }}/npm/${{ steps.pack.outputs.filename }}
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zero-docker-${{ needs.plan.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          path: ${{ runner.temp }}/docker/zero-image.tar
+
+  publish-npm:
+    name: Publish npm package
+    runs-on: ubuntu-latest
+    needs: [plan, build]
+    environment:
+      name: zero-release-npm
+    permissions:
+      contents: read
+      id-token: write # Required for npm provenance / trusted publishing.
+    env:
+      MODE: ${{ needs.plan.outputs.mode }}
+      SCRIPTS: ${{ github.workspace }}/ci/scripts/src
+      VERSION: ${{ needs.plan.outputs.version }}
+      TARBALL_NAME: ${{ needs.build.outputs.tarball_name }}
+    steps:
+      - name: Checkout workflow scripts
+        # Trusted release tooling from `main` only. Do not checkout the release
+        # source branch in this credentialed npm publishing job.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          path: ci
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.11.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download npm package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zero-npm-${{ needs.plan.outputs.version }}
+          path: dist/npm
+
+      - name: Verify npm tarball
+        run: node "$SCRIPTS/release-verify-tarball.ts" "dist/npm/$TARBALL_NAME" "$VERSION"
+
+      - name: Publish npm package
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = 'stable' ]; then
+            pnpm stage publish "dist/npm/$TARBALL_NAME" --provenance --tag staging --access public --no-git-checks --json
+          else
+            # canary and head publish directly under their mode's dist-tag.
+            pnpm publish "dist/npm/$TARBALL_NAME" --provenance --tag "$MODE" --access public --no-git-checks
+          fi
+
+      - name: Summarize npm release
+        run: |
+          {
+            printf '## npm\n\n'
+            printf 'Package: `%s`\n\n' "@rocicorp/zero@$VERSION"
+            if [ "$MODE" = 'stable' ]; then
+              printf 'Stable release was staged. Approve it with `pnpm stage approve <stage-id>` or in the NPM Web UI, then run the Promote Zero Release workflow.\n'
+            else
+              printf '%s release was published with the `%s` dist-tag.\n' "$MODE" "$MODE"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-docker:
+    name: Publish Docker images
+    runs-on: ubuntu-latest
+    needs: [plan, build, archive-cloudzero-source]
+    environment:
+      name: zero-release-docker
+    permissions:
+      id-token: write # Required for cosign keyless signing.
+      packages: write # Required to push the image to GHCR.
+    env:
+      MODE: ${{ needs.plan.outputs.mode }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zero-docker-${{ needs.plan.outputs.version }}
+          path: dist/docker
+
+      - name: Push GHCR Docker image
+        uses: docker://quay.io/containers/skopeo:v1.22.2-immutable@sha256:ca4fd94dba8cab15cf79c4c156bfc26d28e2265411294e9bba87756942e739ad
+        with:
+          args: >-
+            copy --all
+            --dest-creds ${{ github.actor }}:${{ github.token }}
+            oci-archive:dist/docker/zero-image.tar
+            docker://ghcr.io/rocicorp/zero:${{ needs.plan.outputs.version }}
+
+      - name: Push GHCR head tag
+        # Moving tag tracking the newest head release. The cosign signature
+        # below covers it because signatures attach to the digest.
+        if: needs.plan.outputs.mode == 'head'
+        uses: docker://quay.io/containers/skopeo:v1.22.2-immutable@sha256:ca4fd94dba8cab15cf79c4c156bfc26d28e2265411294e9bba87756942e739ad
+        with:
+          args: >-
+            copy --all
+            --dest-creds ${{ github.actor }}:${{ github.token }}
+            oci-archive:dist/docker/zero-image.tar
+            docker://ghcr.io/rocicorp/zero:head
+
+      - name: Push Docker Hub image
+        if: needs.plan.outputs.mode != 'head'
+        uses: docker://quay.io/containers/skopeo:v1.22.2-immutable@sha256:ca4fd94dba8cab15cf79c4c156bfc26d28e2265411294e9bba87756942e739ad
+        with:
+          args: >-
+            copy --all
+            --dest-creds ${{ vars.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_TOKEN }}
+            oci-archive:dist/docker/zero-image.tar
+            docker://docker.io/rocicorp/zero:${{ needs.plan.outputs.version }}
+
+      - name: Login to Docker Hub
+        if: needs.plan.outputs.mode != 'head'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign Docker images
+        run: |
+          cosign sign --yes "ghcr.io/rocicorp/zero:$VERSION"
+          if [ "$MODE" != 'head' ]; then
+            cosign sign --yes "docker.io/rocicorp/zero:$VERSION"
+          fi
+
+      - name: Summarize Docker release
+        run: |
+          {
+            printf '## Docker\n\n'
+            if [ "$MODE" != 'head' ]; then
+              printf 'Docker Hub: `%s`\n\n' "rocicorp/zero:$VERSION"
+            fi
+            printf 'GHCR: `%s`\n' "ghcr.io/rocicorp/zero:$VERSION"
+            if [ "$MODE" = 'head' ]; then
+              printf 'GHCR moving tag: `%s`\n' "ghcr.io/rocicorp/zero:head"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    name: Push git tag
+    runs-on: ubuntu-latest
+    needs: [plan, publish-npm, publish-docker]
+    # Head releases are not tagged; the version itself (source-sha prefix +
+    # date) and the OCI revision label carry the version <-> commit mapping.
+    if: needs.plan.outputs.mode != 'head'
+    permissions:
+      contents: write # Required to push the Zero release tag.
+    env:
+      MODE: ${{ needs.plan.outputs.mode }}
+      SCRIPTS: ${{ github.workspace }}/ci/scripts/src
+      SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Checkout workflow scripts
+        # Trusted release tooling from `main`; the release source checkout below
+        # is used only as git object input for tag creation.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          path: ci
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Checkout release source
+        # zizmor: ignore[artipacked] Tag push intentionally uses the scoped GITHUB_TOKEN from this checkout.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          path: source
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: true
+
+      - name: Create and push tag
+        working-directory: source
+        run: node "$SCRIPTS/release-create-tag.ts" "$MODE" "$VERSION" "$TAG" "$SOURCE_SHA"

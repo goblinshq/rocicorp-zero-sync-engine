@@ -1,11 +1,11 @@
 import '../../../packages/shared/src/dotenv.ts';
 
 import * as fs from 'fs';
-import * as readline from 'readline';
 import {dirname, join} from 'path';
-import postgres from 'postgres';
+import * as readline from 'readline';
 import {pipeline} from 'stream/promises';
 import {fileURLToPath} from 'url';
+import postgres from 'postgres';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -197,7 +197,7 @@ async function discoverTriggers(
 function parseBoolEnv(value: string | undefined): boolean {
   return (
     value !== undefined &&
-    ['t', 'true', '1', ''].indexOf(value.toLocaleLowerCase().trim()) !== -1
+    ['t', 'true', '1', ''].includes(value.toLocaleLowerCase().trim())
   );
 }
 
@@ -211,9 +211,9 @@ async function seed() {
 
   const appendMode =
     process.env.ZERO_SEED_APPEND !== undefined &&
-    ['t', 'true', '1', ''].indexOf(
+    ['t', 'true', '1', ''].includes(
       process.env.ZERO_SEED_APPEND.toLocaleLowerCase().trim(),
-    ) !== -1;
+    );
 
   // oxlint-disable-next-line no-console
   console.log(process.env.ZERO_UPSTREAM_DB);
@@ -274,7 +274,7 @@ async function seed() {
       if (forceSeed && !appendMode) {
         // oxlint-disable-next-line no-console
         console.log('Force mode: truncating existing data...');
-        for (const tableName of [...TABLES_IN_SEED_ORDER].reverse()) {
+        for (const tableName of TABLES_IN_SEED_ORDER.toReversed()) {
           const exists = await sql`
             SELECT 1 FROM pg_tables
             WHERE schemaname = 'public' AND tablename = ${tableName}

@@ -36,6 +36,11 @@ const CONNECTION_URI = mustInject('pgConnectionString');
 
 export type OnNoticeFn = (n: postgres.Notice) => void;
 
+export type TestDBOptions = {
+  onNotice?: OnNoticeFn;
+  typeOpts?: TypeOptions | false;
+};
+
 const IGNORE_LEVELS = new Set(['DEBUG', 'INFO', 'NOTICE']);
 
 const defaultOnNotice: OnNoticeFn = n => {
@@ -57,9 +62,9 @@ export class TestDBs {
 
   async create(
     database: string,
-    onNotice?: OnNoticeFn,
-    typeOpts: TypeOptions | false = {},
-  ): Promise<PostgresDB> {
+    opts: TestDBOptions = {},
+  ): Promise<PostgresDB & AsyncDisposable> {
+    const {onNotice, typeOpts = {}} = opts;
     const exists = this.#dbs[database];
     if (exists !== undefined) {
       console.warn('dropping database', database);
@@ -81,10 +86,19 @@ export class TestDBs {
         onNotice?.(n);
         defaultOnNotice(n);
       },
+      // Ensure deterministic behavior for timestamp/date tests regardless
+      // of the server's timezone setting. This is sent as a startup parameter
+      // to every connection in the pool (unlike SET TIME ZONE which only
+      // affects a single connection).
+      connection: {TimeZone: 'UTC'},
       ...(typeOpts ? postgresTypeConfig(typeOpts) : {}),
     });
     this.#dbs[database] = db;
-    return db;
+    return Object.assign(db, {
+      [Symbol.asyncDispose]: async () => {
+        await this.#drop(db);
+      },
+    });
   }
 
   async drop(...dbs: postgres.Sql[]) {

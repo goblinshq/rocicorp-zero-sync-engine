@@ -8,9 +8,9 @@ import {
 import {hasOwn} from '../../shared/src/has-own.ts';
 import {type JSONValue} from '../../shared/src/json.ts';
 import {must} from '../../shared/src/must.ts';
-import {pgToZqlStringTypeMap} from '../../zero-cache/src/types/pg-data-type.ts';
 import type {
   AST,
+  Bound,
   Condition,
   CorrelatedSubquery,
   CorrelatedSubqueryCondition,
@@ -25,10 +25,7 @@ import {
   type NameMapper,
 } from '../../zero-schema/src/name-mapper.ts';
 import type {Schema} from '../../zero-types/src/schema.ts';
-import type {
-  ServerColumnSchema,
-  ServerSchema,
-} from '../../zero-types/src/server-schema.ts';
+import type {ServerSchema} from '../../zero-types/src/server-schema.ts';
 import type {Format} from '../../zql/src/ivm/view.ts';
 import {completeOrdering} from '../../zql/src/query/complete-ordering.ts';
 import {
@@ -36,7 +33,6 @@ import {
   sqlConvertColumnArg,
   sqlConvertPluralLiteralArg,
   sqlConvertSingularLiteralArg,
-  Z2S_COLLATION,
   type PluralLiteralType,
 } from './sql.ts';
 
@@ -115,7 +111,7 @@ function select(
   }
 
   let appliedWhere = false;
-  function maybeWhere(test: unknown | undefined) {
+  function maybeWhere(test: unknown) {
     if (!test) {
       return sql``;
     }
@@ -127,7 +123,12 @@ function select(
 
   return sql`SELECT ${sql.join(selectionSet, ',')}
     FROM ${fromIdent(spec.server, table)}
-    ${maybeWhere(ast.where)} ${where(spec, ast.where, table)}
+    ${maybeWhere(ast.where)} ${where(spec, ast.where, table)}${
+      ast.start
+        ? sql`
+    ${maybeWhere(ast.start)} ${start(spec, ast.start, ast.orderBy, table)}`
+        : sql``
+    }
     ${maybeWhere(correlate)} ${correlate ? correlate(table) : sql``}
     ${orderBy(spec, ast.orderBy, table)}
     ${limit(ast.limit, format?.singular)}`;
@@ -166,33 +167,72 @@ export function orderBy(
     return sql``;
   }
   return sql`ORDER BY ${sql.join(
-    orderBy.map(([col, dir]) => {
-      const serverColumnSchema = getServerColumn(spec.server, table, col);
-      return dir === 'asc'
+    orderBy.map(([col, dir]) =>
+      dir === 'asc'
         ? // Oh postgres. The table must be referred to by client name but the column by server name.
           // E.g., `SELECT server_col as client_col FROM server_table as client_table ORDER BY client_Table.server_col`
           sql`${colIdent(spec.server, {
             table,
             zql: col,
-          })}${maybeCollate(serverColumnSchema)} ASC NULLS FIRST`
+          })} ASC NULLS FIRST`
         : sql`${colIdent(spec.server, {
             table,
             zql: col,
-          })}${maybeCollate(serverColumnSchema)} DESC NULLS LAST`;
-    }),
+          })} DESC NULLS LAST`,
+    ),
     ', ',
   )}`;
 }
 
-function maybeCollate(serverColumnSchema: ServerColumnSchema): SQLQuery {
-  if (serverColumnSchema.type === 'uuid' || serverColumnSchema.isEnum) {
-    return sql`::text COLLATE ${sql.ident(Z2S_COLLATION)}`;
+export function start(
+  spec: Spec,
+  bound: Bound | undefined,
+  orderBy: Ordering | undefined,
+  table: Table,
+): SQLQuery {
+  if (!bound) {
+    return sql``;
   }
-  if (Object.hasOwn(pgToZqlStringTypeMap, serverColumnSchema.type)) {
-    return sql` COLLATE ${sql.ident(Z2S_COLLATION)}`;
+  assert(
+    orderBy !== undefined && orderBy.length > 0,
+    'start requires ordering',
+  );
+
+  const constraints: SQLQuery[] = [];
+  for (let i = 0; i < orderBy.length; i++) {
+    const group: SQLQuery[] = [];
+    const [iField, iDirection] = orderBy[i];
+    for (let j = 0; j <= i; j++) {
+      const [field] = orderBy[j];
+      if (j === i) {
+        group.push(
+          startRangeComparison(
+            spec,
+            table,
+            iField,
+            bound.row[iField] ?? null,
+            iDirection === 'asc' ? '>' : '<',
+          ),
+        );
+      } else {
+        group.push(startEquality(spec, table, field, bound.row[field] ?? null));
+      }
+    }
+    constraints.push(sql`(${sql.join(group, ' AND ')})`);
   }
 
-  return sql``;
+  if (!bound.exclusive) {
+    constraints.push(
+      sql`(${sql.join(
+        orderBy.map(([field]) =>
+          startEquality(spec, table, field, bound.row[field] ?? null),
+        ),
+        ' AND ',
+      )})`,
+    );
+  }
+
+  return sql`(${sql.join(constraints, ' OR ')})`;
 }
 
 function related(
@@ -258,6 +298,15 @@ function relationshipSubquery(
           nestedAst.where
             ? sql`AND ${where(spec, nestedAst.where, lastTable)}`
             : sql``
+        }${
+          nestedAst.start
+            ? sql` AND ${start(
+                spec,
+                nestedAst.start,
+                nestedAst.orderBy,
+                lastTable,
+              )}`
+            : sql``
         } ${orderBy(spec, nestedAst.orderBy, lastTable)} ${limit(
           last(participatingTables)?.limit,
           format?.singular,
@@ -303,9 +352,15 @@ function where(
         ' OR ',
       )})`;
     case 'correlatedSubquery':
-      if (condition.scalar) {
-        return scalarSubquery(spec, condition, table);
-      }
+      // `scalar` is deliberately ignored here. It is a planner hint for the
+      // IVM engines, which have no cost-based planner and benefit from
+      // pre-resolving an at-most-one-row subquery to a literal comparison
+      // (see zqlite's `resolveSimpleScalarSubqueries`). Postgres decorrelates
+      // EXISTS into a semi-join on its own, so the hint buys nothing here —
+      // and honoring it as `parentField = (SELECT childField … LIMIT 1)` is
+      // only sound when the subquery matches at most one row *globally*.
+      // Applying it unconditionally silently dropped rows whenever the
+      // subquery was not pinned to a unique key.
       return exists(spec, condition, table);
     case 'simple':
       return simple(spec, condition, table);
@@ -347,38 +402,6 @@ function exists(
         ),
       )})`;
   }
-}
-
-function scalarSubquery(
-  spec: Spec,
-  condition: CorrelatedSubqueryCondition,
-  parentTable: Table,
-): SQLQuery {
-  const parentField = condition.related.correlation.parentField[0];
-  const childField = condition.related.correlation.childField[0];
-  const subqueryAST = condition.related.subquery;
-
-  const parentCol = colIdent(spec.server, {
-    table: parentTable,
-    zql: parentField,
-  });
-
-  const subqueryTable = makeTable(spec, subqueryAST.table);
-  const childCol = colIdent(spec.server, {
-    table: subqueryTable,
-    zql: childField,
-  });
-
-  const op = sql.__dangerous__rawValue(
-    condition.op === 'EXISTS' ? '=' : 'IS NOT',
-  );
-
-  const subqueryWhere = subqueryAST.where
-    ? sql`WHERE ${where(spec, subqueryAST.where, subqueryTable)}`
-    : sql``;
-  const subqueryOrderBy = orderBy(spec, subqueryAST.orderBy, subqueryTable);
-
-  return sql`${parentCol} ${op} (SELECT ${childCol} FROM ${fromIdent(spec.server, subqueryTable)} ${subqueryWhere} ${subqueryOrderBy} LIMIT 1)`;
 }
 
 export function makeCorrelator(
@@ -464,6 +487,49 @@ export function distinctFrom(
   } ${valueComparison(spec, condition.right, table, condition.left, false)}`;
 }
 
+function startEquality(
+  spec: Spec,
+  table: Table,
+  field: string,
+  value: unknown,
+): SQLQuery {
+  return sql`${colIdent(spec.server, {
+    table,
+    zql: field,
+  })} IS NOT DISTINCT FROM ${startValue(spec, table, field, value)}`;
+}
+
+function startRangeComparison(
+  spec: Spec,
+  table: Table,
+  field: string,
+  value: unknown,
+  operator: '>' | '<',
+): SQLQuery {
+  const column = colIdent(spec.server, {table, zql: field});
+  if (value === null) {
+    return operator === '>' ? sql`${column} IS NOT NULL` : sql`FALSE`;
+  }
+  const typedValue = startValue(spec, table, field, value);
+  return operator === '>'
+    ? sql`${column} > ${typedValue}`
+    : sql`(${column} IS NULL OR ${column} < ${typedValue})`;
+}
+
+function startValue(
+  spec: Spec,
+  table: Table,
+  field: string,
+  value: unknown,
+): SQLQuery {
+  return sqlConvertColumnArg(
+    getServerColumn(spec.server, table, field),
+    value,
+    false,
+    true,
+  );
+}
+
 function valueComparison(
   spec: Spec,
   valuePos: ValuePosition,
@@ -474,18 +540,10 @@ function valueComparison(
   const valuePosType = valuePos.type;
   switch (valuePosType) {
     case 'column': {
-      const serverColumnSchema = getServerColumn(
-        spec.server,
-        table,
-        valuePos.name,
-      );
       const qualified: QualifiedColumn = {
         table,
         zql: valuePos.name,
       };
-      if (serverColumnSchema.type === 'uuid' || serverColumnSchema.isEnum) {
-        return sql`${colIdent(spec.server, qualified)}::text`;
-      }
       return colIdent(spec.server, qualified);
     }
     case 'literal':
@@ -650,20 +708,44 @@ function selectIdent(server: ServerSpec, column: QualifiedColumn): SQLQuery {
       server.mapper.columnName(column.table.zql, column.zql)
     ];
   const serverType = serverColumnSchema.type;
-  if (
-    !serverColumnSchema.isEnum &&
-    (serverType === 'date' ||
-      serverType === 'timestamp' ||
-      serverType === 'timestamp without time zone' ||
-      serverType === 'timestamptz' ||
-      serverType === 'timestamp with time zone')
-  ) {
-    if (serverColumnSchema.isArray) {
-      // Map EXTRACT(EPOCH FROM ...) * 1000 over array elements
-      return sql`ARRAY(SELECT EXTRACT(EPOCH FROM unnest(${colIdent(server, column)})) * 1000) as ${sql.ident(column.zql)}`;
+  if (!serverColumnSchema.isEnum) {
+    let needsNormalization = false;
+    switch (serverType) {
+      case 'timestamptz':
+      // @ts-expect-error Fallthrough intended
+      case 'timetz':
+        needsNormalization = true;
+      // fallthrough
+
+      case 'date':
+      case 'time':
+      case 'time without time zone':
+      case 'time with time zone':
+      case 'timestamp':
+      case 'timestamp without time zone':
+      case 'timestamp with time zone': {
+        // EXTRACT(EPOCH FROM timetz) can be negative when the UTC offset is
+        // positive (e.g. 01:00+02 = 23:00 UTC prev day = -3600s). Wrap with
+        // modular arithmetic to normalize to 0..86400000.
+        const toMs = (epochExpr: SQLQuery): SQLQuery =>
+          needsNormalization
+            ? sql`((${epochExpr})::bigint + 86400000) % 86400000`
+            : epochExpr;
+
+        if (serverColumnSchema.isArray) {
+          const col = colIdent(server, column);
+          return sql`CASE WHEN ${col} IS NULL THEN NULL ELSE ARRAY(SELECT ${toMs(
+            sql`EXTRACT(EPOCH FROM unnest(${col})) * 1000`,
+          )}) END as ${sql.ident(column.zql)}`;
+        }
+
+        return sql`${toMs(
+          sql`EXTRACT(EPOCH FROM ${colIdent(server, column)}) * 1000`,
+        )} as ${sql.ident(column.zql)}`;
+      }
     }
-    return sql`EXTRACT(EPOCH FROM ${colIdent(server, column)}) * 1000 as ${sql.ident(column.zql)}`;
   }
+
   return sql`${colIdent(server, column)} as ${sql.ident(column.zql)}`;
 }
 

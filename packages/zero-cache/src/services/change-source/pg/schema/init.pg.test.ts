@@ -1,5 +1,5 @@
 import type {LogContext} from '@rocicorp/logger';
-import {beforeEach, describe} from 'vitest';
+import {beforeEach, describe, expect} from 'vitest';
 import {createSilentLogContext} from '../../../../../../shared/src/logging-test-utils.ts';
 import {
   createVersionHistoryTable,
@@ -13,16 +13,16 @@ import {
 } from '../../../../test/db.ts';
 import type {PostgresDB} from '../../../../types/pg.ts';
 import {id} from '../../../../types/sql.ts';
-import {ensureShardSchema, updateShardSchema} from './init.ts';
-import {addReplica, metadataPublicationName} from './shard.ts';
+import {CURRENT_SCHEMA_VERSION, ensureShardSchema} from './init.ts';
+import {createReplica, initReplica, metadataPublicationName} from './shard.ts';
 
 const APP_ID = 'zappz';
 const SHARD_NUM = 23;
 
 // Update as necessary.
 const CURRENT_SCHEMA_VERSIONS = {
-  dataVersion: 16,
-  schemaVersion: 16,
+  dataVersion: CURRENT_SCHEMA_VERSION,
+  schemaVersion: CURRENT_SCHEMA_VERSION,
   minSafeVersion: 1,
   lock: 'v',
 } as const;
@@ -62,8 +62,13 @@ describe('change-streamer/pg/schema/init', () => {
         ],
         [`${APP_ID}_${SHARD_NUM}.replicas`]: [
           {
+            id: /\d{10,}/,
+            rank: expect.any(BigInt),
             slot: `${APP_ID}_${SHARD_NUM}_1234`,
             version: '2dhf29ef',
+            generation: '2dhf29ef',
+            backupPath: '12345',
+            backupV5: true,
             initialSchema: {tables: [], indexes: []},
             initialSyncContext: {foo: 'bar'},
             subscriberContext: null,
@@ -91,8 +96,13 @@ describe('change-streamer/pg/schema/init', () => {
         ],
         [`${APP_ID}_${SHARD_NUM}.replicas`]: [
           {
+            id: /\d{10,}/,
+            rank: expect.any(BigInt),
             slot: `${APP_ID}_${SHARD_NUM}_5678`,
             version: 's8dfh2d',
+            generation: 's8dfh2d',
+            backupPath: '12345',
+            backupV5: true,
             initialSchema: {tables: [], indexes: []},
           },
         ],
@@ -123,10 +133,11 @@ describe('change-streamer/pg/schema/init', () => {
       },
     },
     {
-      name: 'Migration from v5',
+      name: 'Migration from v6',
       upstreamSetup: `
         CREATE SCHEMA ${APP_ID}_${SHARD_NUM};
         CREATE TABLE ${APP_ID}_${SHARD_NUM}."shardConfig" (
+          "replicaVersion" TEXT, 
           "publications"  TEXT[] NOT NULL,
           "ddlDetection"  BOOL NOT NULL,
           "initialSchema" JSON,
@@ -136,8 +147,9 @@ describe('change-streamer/pg/schema/init', () => {
         );
 
         INSERT INTO ${APP_ID}_${SHARD_NUM}."shardConfig" 
-          ("lock", "publications", "ddlDetection", "initialSchema")
-          VALUES (true, 
+          ("lock", "replicaVersion", "publications", "ddlDetection", "initialSchema")
+          VALUES (true,
+            '123',
             ARRAY['_${APP_ID}_metadata_23', '_${APP_ID}_public_23'], 
             true,
             '{"tables":[],"indexes":[]}'
@@ -149,8 +161,8 @@ describe('change-streamer/pg/schema/init', () => {
             FOR TABLE ${APP_ID}_${SHARD_NUM}."clients";
   `,
       existingVersionHistory: {
-        schemaVersion: 5,
-        dataVersion: 5,
+        schemaVersion: 6,
+        dataVersion: 6,
         minSafeVersion: 1,
       },
       upstreamPostState: {
@@ -170,8 +182,13 @@ describe('change-streamer/pg/schema/init', () => {
         ],
         [`${APP_ID}_${SHARD_NUM}.replicas`]: [
           {
+            id: /[a-z0-9]{10,}/, // Random ID is backfilled
+            rank: expect.any(BigInt),
             slot: `${APP_ID}_${SHARD_NUM}`,
             version: '123',
+            generation: '123',
+            backupPath: null,
+            backupV5: false,
             initialSchema: {tables: [], indexes: []},
           },
         ],
@@ -188,32 +205,31 @@ describe('change-streamer/pg/schema/init', () => {
         await createVersionHistoryTable(upstream, schema);
         await upstream`INSERT INTO ${upstream(schema)}."versionHistory"
           ${upstream(c.existingVersionHistory)}`;
-        await updateShardSchema(
-          lc,
+      }
+      await ensureShardSchema(lc, upstream, {
+        appID: APP_ID,
+        shardNum: SHARD_NUM,
+        publications: c.requestedPublications ?? [],
+      });
+      if (c.newReplica) {
+        await createReplica(
           upstream,
+          {appID: APP_ID, shardNum: SHARD_NUM},
+          '12345',
+          c.newReplica[0],
+          c.newReplica[1],
           {
-            appID: APP_ID,
-            shardNum: SHARD_NUM,
-            publications: c.requestedPublications ?? [],
+            backupPath: '12345',
+            backupV5: true,
           },
-          '123',
         );
-      } else {
-        await ensureShardSchema(lc, upstream, {
-          appID: APP_ID,
-          shardNum: SHARD_NUM,
-          publications: c.requestedPublications ?? [],
-        });
-        if (c.newReplica) {
-          await addReplica(
-            upstream,
-            {appID: APP_ID, shardNum: SHARD_NUM},
-            c.newReplica[0],
-            c.newReplica[1],
-            {tables: [], indexes: []},
-            {foo: 'bar'},
-          );
-        }
+        await initReplica(
+          upstream,
+          {appID: APP_ID, shardNum: SHARD_NUM},
+          '12345',
+          {tables: [], indexes: []},
+          {foo: 'bar'},
+        );
       }
 
       await expectTablesToMatch(upstream, c.upstreamPostState);

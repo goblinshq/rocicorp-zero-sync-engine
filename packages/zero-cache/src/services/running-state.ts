@@ -1,7 +1,9 @@
+import {PG_UNDEFINED_TABLE} from '@drdgvhbh/postgres-error-codes';
 import type {LogContext} from '@rocicorp/logger';
 import {resolver} from '@rocicorp/resolver';
 import {AbortError} from '../../../shared/src/abort-error.ts';
 import {sleepWithAbort} from '../../../shared/src/sleep.ts';
+import {isPostgresError} from '../types/pg.ts';
 
 const DEFAULT_INITIAL_RETRY_DELAY_MS = 25;
 export const DEFAULT_MAX_RETRY_DELAY_MS = 10000;
@@ -110,6 +112,7 @@ export class RunningState {
     }, timeoutMs);
 
     this.#pendingTimeouts.add(timeout);
+    return timeout;
   }
 
   /**
@@ -150,6 +153,13 @@ export class RunningState {
     const delay = this.#retryDelay;
     this.#retryDelay = Math.min(delay * 2, this.#maxRetryDelay);
 
+    // Common failure mode when the user deletes a pg schema out from under
+    // us after init. Turn into an AbortError to force restart, which will
+    // restart and re-init the schema.
+    if (isPostgresError(err, PG_UNDEFINED_TABLE)) {
+      err = new AbortError('undefined table', {cause: err});
+    }
+
     if (err instanceof AbortError || err instanceof UnrecoverableError) {
       this.resetBackoff();
       this.stop(lc, err);
@@ -167,9 +177,13 @@ export class RunningState {
    * When using {@link backoff()}, this method should be called when the
    * implementation receives a healthy signal (e.g. a successful
    * response). This resets the delay used in {@link backoff()}.
+   *
+   * @returns The previous backoff delay
    */
   resetBackoff() {
+    const prevDelay = this.#retryDelay;
     this.#retryDelay = this.#initialRetryDelay;
+    return prevDelay;
   }
 }
 

@@ -1,6 +1,8 @@
 import {expect, suite, test} from 'vitest';
+import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {assert} from '../../../shared/src/asserts.ts';
 import type {JSONValue} from '../../../shared/src/json.ts';
+import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import type {CompoundKey, Ordering} from '../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../zero-protocol/src/data.ts';
 import type {PrimaryKey} from '../../../zero-protocol/src/primary-key.ts';
@@ -10,11 +12,10 @@ import {Join} from './join.ts';
 import {MemoryStorage} from './memory-storage.ts';
 import type {SourceSchema} from './schema.ts';
 import {Snitch, type SnitchMessage} from './snitch.ts';
-import {createSource} from './test/source-factory.ts';
-import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
-import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {consume} from './stream.ts';
+import {createSource} from './test/source-factory.ts';
 
+import {makeSourceChangeAdd} from './source.ts';
 const lc = createSilentLogContext();
 
 suite('fetch one:many', () => {
@@ -2084,7 +2085,7 @@ function fetchTest(t: FetchTest): FetchTestResults {
       t.primaryKeys[i],
     );
     for (const row of rows) {
-      consume(source.push({type: 'add', row}));
+      consume(source.push(makeSourceChangeAdd(row)));
     }
     const snitch = new Snitch(source.connect(ordering), String(i), log);
     return {

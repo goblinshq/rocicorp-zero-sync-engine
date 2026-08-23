@@ -11,6 +11,7 @@ import type {
   BaseDefaultSchema,
   DefaultContext,
   DefaultSchema,
+  IsUnknown,
 } from '../../../zero-types/src/default-types.ts';
 import type {Schema} from '../../../zero-types/src/schema.ts';
 import {asQueryInternals} from './query-internals.ts';
@@ -48,7 +49,7 @@ export type CustomQuery<
   TContext = DefaultContext,
 > = {
   readonly 'queryName': string;
-  readonly 'fn': QueryDefinitionFunction<TTable, TInput, TReturn, TContext>;
+  readonly 'fn': QueryExecutionFunction<TTable, TInput, TReturn, TContext>;
   readonly '~': CustomQueryTypes<TTable, TInput, TSchema, TReturn, TContext>;
 } & CustomQueryCallable<TTable, TInput, TOutput, TSchema, TReturn, TContext>;
 
@@ -296,6 +297,26 @@ export type QueryDefinitionFunction<
   TContext,
 > = (options: {args: TInput; ctx: TContext}) => Query<TTable, Schema, TReturn>;
 
+export type QueryExecutionFunction<
+  TTable extends string,
+  TInput extends ReadonlyJSONValue | undefined,
+  TReturn,
+  TContext,
+> = (
+  options: QueryExecutionOptions<TInput, TContext>,
+) => Query<TTable, Schema, TReturn>;
+
+type QueryExecutionOptions<
+  TInput extends ReadonlyJSONValue | undefined,
+  TContext,
+> = undefined extends TInput
+  ? IsUnknown<TContext> extends true
+    ? {args?: TInput | undefined; ctx?: TContext | undefined}
+    : {args?: TInput | undefined; ctx: TContext}
+  : IsUnknown<TContext> extends true
+    ? {args: TInput; ctx?: TContext | undefined}
+    : {args: TInput; ctx: TContext};
+
 /**
  * Defines a query to be used with {@link defineQueries}.
  *
@@ -509,7 +530,7 @@ export function createQuery<
 ): CustomQuery<TTable, TInput, TOutput, TSchema, TReturn, TContext> {
   const {validator} = definition;
 
-  const fn: QueryDefinitionFunction<
+  const fn: QueryExecutionFunction<
     TTable,
     TInput,
     TReturn,
@@ -522,7 +543,7 @@ export function createQuery<
     return asQueryInternals(
       definition.fn({
         args: validatedArgs,
-        ctx: options.ctx,
+        ctx: options.ctx as TContext,
       }),
     ).nameAndArgs(
       name,
@@ -730,6 +751,8 @@ type TypedDefineQueries<S extends Schema> = {
   >;
 };
 
+const separatorRe = /[.|]/;
+
 // ----------------------------------------------------------------------------
 // getQuery / mustGetQuery
 // ----------------------------------------------------------------------------
@@ -738,7 +761,7 @@ export function getQuery<QD extends QueryDefinitions, S extends Schema>(
   queries: QueryRegistry<QD, S>,
   name: string,
 ): FromQueryTree<QD, S> | undefined {
-  const q = getValueAtPath(queries, name, /[.|]/);
+  const q = getValueAtPath(queries, name, separatorRe);
   return q as FromQueryTree<QD, S> | undefined;
 }
 

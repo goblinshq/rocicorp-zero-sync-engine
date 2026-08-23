@@ -3,6 +3,7 @@ import {startAsyncSpan, startSpan} from '../../../../otel/src/span.ts';
 import {assert} from '../../../../shared/src/asserts.ts';
 import {type JSONObject} from '../../../../shared/src/bigint-json.ts';
 import {CustomKeyMap} from '../../../../shared/src/custom-key-map.ts';
+import {toSorted} from '../../../../shared/src/iterables.ts';
 import {
   deepEqual,
   type ReadonlyJSONValue,
@@ -29,10 +30,12 @@ import {rowIDString} from '../../types/row-key.ts';
 import {upstreamSchema, type ShardID} from '../../types/shards.ts';
 import type {Patch, PatchToVersion} from './client-handler.ts';
 import {type CVRFlushStats, type CVRStore} from './cvr-store.ts';
+import {formatSignature, parseSignature} from './row-set-signature.ts';
 import {
   cmpVersions,
   maxVersion,
   oneAfter,
+  versionString,
   type ClientQueryRecord,
   type ClientRecord,
   type CustomQueryRecord,
@@ -370,7 +373,7 @@ export class CVRConfigDrivenUpdater extends CVRUpdater {
         return patches;
       }
       const newVersion = this._ensureNewVersion();
-      client.desiredQueryIDs = [...union(current, needed)].sort(stringCompare);
+      client.desiredQueryIDs = toSorted(union(current, needed), stringCompare);
 
       for (const id of needed) {
         const q = must(queries.find(({hash}) => hash === id));
@@ -439,7 +442,8 @@ export class CVRConfigDrivenUpdater extends CVRUpdater {
       }
 
       const newVersion = this._ensureNewVersion();
-      client.desiredQueryIDs = [...difference(current, remove)].sort(
+      client.desiredQueryIDs = toSorted(
+        difference(current, remove),
         stringCompare,
       );
 
@@ -532,6 +536,14 @@ type RowPatchInfo = {
 };
 
 /**
+ * Callback used by {@link CVRQueryDrivenUpdater.flush} to retrieve the
+ * current row-set signature maintained by the pipeline driver for a given
+ * query. Returning `undefined` means "no pipeline for this query right now" —
+ * the stored signature on disk is left alone.
+ */
+export type RowSetSignatureProvider = (queryID: string) => bigint | undefined;
+
+/**
  * A {@link CVRQueryDrivenUpdater} is used for updating a CVR after making queries.
  * The caller should invoke:
  *
@@ -551,19 +563,26 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
     rowIDString,
   );
   readonly #lastPatches = new CustomKeyMap<RowID, RowPatchInfo>(rowIDString);
+  readonly #rowSetSignature: RowSetSignatureProvider | undefined;
 
   #existingRows: Promise<Iterable<RowRecord>> | undefined = undefined;
 
   /**
    * @param stateVersion The `stateVersion` at which the queries were executed.
+   * @param rowSetSignature Optional callback that returns the current row-set
+   *        signature for a query, typically backed by
+   *        `PipelineDriver.rowSetSignature`. When provided, {@link flush}
+   *        persists any signature deltas it observes.
    */
   constructor(
     cvrStore: CVRStore,
     cvr: CVRSnapshot,
     stateVersion: LexiVersion,
     replicaVersion: string,
+    rowSetSignature?: RowSetSignatureProvider,
   ) {
     super(cvrStore, cvr, replicaVersion);
+    this.#rowSetSignature = rowSetSignature;
 
     assert(
       // We should either be setting the cvr.replicaVersion for the first time, or it should
@@ -612,6 +631,13 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
       // Immediately attach a rejection handler to avoid unhandled rejections.
       // The error will surface when this.#existingRows is awaited.
       void this.#existingRows.then(() => {});
+
+      const versionBumped =
+        cmpVersions(this._orig.version, this._cvr.version) < 0;
+      lc.info?.(
+        `trackQueries: ${executed.length} executed, ${removed.length} removed, ` +
+          `version ${versionBumped ? 'bumped' : 'unchanged'}`,
+      );
 
       return {
         newVersion: this._cvr.version,
@@ -740,16 +766,65 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
    * final cookie (i.e. version), and that must be sent before any poke parts
    * generated from {@link received} are sent.
    */
-  #assertNewVersion(): CVRVersion {
+  #assertNewVersion(
+    rowID: RowID,
+    existingVersion: string | undefined,
+    newVersion: string | undefined,
+    refCounts: RefCounts,
+  ): CVRVersion {
     assert(
       cmpVersions(this._orig.version, this._cvr.version) < 0,
-      'Expected CVR version to have been bumped above original',
+      () =>
+        `Expected CVR version to have been bumped above original` +
+        ` (orig=${versionString(this._orig.version)},` +
+        ` curr=${versionString(this._cvr.version)}).` +
+        ` Row ${JSON.stringify(rowID)}:` +
+        ` existing=${existingVersion},` +
+        ` new=${newVersion},` +
+        ` queries=[${Object.keys(refCounts).join(',')}]`,
     );
     return this._cvr.version;
   }
 
   updatedVersion(): CVRVersion {
     return this._cvr.version;
+  }
+
+  /**
+   * Public alias for {@link _ensureNewVersion}. Forces a `configVersion` bump
+   * when the caller needs a new CVR version for reasons outside the built-in
+   * tracking (e.g. rowSetSignature drift re-execution).
+   */
+  ensureNewVersion(): CVRVersion {
+    return this._ensureNewVersion();
+  }
+
+  override flush(
+    lc: LogContext,
+    lastConnectTime: number,
+    lastActive: number,
+    ttlClock: TTLClock,
+  ): Promise<{cvr: CVRSnapshot; flushed: CVRFlushStats | false}> {
+    if (this.#rowSetSignature) {
+      // Persist the per-query row-set signature for any query whose
+      // pipeline-driver signature differs from what's on disk. Queries
+      // without an active pipeline (provider returns undefined) keep their
+      // stored value.
+      for (const [queryID, query] of Object.entries(this._cvr.queries)) {
+        const sig = this.#rowSetSignature(queryID);
+        if (sig === undefined) {
+          continue;
+        }
+        const stored = parseSignature(query.rowSetSignature);
+        if (stored === sig) {
+          continue;
+        }
+        const hex = formatSignature(sig);
+        query.rowSetSignature = hex;
+        this._cvrStore.updateRowSetSignature(queryID, hex);
+      }
+    }
+    return super.flush(lc, lastConnectTime, lastActive, ttlClock);
   }
 
   /**
@@ -791,7 +866,12 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
           const patchVersion =
             existing && existing.rowVersion === newRowVersion
               ? existing.patchVersion // existing row is unchanged
-              : this.#assertNewVersion();
+              : this.#assertNewVersion(
+                  id,
+                  existing?.rowVersion,
+                  newRowVersion,
+                  refCounts,
+                );
 
           // Note: for determining what to commit to the CVR store, use the
           // `version` of the update even if `merged` is null (i.e. don't
@@ -901,10 +981,16 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
           if (deletedID === null) {
             continue;
           }
+          const lastPatch = this.#lastPatches.get(deletedID);
+          if (lastPatch !== undefined && lastPatch.rowVersion === null) {
+            continue;
+          }
+          const toVersion = maxVersion(this._cvr.version, lastPatch?.toVersion);
           patches.push({
-            toVersion: this._cvr.version,
+            toVersion,
             patch: {type: 'row', op: 'del', id: deletedID},
           });
+          this.#lastPatches.set(deletedID, {rowVersion: null, toVersion});
         }
         lc?.debug?.(
           `computed ${patches.length} delete patches (${Date.now() - start} ms)`,
@@ -929,13 +1015,19 @@ export class CVRQueryDrivenUpdater extends CVRUpdater {
           undefined,
           this.#removedOrExecutedQueryIDs,
         );
+
         // If a row is still referenced, we update the refCounts but not the
         // patchVersion (as the existence and contents of the row have not
         // changed from the clients' perspective). If the row is deleted, it
         // gets a new patchVersion (and corresponding poke).
         const patchVersion = newRefCounts
           ? existing.patchVersion
-          : this.#assertNewVersion();
+          : this.#assertNewVersion(
+              existing.id,
+              existing.rowVersion,
+              undefined,
+              existing.refCounts ?? {},
+            );
         const rowRecord: RowRecord = {
           ...existing,
           patchVersion,
@@ -1043,7 +1135,7 @@ export function getInactiveQueries(cvr: CVR): {
   }
 
   // First sort all the queries that have TTL. Oldest first.
-  return [...inactive.values()].sort((a, b) => {
+  return toSorted(inactive.values(), (a, b) => {
     if (a.ttl === b.ttl) {
       return (
         ttlClockAsNumber(a.inactivatedAt) - ttlClockAsNumber(b.inactivatedAt)

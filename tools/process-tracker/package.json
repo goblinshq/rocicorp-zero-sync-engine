@@ -1,22 +1,26 @@
 {
   "name": "process-tracker",
-  "private": true,
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "go": "tsx src/main.ts",
+    "go": "node src/main.ts",
     "check-types": "tsc",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
-    "@rocicorp/logger": "^5.4.0",
+    "@rocicorp/logger": "^6.1.0",
     "find-process": "^1.4.10",
     "pidusage": "^4.0.0"
   },
   "devDependencies": {
     "@types/pidusage": "^2.0.5",
-    "shared": "0.0.0"
-  }
+    "oxfmt": "^0.45.0",
+    "shared": "workspace:*"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

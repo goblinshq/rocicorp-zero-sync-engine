@@ -6,18 +6,25 @@
   "scripts": {
     "check-types": "tsc",
     "check-types:watch": "tsc --watch",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/",
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts",
     "test": "vitest run",
-    "test:watch": "vitest watch"
+    "test:watch": "vitest watch",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
-    "@badrap/valita": "0.3.11"
+    "@badrap/valita": "0.3.11",
+    "compare-utf8": "^0.2.0"
   },
   "devDependencies": {
-    "shared": "0.0.0",
-    "typescript": "~5.9.3",
-    "zero-types": "0.0.0"
-  }
+    "fast-check": "^3.18.0",
+    "oxfmt": "^0.45.0",
+    "shared": "workspace:*",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.6",
+    "zero-types": "workspace:*"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

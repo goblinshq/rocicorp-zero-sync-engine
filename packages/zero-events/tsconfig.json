@@ -3,7 +3,9 @@
   "compilerOptions": {
     "noEmit": false,
     "emitDeclarationOnly": true,
-    "outDir": "out"
+    "rootDir": "src",
+    "outDir": "out",
+    "tsBuildInfoFile": "out/tsconfig.tsbuildinfo"
   },
   "include": ["src"],
   "exclude": ["src/**/*.test.ts"]

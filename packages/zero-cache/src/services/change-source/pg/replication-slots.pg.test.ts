@@ -1,0 +1,373 @@
+import {PG_LOCK_NOT_AVAILABLE} from '@drdgvhbh/postgres-error-codes';
+import postgres from 'postgres';
+import {beforeEach, describe, expect, vi} from 'vitest';
+import {createSilentLogContext} from '../../../../../shared/src/logging-test-utils.ts';
+import {getConnectionURI, test, type PgTest} from '../../../test/db.ts';
+import {PG_17} from '../../../types/pg-versions.ts';
+import {pgClient, type PostgresDB} from '../../../types/pg.ts';
+import type {ShardID} from '../../../types/shards.ts';
+import {
+  createReplicaAndSlot,
+  createReplicationSlot,
+  dropOldReplicasAndSlots,
+  slotPoolSuffix,
+  type ReplicationSlotResult,
+} from './replication-slots.ts';
+import {
+  ensureGlobalTables,
+  metadataPublicationName,
+  shardSetup,
+} from './schema/shard.ts';
+
+test.each([
+  [0, 'a'],
+  [1, 'b'],
+  [25, 'z'],
+  [26, 'aa'],
+  [27, 'ab'],
+  [26 * 2, 'ba'],
+  [26 ** 2, 'za'],
+  [26 ** 2 + 25, 'zz'],
+  [26 ** 2 + 26, 'aaa'],
+])('slotPoolSuffix: %d', (num, suffix) => {
+  expect(slotPoolSuffix(num)).toBe(suffix);
+});
+
+describe('createReplicationSlot', () => {
+  const APP_ID = 'zero';
+  const SHARD_NUM = 18;
+  const shard: ShardID = {appID: APP_ID, shardNum: SHARD_NUM};
+
+  let upstream: PostgresDB;
+  let pgVersion: number;
+
+  beforeEach<PgTest>(async ({testDBs}) => {
+    upstream = await testDBs.create('replication_slots');
+    [{pgVersion}] =
+      await upstream`SELECT current_setting('server_version_num')::int as "pgVersion"`;
+    await ensureGlobalTables(upstream, shard);
+    const metadataPub = metadataPublicationName(APP_ID, SHARD_NUM);
+    await upstream.unsafe(
+      shardSetup(
+        {...shard, publications: ['foo_pub', metadataPub]},
+        metadataPublicationName(APP_ID, SHARD_NUM),
+      ),
+    );
+    return () => testDBs.drop(upstream);
+  });
+
+  test('createReplicationSlot options', async () => {
+    const lc = createSilentLogContext();
+    const upstreamURI = getConnectionURI(upstream);
+    const session = pgClient(lc, upstreamURI, 'slot-pool', {
+      max: 1,
+      ['fetch_types']: false,
+      connection: {replication: 'database'},
+    });
+
+    await createReplicationSlot(lc, session, {slotName: 'zero_18_a'});
+    await createReplicationSlot(lc, session, {
+      slotName: 'zero_18_b',
+      temporary: true,
+    });
+    expect(
+      await upstream /*sql*/ `
+      SELECT slot_name, temporary FROM pg_replication_slots 
+        WHERE slot_name LIKE 'zero_18_%' ORDER BY slot_name`,
+    ).toMatchObject([
+      {
+        slot_name: 'zero_18_a',
+        temporary: false,
+      },
+      {
+        slot_name: 'zero_18_b',
+        temporary: true,
+      },
+    ]);
+
+    if (pgVersion >= PG_17) {
+      await createReplicationSlot(lc, session, {
+        slotName: 'zero_18_c',
+        failover: true,
+      });
+      // oxlint-disable-next-line jest/no-conditional-expect
+      expect(
+        await upstream`SELECT slot_name, temporary, failover FROM pg_replication_slots WHERE slot_name = 'zero_18_c'`,
+      ).toMatchObject([
+        {
+          slot_name: 'zero_18_c',
+          temporary: false,
+          failover: true,
+        },
+      ]);
+    }
+
+    // Cleanup
+    await dropOldReplicasAndSlots(lc, upstream, shard, 100n);
+  });
+
+  test('createReplicationSlot times out behind an older idle transaction', async () => {
+    const lc = createSilentLogContext();
+    const upstreamURI = getConnectionURI(upstream);
+    const timeoutSlot = `${APP_ID}_${SHARD_NUM}_${Date.now()}_timeout`;
+    const blocker = pgClient(lc, upstreamURI, 'slot-timeout-blocker', {
+      max: 1,
+    });
+    const timeoutSession = pgClient(
+      lc,
+      upstreamURI,
+      'slot-timeout-under-test',
+      {
+        max: 1,
+        ['fetch_types']: false,
+        connection: {replication: 'database'},
+      },
+    );
+
+    let blockerInTransaction = false;
+    try {
+      // Start a transaction in one session and leave it open.
+      await blocker`BEGIN`;
+      blockerInTransaction = true;
+      await blocker`SELECT txid_current()`;
+
+      // The server-side lock_timeout (set inside createReplicationSlot)
+      // should fire before the client-side orTimeout, producing a
+      // PostgresError with code 55P03 (lock_not_available).
+      let caught: unknown;
+      try {
+        await createReplicationSlot(lc, timeoutSession, {
+          slotName: timeoutSlot,
+          lockTimeout: 100,
+        });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(postgres.PostgresError);
+      expect((caught as postgres.PostgresError).code).toBe(
+        PG_LOCK_NOT_AVAILABLE,
+      );
+    } finally {
+      if (blockerInTransaction) {
+        await blocker`ROLLBACK`;
+      }
+      await blocker.end();
+      await timeoutSession.end().catch(() => {});
+      await upstream`
+          SELECT pg_drop_replication_slot(slot_name)
+            FROM pg_replication_slots
+            WHERE slot_name = ${timeoutSlot} AND NOT active`;
+    }
+  });
+
+  test('create replica and slots cleans up and reuses pool names', async () => {
+    const lc = createSilentLogContext();
+    const upstreamURI = getConnectionURI(upstream);
+    const session = pgClient(lc, upstreamURI, 'slot-pool', {
+      max: 1,
+      ['fetch_types']: false,
+      connection: {replication: 'database'},
+    });
+
+    // Create some unused slots. These should be dropped and reused.
+    await createReplicationSlot(lc, session, {slotName: 'zero_18_a'});
+    await createReplicationSlot(lc, session, {slotName: 'zero_18_d'});
+
+    expect(
+      await upstream`
+      SELECT slot_name FROM pg_replication_slots 
+        WHERE slot_name LIKE 'zero_18_%' 
+        ORDER BY slot_name`.values(),
+    ).toEqual([['zero_18_a'], ['zero_18_d']]);
+
+    const results: ReplicationSlotResult<string>[] = [];
+    const create = async (id: string) => {
+      const result = await createReplicaAndSlot(
+        lc,
+        upstream,
+        'initial-sync',
+        shard,
+        id,
+        false,
+        {
+          backupPath: id,
+          backupV5: true,
+        },
+        snapshot => Promise.resolve(`captured(${snapshot})`),
+      );
+      expect(result.capturedSnapshot).toBe(
+        `captured(${result.slot.snapshot_name})`,
+      );
+      const [status] = await upstream<{active: boolean}[]>`
+        SELECT active FROM pg_replication_slots
+          WHERE slot_name = ${result.slot.slot_name};
+      `;
+      expect(status.active).toBe(true);
+      results.push(result);
+    };
+
+    await create('rep_1');
+    expect(results.at(-1)?.slot.slot_name).toBe('zero_18_a');
+
+    await create('rep_2');
+    expect(results.at(-1)?.slot.slot_name).toBe('zero_18_b');
+    // Close the replication session so that it can be dropped.
+    results.at(-1)?.initialSession.destroy();
+
+    await create('rep_3');
+    expect(results.at(-1)?.slot.slot_name).toBe('zero_18_c');
+
+    await session`DROP_REPLICATION_SLOT zero_18_b`.simple();
+
+    await create('rep_4');
+    expect(results.at(-1)?.slot.slot_name).toBe('zero_18_b');
+
+    expect(
+      await upstream`
+      SELECT slot_name FROM pg_replication_slots 
+        WHERE slot_name LIKE 'zero_18_%' 
+        ORDER BY slot_name`.values(),
+    ).toEqual([['zero_18_a'], ['zero_18_b'], ['zero_18_c']]);
+
+    expect(
+      await upstream`SELECT id, slot, version FROM ${upstream(`${APP_ID}_${SHARD_NUM}`)}.replicas`,
+    ).toMatchObject([
+      {
+        id: 'rep_1',
+        slot: 'zero_18_a',
+        version: /[a-z0-9]{5,}/,
+      },
+      {
+        id: 'rep_2',
+        slot: 'zero_18_b',
+        version: /[a-z0-9]{5,}/,
+      },
+      {
+        id: 'rep_3',
+        slot: 'zero_18_c',
+        version: /[a-z0-9]{5,}/,
+      },
+      {
+        id: 'rep_4',
+        slot: 'zero_18_b',
+        version: /[a-z0-9]{5,}/,
+      },
+    ]);
+
+    // Cleanup
+    expect(await dropOldReplicasAndSlots(lc, upstream, shard, 100n)).toEqual({
+      dropped: 0,
+      active: 0,
+      draining: 3,
+    });
+  });
+
+  test('concurrent replica creation uses different slot names', async () => {
+    const lc = createSilentLogContext();
+    const results = await Promise.all(
+      Array.from({length: 3}, (_, i) =>
+        createReplicaAndSlot(
+          lc,
+          upstream,
+          'initial-sync',
+          shard,
+          `rep_${i}`,
+          false,
+          {
+            backupPath: `rep_${i}`,
+            backupV5: true,
+          },
+          snapshot => Promise.resolve(`captured(${snapshot})`),
+        ),
+      ),
+    );
+    const expectedSlots = new Set(['zero_18_a', 'zero_18_b', 'zero_18_c']);
+    const names = new Set(results.map(({slot: {slot_name}}) => slot_name));
+    expect(names).toEqual(expectedSlots);
+
+    const replicaSlots = await upstream<{slot: string}[]> /*sql*/ `
+      SELECT slot FROM zero_18.replicas`.values();
+    expect(new Set(replicaSlots.flat())).toEqual(expectedSlots);
+
+    // Cleanup
+    expect(await dropOldReplicasAndSlots(lc, upstream, shard, 100n)).toEqual({
+      dropped: 0,
+      active: 0,
+      draining: 3,
+    });
+  });
+
+  test('failure from captureSnapshot cleans up slot', async () => {
+    const lc = createSilentLogContext();
+    const failure = new Error('oh nose');
+    await expect(
+      createReplicaAndSlot(
+        lc,
+        upstream,
+        'initial-sync',
+        shard,
+        `foo`,
+        false,
+        {
+          backupPath: `foo`,
+          backupV5: true,
+        },
+        () => Promise.reject(failure),
+      ),
+    ).rejects.toThrow(failure);
+
+    const replicaSlots = await upstream<{slot: string}[]> /*sql*/ `
+      SELECT slot FROM zero_18.replicas`.values();
+    expect(replicaSlots).toEqual([]);
+  });
+
+  test('dropReplicaAndSlots', async () => {
+    const lc = createSilentLogContext();
+    const results: ReplicationSlotResult<string>[] = [];
+    const create = async (id: string) => {
+      const result = await createReplicaAndSlot(
+        lc,
+        upstream,
+        'initial-sync',
+        shard,
+        id,
+        false,
+        {
+          backupPath: id,
+          backupV5: true,
+        },
+        snapshot => Promise.resolve(`captured(${snapshot})`),
+      );
+      results.push(result);
+    };
+
+    await create('rep_1');
+    await create('rep_2');
+    await create('rep_3');
+
+    // Close end the first replication slot but leave the second
+    // one active.
+    results[0].initialSession.destroy();
+
+    await vi.waitFor(async () => {
+      expect(await dropOldReplicasAndSlots(lc, upstream, shard, 3n)).toEqual({
+        active: 1,
+        draining: 1,
+        dropped: 1,
+      });
+    });
+
+    // Now close the rest.
+    results[1].initialSession.destroy();
+    results[2].initialSession.destroy();
+
+    await vi.waitFor(async () => {
+      expect(
+        await dropOldReplicasAndSlots(lc, upstream, shard, 4n),
+      ).toMatchObject({
+        active: 0,
+        draining: 0,
+      });
+    });
+  });
+});

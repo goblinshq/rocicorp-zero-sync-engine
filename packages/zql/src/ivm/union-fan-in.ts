@@ -1,5 +1,7 @@
 import {assert} from '../../../shared/src/asserts.ts';
 import type {Writable} from '../../../shared/src/writable.ts';
+import {ChangeIndex} from './change-index.ts';
+import {ChangeType} from './change-type.ts';
 import type {Change} from './change.ts';
 import type {Constraint} from './constraint.ts';
 import type {Node} from './data.ts';
@@ -17,7 +19,7 @@ import {
   pushAccumulatedChanges,
 } from './push-accumulated.ts';
 import type {SourceSchema} from './schema.ts';
-import {first, type Stream} from './stream.ts';
+import type {Stream} from './stream.ts';
 import type {UnionFanOut} from './union-fan-out.ts';
 
 export class UnionFanIn implements Operator {
@@ -31,6 +33,7 @@ export class UnionFanIn implements Operator {
     this.#inputs = inputs;
     const fanOutSchema = fanOut.getSchema();
     fanOut.setFanIn(this);
+    assert(fanOutSchema.sort !== undefined, 'UnionFanIn requires sorted input');
 
     const schema: Writable<SourceSchema> = {
       tableName: fanOutSchema.tableName,
@@ -99,9 +102,11 @@ export class UnionFanIn implements Operator {
 
   fetch(req: FetchRequest): Stream<Node | 'yield'> {
     const iterables = this.#inputs.map(input => input.fetch(req));
-    return mergeFetches(iterables, (l, r) =>
-      this.#schema.compareRows(l.row, r.row),
-    );
+    const compareRows = this.#schema.compareRows;
+    const compare = req.reverse
+      ? (l: Node, r: Node) => compareRows(r.row, l.row)
+      : (l: Node, r: Node) => compareRows(l.row, r.row);
+    return mergeFetches(iterables, compare);
   }
 
   getSchema(): SourceSchema {
@@ -138,15 +143,16 @@ export class UnionFanIn implements Operator {
    *    An edit that would result in a remove or add will have been split into an add/remove pair rather than being an edit.
    */
   *#pushInternalChange(change: Change, pusher: InputBase): Stream<'yield'> {
-    if (change.type === 'child') {
+    if (change[ChangeIndex.TYPE] === ChangeType.CHILD) {
       yield* this.#output.push(change, this);
       return;
     }
 
     assert(
-      change.type === 'add' || change.type === 'remove',
+      change[ChangeIndex.TYPE] === ChangeType.ADD ||
+        change[ChangeIndex.TYPE] === ChangeType.REMOVE,
       () =>
-        `UnionFanIn: expected add or remove change type, got ${change.type}`,
+        `UnionFanIn: expected add or remove change type, got ${change[ChangeIndex.TYPE]}`,
     );
 
     let hadMatch = false;
@@ -158,13 +164,30 @@ export class UnionFanIn implements Operator {
 
       const constraint: Writable<Constraint> = {};
       for (const key of this.#schema.primaryKey) {
-        constraint[key] = change.node.row[key];
+        constraint[key] = change[ChangeIndex.NODE].row[key];
       }
       const fetchResult = input.fetch({
         constraint,
       });
 
-      if (first(fetchResult) !== undefined) {
+      // `fetch` interleaves 'yield' sentinels for cooperative multitasking.
+      // They must be forwarded, not just skipped: this probe runs inside a
+      // push, and the sentinel is the source offering the scheduler a breath.
+      // They must also not be mistaken for rows -- reading one as a row is
+      // what broke this before, since an empty branch that happened to yield
+      // looked like a branch holding the row, silently dropping the
+      // add/remove and desyncing a downstream `Take`'s push and fetch paths.
+      let otherBranchHasRow = false;
+      for (const node of fetchResult) {
+        if (node === 'yield') {
+          yield node;
+          continue;
+        }
+        otherBranchHasRow = true;
+        break;
+      }
+
+      if (otherBranchHasRow) {
         // Another branch has the row, so the add/remove is not needed.
         return;
       }
@@ -184,7 +207,7 @@ export class UnionFanIn implements Operator {
     this.#fanOutPushStarted = true;
   }
 
-  *fanOutDonePushing(fanOutChangeType: Change['type']): Stream<'yield'> {
+  *fanOutDonePushing(fanOutChangeType: ChangeType): Stream<'yield'> {
     assert(
       this.#fanOutPushStarted,
       'UnionFanIn: fanOutDonePushing called without fanOutStartedPushing',

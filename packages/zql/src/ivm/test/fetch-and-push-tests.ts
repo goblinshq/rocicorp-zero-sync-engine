@@ -12,9 +12,10 @@ import {ArrayView} from '../array-view.ts';
 import {Catch} from '../catch.ts';
 import type {Input} from '../operator.ts';
 import type {Source, SourceChange} from '../source.ts';
+import {makeSourceChangeAdd} from '../source.ts';
+import {consume} from '../stream.ts';
 import type {Format} from '../view.ts';
 import {createSource} from './source-factory.ts';
-import {consume} from '../stream.ts';
 
 const lc = createSilentLogContext();
 
@@ -32,7 +33,7 @@ function makeSource(
     primaryKeys,
   );
   for (const row of rows) {
-    consume(source.push({type: 'add', row}));
+    consume(source.push(makeSourceChangeAdd(row)));
   }
   return source;
 }
@@ -101,11 +102,7 @@ export function runPushTest(t: PushTest) {
   });
 
   let data;
-  const {
-    log: log2,
-    finalOutput: view,
-    actualStorage: actualStorage2,
-  } = innerTest(j => {
+  const {finalOutput: view, actualStorage: actualStorage2} = innerTest(j => {
     const view = new ArrayView(j, t.format, true, () => {});
     data = view.data;
     return view;
@@ -115,9 +112,10 @@ export function runPushTest(t: PushTest) {
     data = v;
   });
 
-  // ArrayView does not expand relationships of removed nodes, so
-  // its logs should be a subset of the catch operator's logs.
-  expect(log).toEqual(expect.arrayContaining(log2));
+  // Note: With lazy relationship generators evaluated on demand,
+  // ArrayView and Catch may produce different fetch logs since they
+  // iterate generators independently. We no longer compare logs.
+  // The important invariant is that they produce the same storage state.
   expect(actualStorage).toEqual(actualStorage2);
 
   view.flush();
@@ -188,11 +186,7 @@ export function runFetchTest(t: FetchTest) {
   });
 
   let data;
-  const {
-    log: log2,
-    finalOutput: view,
-    actualStorage: actualStorage2,
-  } = innerTest(j => {
+  const {finalOutput: view, actualStorage: actualStorage2} = innerTest(j => {
     const view = new ArrayView(j, t.format, true, () => {});
     data = view.data;
     return view;
@@ -202,7 +196,10 @@ export function runFetchTest(t: FetchTest) {
     data = v;
   });
 
-  expect(log).toEqual(log2);
+  // Note: With lazy relationship generators evaluated on demand,
+  // ArrayView and Catch may produce different fetch logs since they
+  // iterate generators independently. We no longer compare logs.
+  // The important invariant is that they produce the same storage state.
   expect(actualStorage).toEqual(actualStorage2);
 
   view.flush();

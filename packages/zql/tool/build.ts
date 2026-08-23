@@ -1,7 +1,7 @@
-import * as esbuild from 'esbuild';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import * as esbuild from 'esbuild';
 import {makeDefine, sharedOptions} from '../../shared/src/build.ts';
 import {getExternalFromPackageJSON} from '../../shared/src/tool/get-external-from-package-json.ts';
 
@@ -27,10 +27,7 @@ async function buildPackages() {
     ...shared,
     external: await getExternalFromPackageJSON(import.meta.url),
     platform: 'browser',
-    define: {
-      ...define,
-      ['TESTING']: 'false',
-    },
+    define,
     format: 'esm',
     entryPoints: [basePath('src', 'index.ts')],
     bundle: true,

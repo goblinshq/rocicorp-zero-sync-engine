@@ -1,23 +1,28 @@
 {
   "name": "load-generator",
-  "private": true,
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "go": "tsx src/main.ts",
+    "go": "node src/main.ts",
     "check-types": "tsc",
-    "format": "prettier --write .",
-    "check-format": "prettier --check .",
-    "lint": "oxlint --type-aware src/"
+    "format": "oxfmt .",
+    "check-format": "oxfmt --check .",
+    "lint": "oxlint --quiet --config ../../oxlint.config.ts",
+    "fmt": "oxfmt .",
+    "check-fmt": "oxfmt --check ."
   },
   "dependencies": {
     "@dotenvx/dotenvx": "^1.39.0",
-    "@rocicorp/logger": "^5.4.0",
+    "@rocicorp/logger": "^6.1.0",
     "nanoid": "^5.1.2",
     "pg-format": "npm:pg-format-fix@^1.0.5",
     "postgres": "3.4.7"
   },
   "devDependencies": {
-    "shared": "0.0.0"
-  }
+    "@types/pg-format": "^1.0.5",
+    "oxfmt": "^0.45.0",
+    "shared": "workspace:*"
+  },
+  "packageManager": "pnpm@11.11.0"
 }

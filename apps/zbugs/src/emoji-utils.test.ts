@@ -1,5 +1,5 @@
-import type {Writable} from 'shared/src/writable.js';
 import {expect, test} from 'vitest';
+import type {Writable} from '../../../packages/shared/src/writable.js';
 import type {Emoji} from './emoji-utils.ts';
 import {formatEmojiCreatorList, formatEmojiTooltipText} from './emoji-utils.ts';
 
@@ -135,7 +135,7 @@ test('formatEmojiCreatorList', () => {
   expect(
     formatEmojiCreatorList(
       Array.from({length: 55}, (_, i) => makeEmoji('id-' + i, 'user-' + i)),
-      'anon',
+      undefined,
     ),
   ).toBe(
     'user-0, user-1, user-2, user-3, user-4, user-5, user-6, user-7, user-8, user-9 and 45 others',

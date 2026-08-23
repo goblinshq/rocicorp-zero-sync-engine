@@ -1,6 +1,6 @@
+import {availableParallelism} from 'node:os';
 import type {LogContext} from '@rocicorp/logger';
 import {nanoid} from 'nanoid';
-import {availableParallelism} from 'node:os';
 import {assert, assertNotUndefined} from '../../../shared/src/asserts.ts';
 import {getHostIp} from './network.ts';
 import type {ZeroConfig} from './zero-config.ts';
@@ -24,9 +24,18 @@ export type NormalizedZeroConfig = ZeroConfig & {
   numSyncWorkers: number;
 };
 
+export type LitestreamConfig = NormalizedZeroConfig['litestream'];
+
 export function isDevelopmentMode(): boolean {
   return process.env.NODE_ENV === 'development';
 }
+
+function isRunningInECS(): boolean {
+  // https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-environment-variables.html
+  return process.env.ECS_CONTAINER_METADATA_URI_V4 !== undefined;
+}
+
+const DEFAULT_ECS_KEEPALIVE_TIMEOUT_MS = 20_000;
 
 export function assertNormalized(
   config: ZeroConfig,
@@ -34,7 +43,80 @@ export function assertNormalized(
   assert(config.taskID, 'missing --task-id');
   assert(config.changeStreamer.port, 'missing --change-streamer-port');
   assert(config.changeStreamer.address, 'missing --change-streamer-address');
+  const {
+    sqliteChangeLogMode,
+    sqliteChangeLogReadPercent,
+    sqliteChangeLogColdReadPercent,
+    sqliteChangeLogComparePercent,
+    sqliteChangeLogRetentionMs,
+    sqliteChangeLogReadBatchRows,
+    sqliteChangeLogPurgeBatchRows,
+    sqliteChangeLogBarrierTimeoutMs,
+  } = config.changeStreamer;
+  assert(
+    Number.isSafeInteger(sqliteChangeLogReadPercent) &&
+      sqliteChangeLogReadPercent >= 0 &&
+      sqliteChangeLogReadPercent <= 100,
+    '--change-streamer-sqlite-change-log-read-percent must be an integer between 0 and 100',
+  );
+  assert(
+    Number.isSafeInteger(sqliteChangeLogColdReadPercent) &&
+      sqliteChangeLogColdReadPercent >= 0 &&
+      sqliteChangeLogColdReadPercent <= 100,
+    '--change-streamer-sqlite-change-log-cold-read-percent must be an integer between 0 and 100',
+  );
+  // This setting has no mode restriction. Comparison starts in `compare` mode.
+  assert(
+    Number.isSafeInteger(sqliteChangeLogComparePercent) &&
+      sqliteChangeLogComparePercent >= 0 &&
+      sqliteChangeLogComparePercent <= 100,
+    '--change-streamer-sqlite-change-log-compare-percent must be an integer between 0 and 100',
+  );
+  assert(
+    sqliteChangeLogMode === 'serve' || sqliteChangeLogReadPercent === 0,
+    '--change-streamer-sqlite-change-log-read-percent must be 0 unless --change-streamer-sqlite-change-log-mode=serve',
+  );
+  assert(
+    sqliteChangeLogMode === 'serve' || sqliteChangeLogColdReadPercent === 0,
+    '--change-streamer-sqlite-change-log-cold-read-percent must be 0 unless --change-streamer-sqlite-change-log-mode=serve',
+  );
+  // The cold gate only admits a task to the read gate; it never serves one on
+  // its own. A nonzero cold percentage with a zero read percentage is a
+  // silent no-op, which is the shape of a rollout that looks enabled and
+  // serves nothing.
+  assert(
+    sqliteChangeLogReadPercent > 0 || sqliteChangeLogColdReadPercent === 0,
+    '--change-streamer-sqlite-change-log-cold-read-percent must be 0 when --change-streamer-sqlite-change-log-read-percent is 0',
+  );
+  for (const [flag, value] of [
+    ['retention-ms', sqliteChangeLogRetentionMs],
+    ['read-batch-rows', sqliteChangeLogReadBatchRows],
+    ['purge-batch-rows', sqliteChangeLogPurgeBatchRows],
+    ['barrier-timeout-ms', sqliteChangeLogBarrierTimeoutMs],
+  ] as const) {
+    assert(
+      Number.isSafeInteger(value) && value > 0,
+      `--change-streamer-sqlite-change-log-${flag} must be a positive integer`,
+    );
+  }
   assert(config.litestream.port, 'missing --litestream-port');
+  assert(
+    !config.litestream.backupUsingV5 || config.litestream.restoreUsingV5,
+    '--litestream-backup-using-v5 requires --litestream-restore-using-v5',
+  );
+  assert(
+    !config.litestream.backupURL ||
+      config.litestream.executableV5 ||
+      !(config.litestream.restoreUsingV5 || config.litestream.backupUsingV5),
+    '--litestream-restore-using-v5 and --litestream-backup-using-v5 ' +
+      'require --litestream-executable-v5 to be specified',
+  );
+  assert(
+    !config.litestream.backupURL ||
+      !config.litestream.backupUsingV5 ||
+      config.litestream.vfsPollIntervalMs,
+    '--litestream-backup-using-v5 requires --litestream-vfs-query-executable to be specified',
+  );
   assert(config.change.db, 'missing --change-db');
   assert(config.cvr.db, 'missing --cvr-db');
   assertNotUndefined(config.numSyncWorkers, 'missing --num-sync-workers');
@@ -101,6 +183,11 @@ export function normalizeZeroConfig(
   if (!config.cvr.db) {
     config.cvr.db = config.upstream.db;
     env['ZERO_CVR_DB'] = config.upstream.db;
+  }
+
+  if (!config.keepaliveTimeoutMs && isRunningInECS()) {
+    config.keepaliveTimeoutMs = DEFAULT_ECS_KEEPALIVE_TIMEOUT_MS;
+    env['ZERO_KEEPALIVE_TIMEOUT_MS'] = String(DEFAULT_ECS_KEEPALIVE_TIMEOUT_MS);
   }
 
   lc.info?.(`runtime env: taskID=${config.taskID}, hostIP=${hostIP}`);

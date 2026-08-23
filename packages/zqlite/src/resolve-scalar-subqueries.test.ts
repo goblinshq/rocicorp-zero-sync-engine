@@ -6,11 +6,19 @@ import type {
   SimpleCondition,
 } from '../../zero-protocol/src/ast.ts';
 import type {PrimaryKey} from '../../zero-protocol/src/primary-key.ts';
+import {newQuery} from '../../zql/src/query/query-impl.ts';
+import {asQueryInternals} from '../../zql/src/query/query-internals.ts';
+import type {AnyQuery} from '../../zql/src/query/query.ts';
+import {schema} from '../../zql/src/query/test/test-schemas.ts';
 import {
   extractLiteralEqualityConstraints,
   isSimpleSubquery,
   resolveSimpleScalarSubqueries,
 } from './resolve-scalar-subqueries.ts';
+
+function ast(q: AnyQuery): AST {
+  return asQueryInternals(q).ast;
+}
 
 function makeTableSpecs(
   entries: Record<string, PrimaryKey[]>,
@@ -27,6 +35,13 @@ const ALWAYS_FALSE: SimpleCondition = {
   op: '=',
   left: {type: 'literal', value: 1},
   right: {type: 'literal', value: 0},
+};
+
+const ALWAYS_TRUE: SimpleCondition = {
+  type: 'simple',
+  op: '=',
+  left: {type: 'literal', value: 1},
+  right: {type: 'literal', value: 1},
 };
 
 // ---------- extractLiteralEqualityConstraints ----------
@@ -357,6 +372,77 @@ test('returns ALWAYS_FALSE when executor returns null', () => {
   expect(resolved.where).toEqual(ALWAYS_FALSE);
 });
 
+// NOT EXISTS is the negation, so an unresolvable subquery makes it always
+// *true*: if no child row matches the subquery's WHERE, none can satisfy the
+// correlation either, so the EXISTS is false for every parent row.
+test('NOT EXISTS returns ALWAYS_TRUE when executor returns undefined', () => {
+  const specs = makeTableSpecs({users: [['id']]});
+  const ast: AST = {
+    table: 'issues',
+    where: {
+      type: 'correlatedSubquery',
+      op: 'NOT EXISTS',
+      scalar: true,
+      related: {
+        correlation: {
+          parentField: ['ownerId'],
+          childField: ['name'],
+        },
+        subquery: {
+          table: 'users',
+          where: {
+            type: 'simple',
+            op: '=',
+            left: {type: 'column', name: 'id'},
+            right: {type: 'literal', value: 'nonexistent'},
+          },
+        },
+      },
+    },
+  };
+
+  const {ast: resolved, companions} = resolveSimpleScalarSubqueries(
+    ast,
+    specs,
+    () => undefined,
+  );
+
+  expect(resolved.where).toEqual(ALWAYS_TRUE);
+  // Still recorded, so the pipeline re-resolves if a matching row appears.
+  expect(companions).toHaveLength(1);
+});
+
+test('NOT EXISTS returns ALWAYS_TRUE when executor returns null', () => {
+  const specs = makeTableSpecs({users: [['id']]});
+  const ast: AST = {
+    table: 'issues',
+    where: {
+      type: 'correlatedSubquery',
+      op: 'NOT EXISTS',
+      scalar: true,
+      related: {
+        correlation: {
+          parentField: ['ownerId'],
+          childField: ['name'],
+        },
+        subquery: {
+          table: 'users',
+          where: {
+            type: 'simple',
+            op: '=',
+            left: {type: 'column', name: 'id'},
+            right: {type: 'literal', value: '0001'},
+          },
+        },
+      },
+    },
+  };
+
+  const {ast: resolved} = resolveSimpleScalarSubqueries(ast, specs, () => null);
+
+  expect(resolved.where).toEqual(ALWAYS_TRUE);
+});
+
 test('leaves non-simple scalar subquery untouched', () => {
   const specs = makeTableSpecs({users: [['id']]});
   const ast: AST = {
@@ -657,6 +743,55 @@ test('resolves scalar subqueries inside correlatedSubquery (EXISTS) conditions',
   });
   expect(companions).toHaveLength(1);
   expect(companions[0].ast.table).toBe('label');
+});
+
+test('resolves scalar + flip on junction edge (issue -> issueLabel -> label)', () => {
+  const specs = makeTableSpecs({
+    label: [['id'], ['name']],
+  });
+
+  const inputAST = ast(
+    newQuery(schema, 'issue').whereExists(
+      'labels',
+      q => q.where('name', 'foo'),
+      {scalar: true, flip: true},
+    ),
+  );
+
+  const {ast: resolved, companions} = resolveSimpleScalarSubqueries(
+    inputAST,
+    specs,
+    () => 'label-foo-id',
+  );
+
+  // The inner scalar subquery is resolved to a literal condition,
+  // and the outer EXISTS with flip: true is preserved.
+  expect(resolved.where).toMatchObject({
+    type: 'correlatedSubquery',
+    op: 'EXISTS',
+    flip: true,
+    related: {
+      system: 'client',
+      correlation: {
+        parentField: ['id'],
+        childField: ['issueId'],
+      },
+      subquery: {
+        table: 'issueLabel',
+        alias: 'zsubq_labels',
+        where: {
+          type: 'simple',
+          op: '=',
+          left: {type: 'column', name: 'labelId'},
+          right: {type: 'literal', value: 'label-foo-id'},
+        },
+      },
+    },
+  });
+  expect(companions).toHaveLength(1);
+  expect(companions[0].ast.table).toBe('label');
+  expect(companions[0].childField).toBe('id');
+  expect(companions[0].resolvedValue).toBe('label-foo-id');
 });
 
 test('resolves scalar subqueries inside AND of correlatedSubquery conditions', () => {

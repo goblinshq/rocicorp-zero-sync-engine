@@ -6,34 +6,74 @@ on:
     paths:
       - 'packages/replicache/**'
 
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  bundle-size:
-    name: Bundle Sizes Check
+  measure:
+    name: Measure bundle sizes
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22.x
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run --workspace=replicache build-bundle-sizes
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.11.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+
+        with:
+          node-version: 24.x
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter replicache run build-bundle-sizes
       - run: brotli packages/replicache/out/*
 
       # Builds bundles then measures bundles sizes and stores them to a file
       - name: Measure bundles
-        run: npx tsx tool/bundle-sizes.ts --bundles replicache.mjs replicache.mjs.br replicache.min.mjs replicache.min.mjs.br | tee bundle-sizes.json
+        run: node tool/bundle-sizes.ts --bundles replicache.mjs replicache.mjs.br replicache.min.mjs replicache.min.mjs.br | tee bundle-sizes.json
         working-directory: packages/replicache
+
+      - name: Upload bundle size output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-size-output
+          path: packages/replicache/bundle-sizes.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish bundle sizes
+    needs: measure
+    permissions:
+      contents: write # Required by github-action-benchmark to push gh-pages data.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download bundle size output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bundle-size-output
+          path: packages/replicache
 
       # Run `github-action-benchmark` action
       - name: Store bundle size
-        uses: rhysd/github-action-benchmark@v1
+        uses: rhysd/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           name: 'Bundle Sizes'
           tool: 'customSmallerIsBetter'
           output-file-path: packages/replicache/bundle-sizes.json
           fail-on-alert: true
-          github-token: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
+          github-token: ${{ github.token }}
           benchmark-data-dir-path: bundle-sizes
           auto-push: true
           alert-threshold: '105%'

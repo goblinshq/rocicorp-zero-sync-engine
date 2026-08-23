@@ -52,6 +52,12 @@ export const schema = createSchema({
         d: number(),
       })
       .primaryKey('ts'),
+    table('arrayCases')
+      .columns({
+        id: string(),
+        tags: json<string[]>().optional(),
+      })
+      .primaryKey('id'),
     table('jsonCases')
       .columns({
         ...jsonCols,
@@ -86,13 +92,23 @@ export const schema = createSchema({
         c: boolean().optional(),
       })
       .primaryKey('id'),
+    table('textRepresentedScalars')
+      .columns({
+        id: string(),
+        ip: string(),
+        mac: string(),
+        title: string(),
+      })
+      .primaryKey('id'),
   ],
   relationships: [],
   enableLegacyMutators: true,
   enableLegacyQueries: true,
 });
 
-export const schemaSql = `CREATE TABLE basic (
+export const schemaSql = `CREATE EXTENSION IF NOT EXISTS isn;
+
+CREATE TABLE basic (
   id TEXT PRIMARY KEY,
   a INTEGER,
   b TEXT,
@@ -120,6 +136,11 @@ CREATE TABLE "dateTypes" (
   "tswotz" TIMESTAMP WITHOUT TIME ZONE,
   "d" DATE,
   PRIMARY KEY ("ts")
+);
+
+CREATE TABLE "arrayCases" (
+  "id" TEXT PRIMARY KEY,
+  "tags" TEXT[]
 );
 
 CREATE TABLE "jsonbCases" (
@@ -168,6 +189,13 @@ CREATE TABLE alternate_schema.basic (
   a INTEGER,
   b TEXT,
   C BOOLEAN
+);
+
+CREATE TABLE "textRepresentedScalars" (
+  "id" ISBN13 PRIMARY KEY,
+  "ip" INET NOT NULL,
+  "mac" MACADDR NOT NULL,
+  "title" TEXT NOT NULL
 );
 `;
 

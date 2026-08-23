@@ -1,21 +1,29 @@
 import {Subscription} from '../../types/subscription.ts';
 import {PROTOCOL_VERSION, type Downstream} from './change-streamer.ts';
-import {Subscriber} from './subscriber.ts';
+import {Subscriber, type SubscriberOptions} from './subscriber.ts';
 
 let nextID = 1;
 
 export function createSubscriber(
   watermark = '00',
   caughtUp = false,
-): [Subscriber, Downstream[], Subscription<Downstream>] {
+  options: SubscriberOptions = {},
+): [Subscriber, Downstream[], Subscription<string>] {
   const id = '' + nextID++;
   const received: Downstream[] = [];
-  const sub = Subscription.create<Downstream>({
-    cleanup: unconsumed => received.push(...unconsumed),
+  const sub = Subscription.create<string>({
+    cleanup: unconsumed => received.push(...unconsumed.map(m => JSON.parse(m))),
   });
-  const subscriber = new Subscriber(PROTOCOL_VERSION, id, watermark, sub);
+  const subscriber = new Subscriber(
+    PROTOCOL_VERSION,
+    id,
+    watermark,
+    sub,
+    () => ({tag: 'status'}),
+    options,
+  );
   if (caughtUp) {
-    subscriber.setCaughtUp();
+    void subscriber.setCaughtUp();
   }
 
   return [subscriber, received, sub];

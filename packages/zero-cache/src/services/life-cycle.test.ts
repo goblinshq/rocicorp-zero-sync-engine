@@ -1,14 +1,40 @@
-import {resolver} from '@rocicorp/resolver';
 import EventEmitter from 'node:events';
-import {beforeEach, describe, expect, test} from 'vitest';
+import {LogContext} from '@rocicorp/logger';
+import {resolver} from '@rocicorp/resolver';
+import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
 import {promiseVoid} from '../../../shared/src/resolved-promises.ts';
+import type * as Metrics from '../observability/metrics.ts';
+
+const startupRecordMs = vi.hoisted(() => vi.fn());
+const workerStartupRecordMs = vi.hoisted(() => vi.fn());
+const logLastChanceSQLiteCorruptionDiagnostics = vi.hoisted(() => vi.fn());
+
+vi.mock('../db/sqlite-corruption.ts', () => ({
+  logLastChanceSQLiteCorruptionDiagnostics,
+}));
+
+vi.mock('../observability/metrics.ts', async importOriginal => {
+  const actual = await importOriginal<typeof Metrics>();
+  return {
+    ...actual,
+    getOrCreateHistogram: vi.fn((_category, name) => ({
+      recordMs:
+        name === 'startup_duration' ? startupRecordMs : workerStartupRecordMs,
+    })),
+  };
+});
+
 import {
+  exitAfter,
+  INTENTIONAL_SHUTDOWN_ERROR_CODE,
   ProcessManager,
+  recordStartupDurationMs,
   runUntilKilled,
   type WorkerType,
 } from '../services/life-cycle.ts';
 import type {SingletonService} from '../services/service.ts';
+import {ConfigurationError} from '../types/configuration-error.ts';
 import {inProcChannel} from '../types/processes.ts';
 
 describe('shutdown', () => {
@@ -67,6 +93,9 @@ describe('shutdown', () => {
   }
 
   beforeEach(async () => {
+    startupRecordMs.mockReset();
+    workerStartupRecordMs.mockReset();
+
     // For testing process.exit()
     process.env['SINGLE_PROCESS'] = '1';
 
@@ -82,6 +111,28 @@ describe('shutdown', () => {
 
     await Promise.all(all.map(w => w.running.promise));
   });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test.each([
+    ['SIGTERM', 0],
+    ['SIGINT', 0],
+    ['SIGQUIT', INTENTIONAL_SHUTDOWN_ERROR_CODE],
+    ['SIGABRT', -1],
+  ])(
+    'shutdown before workers started: %s',
+    async (signal, expectedExitCode) => {
+      const {promise: exitCode, resolve} = resolver<number>();
+      proc = new EventEmitter();
+      proc.on('exit', resolve);
+
+      new ProcessManager(lc, proc);
+      proc.emit(signal);
+      expect(await exitCode).toBe(expectedExitCode);
+    },
+  );
 
   test.each([['SIGTERM'], ['SIGINT']])(
     'graceful shutdown: %s',
@@ -188,6 +239,16 @@ describe('shutdown', () => {
       ],
     ],
     [
+      'SIGABRT',
+      () => proc.emit('SIGABRT'),
+      [
+        'stop supporting',
+        'stop supporting',
+        'stop user-facing',
+        'stop user-facing',
+      ],
+    ],
+    [
       'supporting worker exits',
       () => replicator.stop(),
       [
@@ -218,7 +279,7 @@ describe('shutdown', () => {
       ['stop supporting', 'stop supporting', 'stop user-facing'],
     ],
   ])('forceful shutdown: %s', async (_name, fn, expectedEvents) => {
-    void fn();
+    fn();
 
     await Promise.allSettled(all.map(w => w.stopped.promise));
 
@@ -226,28 +287,105 @@ describe('shutdown', () => {
     expect(events.sort()).toEqual(expectedEvents.sort());
   });
 
-  test('graceful shutdown with no user-facing workers', async () => {
-    proc = new EventEmitter();
-    processes = new ProcessManager(lc, proc);
-    const changeStreamer = startWorker('cs', 'supporting');
-    const replicator = startWorker('rep', 'supporting');
-    const all = [changeStreamer, replicator];
+  test('exits nonzero when the final worker stops before drain', async () => {
+    const testProc = new EventEmitter();
+    const {promise: exitCode, resolve} = resolver<number>();
+    testProc.on('exit', resolve);
+    const manager = new ProcessManager(lc, testProc);
+    const [worker] = inProcChannel();
+    manager.addWorker(worker, 'user-facing', 'zero-cache');
 
-    await Promise.all(all.map(w => w.running.promise));
+    worker.emit('close', 0, null);
 
-    void changeStreamer.stop();
+    expect(await exitCode).toBe(-1);
+  });
 
-    await replicator.draining.promise;
+  test('records worker startup duration when a worker is ready', () => {
+    const [parentPort, childPort] = inProcChannel();
+    processes.addWorker(parentPort, 'supporting', 'replicator.ts (backup)');
 
-    replicator.finishDrain.resolve();
+    childPort.send(['ready', {ready: true}]);
 
-    await replicator.stopped.promise;
+    expect(workerStartupRecordMs).toHaveBeenCalledWith(expect.any(Number), {
+      worker: 'backup_replicator',
+      type: 'supporting',
+    });
+  });
 
-    lc.debug?.('expecting');
-    expect(events).toEqual([
-      'stop supporting',
-      'drain supporting',
-      'stop supporting',
-    ]);
+  test('does not record zero-cache as a worker startup duration', () => {
+    const [parentPort, childPort] = inProcChannel();
+    processes.addWorker(parentPort, 'user-facing', 'zero-cache');
+
+    childPort.send(['ready', {ready: true}]);
+
+    expect(startupRecordMs).not.toHaveBeenCalled();
+    expect(workerStartupRecordMs).not.toHaveBeenCalled();
+  });
+
+  test('records top-level startup duration explicitly', () => {
+    recordStartupDurationMs(123);
+
+    expect(startupRecordMs).toHaveBeenCalledWith(123, {
+      component: 'dispatcher',
+    });
+  });
+});
+
+describe('exitAfter', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    logLastChanceSQLiteCorruptionDiagnostics.mockReset();
+  });
+
+  test('exits 0 for configuration errors', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => {
+      throw Object.assign(new Error('process.exit'), {code});
+    });
+
+    await expect(
+      exitAfter(createSilentLogContext(), () => {
+        throw new ConfigurationError('bad config');
+      }),
+    ).rejects.toMatchObject({code: 0});
+
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  test('logs corruption diagnostics and flushes before a fatal exit', async () => {
+    const initialLC = createSilentLogContext();
+    const flushDone = resolver();
+    const flush = vi.fn(() => flushDone.promise);
+    const activeLC = new LogContext('debug', undefined, {
+      flush,
+      log: vi.fn(),
+    });
+    const error = Object.assign(new Error('database disk image is malformed'), {
+      code: 'SQLITE_CORRUPT',
+    });
+    let lc = initialLC;
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => {
+      throw Object.assign(new Error('process.exit'), {code});
+    });
+
+    const exiting = exitAfter(
+      () => lc,
+      () => {
+        lc = activeLC;
+        return Promise.reject(error);
+      },
+    );
+
+    await Promise.resolve();
+
+    expect(logLastChanceSQLiteCorruptionDiagnostics).toHaveBeenCalledWith(
+      activeLC,
+      error,
+    );
+    expect(flush).toHaveBeenCalledTimes(1);
+    expect(exit).not.toHaveBeenCalled();
+
+    flushDone.resolve();
+    await expect(exiting).rejects.toMatchObject({code: -1});
+    expect(exit).toHaveBeenCalledWith(-1);
   });
 });

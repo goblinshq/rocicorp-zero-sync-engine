@@ -59,11 +59,15 @@ export type ZeroProviderProps<
   MD extends CustomMutatorDefs | undefined = undefined,
   Context extends BaseDefaultContext = DefaultContext,
 > = (ZeroOptions<S, MD, Context> | {zero: Zero<S, MD, Context>}) & {
+  /**
+   * Called after ZeroProvider constructs a new Zero instance.
+   *
+   * This runs only when the provider creates Zero from options, and is not
+   * called when an existing instance is passed with `zero`.
+   */
   init?: (zero: Zero<S, MD, Context>) => void;
   children: ReactNode;
 };
-
-const NO_AUTH_SET = Symbol();
 
 export function ZeroProvider<
   S extends BaseDefaultSchema = DefaultSchema,
@@ -75,9 +79,20 @@ export function ZeroProvider<
   const [zero, setZero] = useState<Zero<S, MD, Context> | undefined>(
     isExternalZero ? props.zero : undefined,
   );
+  const [rotationGeneration, setRotationGeneration] = useState(0);
 
-  const auth = 'auth' in props ? props.auth : NO_AUTH_SET;
+  const auth = 'auth' in props ? props.auth : undefined;
+  const hasAuth = typeof auth === 'string';
   const prevAuthRef = useRef<typeof auth>(auth);
+  const rotationPendingRef = useRef(false);
+
+  const scheduleRotation = () => {
+    if (rotationPendingRef.current) {
+      return;
+    }
+    rotationPendingRef.current = true;
+    setRotationGeneration(gen => gen + 1);
+  };
 
   const keysWithoutAuth = useMemo(
     () =>
@@ -95,13 +110,34 @@ export function ZeroProvider<
   // component.
   useEffect(() => {
     if (isExternalZero) {
+      rotationPendingRef.current = false;
       setZero(props.zero);
       return;
     }
 
-    const z = new Zero(props);
+    const z = new Zero({
+      ...props,
+      onClientStateNotFound: () => {
+        if (rotationPendingRef.current) {
+          return;
+        }
+
+        if (props.onClientStateNotFound) {
+          try {
+            props.onClientStateNotFound();
+            return;
+          } catch {
+            // rotate since zero client is now closed
+          }
+        }
+
+        scheduleRotation();
+      },
+    });
+    prevAuthRef.current = auth;
     init?.(z);
     setZero(z);
+    rotationPendingRef.current = false;
 
     return () => {
       void z.close();
@@ -109,18 +145,20 @@ export function ZeroProvider<
     };
     // we intentionally don't include auth in the dependency array
     // to avoid closing zero when auth changes
-  }, [init, ...keysWithoutAuth]);
+  }, [hasAuth, init, rotationGeneration, ...keysWithoutAuth]);
 
   useEffect(() => {
     if (!zero || isExternalZero) return;
 
-    const authChanged = auth !== prevAuthRef.current;
+    const prevAuth = prevAuthRef.current;
+    const authChanged = auth !== prevAuth;
 
     if (authChanged) {
       prevAuthRef.current = auth;
-      void zero.connection.connect({
-        auth: auth === NO_AUTH_SET ? undefined : auth,
-      });
+
+      if (typeof prevAuth === 'string' && typeof auth === 'string') {
+        void zero.connection.connect({auth});
+      }
     }
   }, [auth, zero]);
 

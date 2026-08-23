@@ -36,6 +36,14 @@ export class Database implements Disposable {
       this.#db = new SQLite3Database(path, options);
       this.#threshold = slowQueryThreshold;
 
+      // Match Postgres LIKE/ILIKE semantics. Postgres LIKE is case-sensitive,
+      // but SQLite's LIKE operator is case-insensitive by default; enable
+      // case-sensitive LIKE so the bare operator matches Postgres. Case-
+      // insensitive ILIKE is handled in query-builder.ts by lower()-ing both
+      // operands (using the Unicode-aware lower() that @rocicorp/zero-sqlite3
+      // provides via ICU).
+      this.pragma('case_sensitive_like = ON');
+
       const [{page_size: pageSize}] = this.pragma<{page_size: number}>(
         'page_size',
       );
@@ -137,14 +145,16 @@ export class Database implements Disposable {
 
   close(): void {
     const start = Date.now();
-    try {
-      this.#db.pragma('optimize');
-      const elapsed = Date.now() - start;
-      if (elapsed > 2) {
-        this.#lc.debug?.(`PRAGMA optimized (${elapsed} ms)`);
+    if (!this.#db.readonly) {
+      try {
+        this.#db.pragma('optimize');
+        const elapsed = Date.now() - start;
+        if (elapsed > 2) {
+          this.#lc.debug?.(`PRAGMA optimized (${elapsed} ms)`);
+        }
+      } catch (e) {
+        this.#lc.warn?.('error running PRAGMA optimize', e);
       }
-    } catch (e) {
-      this.#lc.warn?.('error running PRAGMA optimize', e);
     }
     this.#db.close();
   }

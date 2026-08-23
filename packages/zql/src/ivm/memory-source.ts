@@ -1,7 +1,8 @@
 import {assert, unreachable} from '../../../shared/src/asserts.ts';
 import {BTreeSet} from '../../../shared/src/btree-set.ts';
 import {hasOwn} from '../../../shared/src/has-own.ts';
-import {once} from '../../../shared/src/iterables.ts';
+import {once, toSorted} from '../../../shared/src/iterables.ts';
+import {must} from '../../../shared/src/must.ts';
 import type {
   Condition,
   Ordering,
@@ -17,7 +18,9 @@ import {
   type NoSubqueryCondition,
 } from '../builder/filter.ts';
 import {assertOrderingIncludesPK} from '../query/complete-ordering.ts';
+import {ChangeType} from './change-type.ts';
 import type {Change} from './change.ts';
+import {makeAddChange, makeEditChange, makeRemoveChange} from './change.ts';
 import {
   constraintMatchesPrimaryKey,
   constraintMatchesRow,
@@ -36,10 +39,12 @@ import {
   skipYields,
   type FetchRequest,
   type Input,
+  type MultiConstraint,
   type Output,
   type Start,
 } from './operator.ts';
 import type {SourceSchema} from './schema.ts';
+import {SourceChangeIndex} from './source-change-index.ts';
 import type {
   Source,
   SourceChange,
@@ -48,6 +53,7 @@ import type {
   SourceChangeRemove,
   SourceInput,
 } from './source.ts';
+import {makeSourceChangeAdd, makeSourceChangeRemove} from './source.ts';
 import type {Stream} from './stream.ts';
 
 export type Overlay = {
@@ -69,7 +75,7 @@ type Index = {
 export type Connection = {
   input: Input;
   output: Output | undefined;
-  sort: Ordering;
+  sort?: Ordering | undefined;
   splitEditKeys: Set<string> | undefined;
   compareRows: Comparator;
   filters:
@@ -140,12 +146,12 @@ export class MemorySource implements Source {
     return this.#getPrimaryIndex().data;
   }
 
-  #getSchema(connection: Connection): SourceSchema {
+  #getSchema(connection: Connection, unordered: boolean): SourceSchema {
     return {
       tableName: this.#tableName,
       columns: this.#columns,
       primaryKey: this.#primaryKey,
-      sort: connection.sort,
+      sort: unordered ? undefined : connection.sort,
       system: 'client',
       relationships: {},
       isHidden: false,
@@ -154,11 +160,13 @@ export class MemorySource implements Source {
   }
 
   connect(
-    sort: Ordering,
+    sort: Ordering | undefined,
     filters?: Condition,
     splitEditKeys?: Set<string>,
   ): SourceInput {
     const transformedFilters = transformFilters(filters);
+    const unordered = sort === undefined;
+    const internalSort = sort ?? this.#primaryIndexSort;
 
     const input: SourceInput = {
       getSchema: () => schema,
@@ -175,9 +183,9 @@ export class MemorySource implements Source {
     const connection: Connection = {
       input,
       output: undefined,
-      sort,
+      sort: internalSort,
       splitEditKeys,
-      compareRows: makeComparator(sort),
+      compareRows: makeComparator(internalSort),
       filters: transformedFilters.filters
         ? {
             condition: transformedFilters.filters,
@@ -186,8 +194,10 @@ export class MemorySource implements Source {
         : undefined,
       lastPushedEpoch: 0,
     };
-    const schema = this.#getSchema(connection);
-    assertOrderingIncludesPK(sort, this.#primaryKey);
+    const schema = this.#getSchema(connection, unordered);
+    if (!unordered) {
+      assertOrderingIncludesPK(internalSort, this.#primaryKey);
+    }
     this.#connections.push(connection);
     return input;
   }
@@ -231,13 +241,8 @@ export class MemorySource implements Source {
     // a different library.)
     // 3. We could even theoretically do (2) on multiple threads and then merge the
     // results!
-    const data = new BTreeSet<Row>(comparator);
-
-    // I checked, there's no special path for adding data in bulk faster.
-    // The constructor takes an array, but it just calls add/set over and over.
-    for (const row of this.#getPrimaryIndex().data) {
-      data.add(row);
-    }
+    const rows = toSorted(this.#getPrimaryIndex().data, comparator);
+    const data = BTreeSet.fromSorted(comparator, rows);
 
     const newIndex = {comparator, data, usedBy: new Set([usedBy])};
     this.#indexes.set(key, newIndex);
@@ -250,9 +255,25 @@ export class MemorySource implements Source {
   }
 
   *#fetch(req: FetchRequest, conn: Connection): Stream<Node | 'yield'> {
-    const {sort: requestedSort, compareRows} = conn;
-    const connectionComparator = (r1: Row, r2: Row) =>
-      compareRows(r1, r2) * (req.reverse ? -1 : 1);
+    // multiConstraints is handled by driving sub-fetches off the first
+    // entry's values and post-filtering matches against any remaining
+    // entries. TableSource implements multi-IN natively via SQL `AND` of
+    // `IN` clauses; the in-memory path is correct but not specially
+    // optimized — it pays the index-seek cost per primary value, then
+    // walks each result against the rest.
+    if (
+      req.multiConstraints &&
+      req.multiConstraints.some(mc => mc.length > 0)
+    ) {
+      yield* this.#fetchMulti(req, conn);
+      return;
+    }
+    const requestedSort = must(conn.sort);
+    const {compareRows} = conn;
+    // Avoid allocating a new closure when not reversing (the common case).
+    const connectionComparator: Comparator = req.reverse
+      ? (r1, r2) => compareRows(r2, r1)
+      : compareRows;
 
     const pkConstraint = primaryKeyConstraintFromFilters(
       conn.filters?.condition,
@@ -283,8 +304,10 @@ export class MemorySource implements Source {
 
     const index = this.#getOrCreateIndex(indexSort, conn);
     const {data, comparator: compare} = index;
-    const indexComparator = (r1: Row, r2: Row) =>
-      compare(r1, r2) * (req.reverse ? -1 : 1);
+    // Avoid allocating a new closure when not reversing (the common case).
+    const indexComparator: Comparator = req.reverse
+      ? (r1, r2) => compare(r2, r1)
+      : compare;
 
     const startAt = req.start?.row;
 
@@ -318,6 +341,29 @@ export class MemorySource implements Source {
     }
 
     const rowsIterable = generateRows(data, scanStart, req.reverse);
+
+    // Fast path: no overlay to apply, no `start`, and no connection filters.
+    // This is the common shape for join child-lookups, plain scans, and source
+    // fetches that sit beneath a downstream `Filter` operator. In that case the
+    // whole generator stack (generateWithOverlay → generateWithStart →
+    // skipYields → generateWithConstraint) reduces to: walk rows from
+    // `scanStart`, wrap each as a Node, and stop once the constraint no longer
+    // matches (rows are sorted by the constraint key first, so matches are
+    // contiguous). Collapsing the five chained generators into one loop removes
+    // a large amount of per-row generator-resume overhead on the hottest path.
+    const overlayActive =
+      this.#overlay && conn.lastPushedEpoch >= this.#overlay.epoch;
+    if (!overlayActive && !req.start && !conn.filters) {
+      const {constraint} = req;
+      for (const row of rowsIterable) {
+        if (constraint && !constraintMatchesRow(constraint, row)) {
+          break;
+        }
+        yield {row, relationships: {}};
+      }
+      return;
+    }
+
     const withOverlay = generateWithOverlay(
       startAt,
       pkConstraint ? once(rowsIterable) : rowsIterable,
@@ -337,6 +383,15 @@ export class MemorySource implements Source {
       // not yet yielded add overlay will be yielded when the first row
       // not matching the constraint is reached.
       indexComparator,
+      // `startAt` is `req.start.row`, a bound in the connection's sort order,
+      // so it must be compared in that order -- not `indexComparator`, which
+      // with a constraint leads with the constraint keys. The two agree only
+      // when the overlay row and `startAt` share those key values; they do not
+      // for `#fetchMulti`'s per-value sub-fetches, which pin one primary key
+      // while still carrying the caller's connection-sort `start`. Comparing
+      // there by the constraint key dropped the in-flight overlay and served
+      // pre-push data. Same distinction #4926 drew for `generateWithStart`.
+      connectionComparator,
       conn.filters?.predicate,
     );
 
@@ -352,6 +407,65 @@ export class MemorySource implements Source {
     yield* conn.filters
       ? generateWithFilter(withConstraint, conn.filters.predicate)
       : withConstraint;
+  }
+
+  *#fetchMulti(req: FetchRequest, conn: Connection): Stream<Node | 'yield'> {
+    // Caller (`#fetch`) guards entry on `req.multiConstraints.some(mc =>
+    // mc.length > 0)`, so `multis` is guaranteed non-empty after the
+    // empty-entry filter. Per the MultiConstraint contract (operator.ts),
+    // entries are non-empty, share key shape, are unique, and are
+    // key-compatible with `req.constraint`.
+    const multis = must(req.multiConstraints).filter(mc => mc.length > 0);
+    const primary = multis[0];
+    const rest = multis.slice(1);
+    const baseConstraint = req.constraint;
+
+    // Drive sub-fetches off `primary`. Within each sub-fetch the source
+    // can use its index for `primary`; we then post-filter rows by
+    // checking they also match every entry in `rest`. Per the
+    // MultiConstraint contract (see operator.ts), entries are unique and
+    // key-compatible with `baseConstraint`, so we don't dedupe or check
+    // compatibility here.
+    const subStreams: Stream<Node | 'yield'>[] = primary.map(c => {
+      const merged: Constraint = baseConstraint ? {...baseConstraint, ...c} : c;
+      return this.#fetch(
+        {...req, constraint: merged, multiConstraints: undefined},
+        conn,
+      );
+    });
+    const merged = mergeSortedStreams(
+      subStreams,
+      req.reverse
+        ? (a, b) => conn.compareRows(b.row, a.row)
+        : (a, b) => conn.compareRows(a.row, b.row),
+    );
+
+    if (rest.length === 0) {
+      yield* merged;
+      return;
+    }
+
+    for (const node of merged) {
+      if (node === 'yield') {
+        yield 'yield';
+        continue;
+      }
+      let matchesAll = true;
+      for (const mc of rest) {
+        let any = false;
+        for (const c of mc) {
+          if (constraintMatchesRow(c, node.row)) {
+            any = true;
+            break;
+          }
+        }
+        if (!any) {
+          matchesAll = false;
+          break;
+        }
+      }
+      if (matchesAll) yield node;
+    }
   }
 
   *push(change: SourceChange): Stream<'yield'> {
@@ -380,9 +494,9 @@ export class MemorySource implements Source {
 
   #writeChange(change: SourceChange) {
     for (const {data} of this.#indexes.values()) {
-      switch (change.type) {
-        case 'add': {
-          const added = data.add(change.row);
+      switch (change[SourceChangeIndex.TYPE]) {
+        case ChangeType.ADD: {
+          const added = data.add(change[SourceChangeIndex.ROW]);
           // must succeed since we checked has() above.
           assert(
             added,
@@ -390,8 +504,8 @@ export class MemorySource implements Source {
           );
           break;
         }
-        case 'remove': {
-          const removed = data.delete(change.row);
+        case ChangeType.REMOVE: {
+          const removed = data.delete(change[SourceChangeIndex.ROW]);
           // must succeed since we checked has() above.
           assert(
             removed,
@@ -399,18 +513,18 @@ export class MemorySource implements Source {
           );
           break;
         }
-        case 'edit': {
+        case ChangeType.EDIT: {
           // TODO: We could see if the PK (form the index tree's perspective)
           // changed and if not we could use set.
           // We cannot just do `set` with the new value since the `oldRow` might
           // not map to the same entry as the new `row` in the index btree.
-          const removed = data.delete(change.oldRow);
+          const removed = data.delete(change[SourceChangeIndex.OLD_ROW]);
           // must succeed since we checked has() above.
           assert(
             removed,
             'MemorySource: edit remove must succeed since row existence was already checked',
           );
-          data.add(change.row);
+          data.add(change[SourceChangeIndex.ROW]);
           break;
         }
         default:
@@ -449,11 +563,16 @@ export function* genPushAndWriteWithSplitEdit(
   getNextEpoch: () => number,
 ) {
   let shouldSplitEdit = false;
-  if (change.type === 'edit') {
+  if (change[SourceChangeIndex.TYPE] === ChangeType.EDIT) {
     for (const {splitEditKeys} of connections) {
       if (splitEditKeys) {
         for (const key of splitEditKeys) {
-          if (!valuesEqual(change.row[key], change.oldRow[key])) {
+          if (
+            !valuesEqual(
+              change[SourceChangeIndex.ROW][key],
+              change[SourceChangeIndex.OLD_ROW][key],
+            )
+          ) {
             shouldSplitEdit = true;
             break;
           }
@@ -462,13 +581,10 @@ export function* genPushAndWriteWithSplitEdit(
     }
   }
 
-  if (change.type === 'edit' && shouldSplitEdit) {
+  if (change[SourceChangeIndex.TYPE] === ChangeType.EDIT && shouldSplitEdit) {
     yield* genPushAndWrite(
       connections,
-      {
-        type: 'remove',
-        row: change.oldRow,
-      },
+      makeSourceChangeRemove(change[SourceChangeIndex.OLD_ROW]),
       exists,
       setOverlay,
       writeChange,
@@ -476,10 +592,7 @@ export function* genPushAndWriteWithSplitEdit(
     );
     yield* genPushAndWrite(
       connections,
-      {
-        type: 'add',
-        row: change.row,
-      },
+      makeSourceChangeAdd(change[SourceChangeIndex.ROW]),
       exists,
       setOverlay,
       writeChange,
@@ -518,18 +631,24 @@ function* genPush(
   setOverlay: (o: Overlay | undefined) => void,
   pushEpoch: number,
 ) {
-  switch (change.type) {
-    case 'add':
+  switch (change[SourceChangeIndex.TYPE]) {
+    case ChangeType.ADD:
       assert(
-        !exists(change.row),
+        !exists(change[SourceChangeIndex.ROW]),
         () => `Row already exists ${stringify(change)}`,
       );
       break;
-    case 'remove':
-      assert(exists(change.row), () => `Row not found ${stringify(change)}`);
+    case ChangeType.REMOVE:
+      assert(
+        exists(change[SourceChangeIndex.ROW]),
+        () => `Row not found ${stringify(change)}`,
+      );
       break;
-    case 'edit':
-      assert(exists(change.oldRow), () => `Row not found ${stringify(change)}`);
+    case ChangeType.EDIT:
+      assert(
+        exists(change[SourceChangeIndex.OLD_ROW]),
+        () => `Row not found ${stringify(change)}`,
+      );
       break;
     default:
       unreachable(change);
@@ -541,25 +660,20 @@ function* genPush(
       conn.lastPushedEpoch = pushEpoch;
       setOverlay({epoch: pushEpoch, change});
       const outputChange: Change =
-        change.type === 'edit'
-          ? {
-              type: change.type,
-              oldNode: {
-                row: change.oldRow,
+        change[SourceChangeIndex.TYPE] === ChangeType.EDIT
+          ? makeEditChange(
+              {row: change[SourceChangeIndex.ROW], relationships: {}},
+              {row: change[SourceChangeIndex.OLD_ROW], relationships: {}},
+            )
+          : change[SourceChangeIndex.TYPE] === ChangeType.ADD
+            ? makeAddChange({
+                row: change[SourceChangeIndex.ROW],
                 relationships: {},
-              },
-              node: {
-                row: change.row,
+              })
+            : makeRemoveChange({
+                row: change[SourceChangeIndex.ROW],
                 relationships: {},
-              },
-            }
-          : {
-              type: change.type,
-              node: {
-                row: change.row,
-                relationships: {},
-              },
-            };
+              });
       yield* filterPush(outputChange, output, input, filters?.predicate);
       yield undefined;
     }
@@ -610,7 +724,15 @@ export function* generateWithStart(
  * @param constraint - constraint that was applied to the rowIterator and should
  * also be applied to the overlay.
  * @param overlay - the overlay values to splice in
- * @param compare - the comparator to use to find the position for the overlay
+ * @param compare - the comparator to use to find the position for the overlay.
+ * Must order rows the same way `rows` is ordered. For `MemorySource` that is
+ * *index* order, which leads with the constraint keys.
+ * @param startAtCompare - the comparator for `startAt`, which is a bound in the
+ * *connection's* sort order. Only the same as `compare` when the stream's order
+ * happens to be the connection's -- true for `TableSource` (SQL does the
+ * ordering) but not for a constrained `MemorySource` fetch. Conflating the two
+ * is what #4926 fixed for `generateWithStart`; this parameter is the same
+ * distinction for the overlay's own `startAt` pruning.
  */
 export function* generateWithOverlay(
   startAt: Row | undefined,
@@ -619,7 +741,9 @@ export function* generateWithOverlay(
   overlay: Overlay | undefined,
   lastPushedEpoch: number,
   compare: Comparator,
+  startAtCompare: Comparator,
   filterPredicate?: (row: Row) => boolean | undefined,
+  multiConstraints?: readonly MultiConstraint[] | undefined,
 ) {
   let overlayToApply: Overlay | undefined = undefined;
   if (overlay && lastPushedEpoch >= overlay.epoch) {
@@ -629,8 +753,9 @@ export function* generateWithOverlay(
     startAt,
     constraint,
     overlayToApply,
-    compare,
+    startAtCompare,
     filterPredicate,
+    multiConstraints,
   );
   yield* generateWithOverlayInner(rows, overlays, compare);
 }
@@ -639,47 +764,84 @@ function computeOverlays(
   startAt: Row | undefined,
   constraint: Constraint | undefined,
   overlay: Overlay | undefined,
-  compare: Comparator,
+  // Only ever used for `overlaysForStartAt`, so this is the *connection*-order
+  // comparator, not the one used to splice the overlay into the row stream.
+  startAtCompare: Comparator,
   filterPredicate?: (row: Row) => boolean | undefined,
+  multiConstraints?: readonly MultiConstraint[] | undefined,
 ): Overlays {
   let overlays: Overlays = {
     add: undefined,
     remove: undefined,
   };
-  switch (overlay?.change.type) {
-    case 'add':
+  switch (overlay?.change[SourceChangeIndex.TYPE]) {
+    case ChangeType.ADD:
       overlays = {
-        add: overlay.change.row,
+        add: overlay.change[SourceChangeIndex.ROW],
         remove: undefined,
       };
       break;
-    case 'remove':
+    case ChangeType.REMOVE:
       overlays = {
         add: undefined,
-        remove: overlay.change.row,
+        remove: overlay.change[SourceChangeIndex.ROW],
       };
       break;
-    case 'edit':
+    case ChangeType.EDIT:
       overlays = {
-        add: overlay.change.row,
-        remove: overlay.change.oldRow,
+        add: overlay.change[SourceChangeIndex.ROW],
+        remove: overlay.change[SourceChangeIndex.OLD_ROW],
       };
       break;
   }
 
   if (startAt) {
-    overlays = overlaysForStartAt(overlays, startAt, compare);
+    overlays = overlaysForStartAt(overlays, startAt, startAtCompare);
   }
 
   if (constraint) {
     overlays = overlaysForConstraint(overlays, constraint);
   }
 
+  overlays = applyMultiConstraintsToOverlays(overlays, multiConstraints);
+
   if (filterPredicate) {
     overlays = overlaysForFilterPredicate(overlays, filterPredicate);
   }
 
   return overlays;
+}
+
+function applyMultiConstraintsToOverlays(
+  overlays: Overlays,
+  multiConstraints: readonly MultiConstraint[] | undefined,
+): Overlays {
+  if (!multiConstraints) return overlays;
+  for (const mc of multiConstraints) {
+    if (mc.length > 0) {
+      overlays = overlaysForMultiConstraint(overlays, mc);
+    }
+  }
+  return overlays;
+}
+
+export {overlaysForMultiConstraint as overlaysForMultiConstraintForTest};
+
+function overlaysForMultiConstraint(
+  {add, remove}: Overlays,
+  multiConstraint: MultiConstraint,
+): Overlays {
+  const matchesAny = (row: Row | undefined) => {
+    if (row === undefined) return false;
+    for (const c of multiConstraint) {
+      if (constraintMatchesRow(c, row)) return true;
+    }
+    return false;
+  };
+  return {
+    add: matchesAny(add) ? add : undefined,
+    remove: matchesAny(remove) ? remove : undefined,
+  };
 }
 
 export {overlaysForStartAt as overlaysForStartAtForTest};
@@ -759,6 +921,88 @@ export function* generateWithOverlayInner(
 }
 
 /**
+ * Like {@link generateWithOverlay} but for unordered streams.
+ * No `startAt` or comparator needed. Injects remove/old-edit rows eagerly
+ * at the start, and suppresses add/new-edit rows inline by PK match.
+ */
+export function* generateWithOverlayUnordered(
+  rows: Iterable<Row>,
+  constraint: Constraint | undefined,
+  overlay: Overlay | undefined,
+  lastPushedEpoch: number,
+  primaryKey: PrimaryKey,
+  filterPredicate?: (row: Row) => boolean,
+  multiConstraints?: readonly MultiConstraint[] | undefined,
+) {
+  let overlayToApply: Overlay | undefined = undefined;
+  if (overlay && lastPushedEpoch >= overlay.epoch) {
+    overlayToApply = overlay;
+  }
+  let overlays: Overlays = {add: undefined, remove: undefined};
+  switch (overlayToApply?.change[SourceChangeIndex.TYPE]) {
+    case ChangeType.ADD:
+      overlays = {
+        add: overlayToApply.change[SourceChangeIndex.ROW],
+        remove: undefined,
+      };
+      break;
+    case ChangeType.REMOVE:
+      overlays = {
+        add: undefined,
+        remove: overlayToApply.change[SourceChangeIndex.ROW],
+      };
+      break;
+    case ChangeType.EDIT:
+      overlays = {
+        add: overlayToApply.change[SourceChangeIndex.ROW],
+        remove: overlayToApply.change[SourceChangeIndex.OLD_ROW],
+      };
+      break;
+  }
+  if (constraint) {
+    overlays = overlaysForConstraint(overlays, constraint);
+  }
+  overlays = applyMultiConstraintsToOverlays(overlays, multiConstraints);
+  if (filterPredicate) {
+    overlays = overlaysForFilterPredicate(overlays, filterPredicate);
+  }
+  yield* generateWithOverlayInnerUnordered(rows, overlays, primaryKey);
+}
+
+export function* generateWithOverlayInnerUnordered(
+  rowIterator: Iterable<Row>,
+  overlays: Overlays,
+  primaryKey: PrimaryKey,
+) {
+  // Eager inject: yield the add overlay at the start (row not yet in storage)
+  if (overlays.add) {
+    yield {row: overlays.add, relationships: {}};
+  }
+  // Stream with inline suppress: skip the remove overlay (row still in storage)
+  let removeSkipped = false;
+  for (const row of rowIterator) {
+    if (
+      !removeSkipped &&
+      overlays.remove &&
+      rowMatchesPK(overlays.remove, row, primaryKey)
+    ) {
+      removeSkipped = true;
+      continue;
+    }
+    yield {row, relationships: {}};
+  }
+}
+
+function rowMatchesPK(a: Row, b: Row, primaryKey: PrimaryKey): boolean {
+  for (const key of primaryKey) {
+    if (!valuesEqual(a[key], b[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * A location to begin scanning an index from. Can either be a specific value
  * or the min or max possible value for the type. This is used to start a scan
  * at the beginning of the rows matching a constraint.
@@ -770,15 +1014,27 @@ type MinValue = typeof minValue;
 const maxValue = Symbol('max-value');
 type MaxValue = typeof maxValue;
 
-function makeBoundComparator(sort: Ordering) {
+function makeBoundComparator(sort: Ordering): Comparator {
+  // Pre-extract the first two keys/directions to avoid per-call array access.
+  // All paths share one function literal (single SFI) so the BTree comparator call site
+  // stays monomorphic across indexes with different sort orderings, preventing V8 IC deopt.
+  // Even a 2-SFI split (e.g. separate len=1 path) creates a polymorphic IC that
+  // measurably regresses performance, so we keep a single return body.
+  const len = sort.length;
+  const k0 = sort[0][0];
+  const a0 = sort[0][1] === 'asc';
+  const k1 = len > 1 ? sort[1][0] : '';
+  const a1 = len > 1 ? sort[1][1] === 'asc' : true;
+
   return (a: RowBound, b: RowBound) => {
+    const c0 = a0 ? compareBounds(a[k0], b[k0]) : compareBounds(b[k0], a[k0]);
+    if (len === 1 || c0 !== 0) return c0;
+    const c1 = a1 ? compareBounds(a[k1], b[k1]) : compareBounds(b[k1], a[k1]);
+    if (len === 2 || c1 !== 0) return c1;
     // Hot! Do not use destructuring
-    for (const entry of sort) {
-      const key = entry[0];
-      const cmp = compareBounds(a[key], b[key]);
-      if (cmp !== 0) {
-        return entry[1] === 'asc' ? cmp : -cmp;
-      }
+    for (let i = 2; i < len; i++) {
+      const cmp = compareBounds(a[sort[i][0]], b[sort[i][0]]);
+      if (cmp !== 0) return sort[i][1] === 'asc' ? cmp : -cmp;
     }
     return 0;
   };
@@ -788,17 +1044,15 @@ function compareBounds(a: Bound, b: Bound): number {
   if (a === b) {
     return 0;
   }
-  if (a === minValue) {
-    return -1;
+  // Use typeof to guard the Symbol sentinel checks first. This gives V8 a
+  // clear type discriminant so the common non-symbol path compiles as a
+  // specialised numeric/string fast-path without a Smi deopt when the
+  // minValue/maxValue sentinel symbols appear.
+  if (typeof a === 'symbol') {
+    return a === minValue ? -1 : 1;
   }
-  if (b === minValue) {
-    return 1;
-  }
-  if (a === maxValue) {
-    return 1;
-  }
-  if (b === maxValue) {
-    return -1;
+  if (typeof b === 'symbol') {
+    return b === minValue ? 1 : -1;
   }
   return compareValues(a, b);
 }
@@ -817,4 +1071,130 @@ export function stringify(change: SourceChange) {
   return JSON.stringify(change, (_, v) =>
     typeof v === 'bigint' ? v.toString() : v,
   );
+}
+
+/**
+ * N-way merge of pre-sorted Node streams. Each input stream must yield
+ * Nodes in `compare` order (and may interleave 'yield' values, which are
+ * forwarded as-is). The merged stream yields Nodes in `compare` order.
+ *
+ * Implemented as a binary min-heap keyed by `compare(entry.row, ...)`, so
+ * each emit costs O(log K) (K = number of streams) rather than the O(K)
+ * a linear-scan-of-heads merge would. Matters when FlippedJoin chunks a
+ * large `multiConstraints` IN-list into hundreds of sub-fetches.
+ *
+ * If the merged stream is closed early (e.g. downstream `Take` `break`s
+ * after hitting its limit, prompting JS to call `.return()` on this
+ * generator), the `finally` block propagates `.return()` to each
+ * non-exhausted sub-iterator so the underlying sources (SQLite cursors,
+ * etc.) can run their cleanup. Without this, mid-merge early-termination
+ * leaves cursors open, causing later writes on the same connection to
+ * fail with "database connection is busy executing a query".
+ */
+export function* mergeSortedStreams(
+  streams: readonly Stream<Node | 'yield'>[],
+  compare: (a: Node, b: Node) => number,
+): Stream<Node | 'yield'> {
+  const iterators: Iterator<Node | 'yield'>[] = streams.map(s =>
+    s[Symbol.iterator](),
+  );
+  // True while iterators[i] hasn't yet returned `done`. The finally
+  // block uses this to skip already-exhausted streams when propagating
+  // `.return()`.
+  const active: boolean[] = new Array(iterators.length).fill(true);
+
+  // Min-heap of entries; `idx` tells us which stream to refill from
+  // after the entry's row is emitted.
+  type Entry = {row: Node; idx: number};
+  const heap: Entry[] = [];
+
+  const siftUp = (start: number) => {
+    let i = start;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (compare(heap[i].row, heap[p].row) >= 0) return;
+      const t = heap[i];
+      heap[i] = heap[p];
+      heap[p] = t;
+      i = p;
+    }
+  };
+
+  const siftDown = (start: number) => {
+    let i = start;
+    const n = heap.length;
+    while (true) {
+      const l = (i << 1) + 1;
+      const r = l + 1;
+      let smallest = i;
+      if (l < n && compare(heap[l].row, heap[smallest].row) < 0) smallest = l;
+      if (r < n && compare(heap[r].row, heap[smallest].row) < 0) smallest = r;
+      if (smallest === i) return;
+      const t = heap[i];
+      heap[i] = heap[smallest];
+      heap[smallest] = t;
+      i = smallest;
+    }
+  };
+
+  // Pull the next Node from iterator `idx`, forwarding any 'yield's.
+  // Returns the Node, or `undefined` once the stream is exhausted.
+  const pullNext = function* (
+    idx: number,
+  ): Generator<'yield', Node | undefined, undefined> {
+    while (true) {
+      const r = iterators[idx].next();
+      if (r.done) {
+        active[idx] = false;
+        return undefined;
+      }
+      if (r.value === 'yield') {
+        yield 'yield';
+        continue;
+      }
+      return r.value;
+    }
+  };
+
+  try {
+    // Prime: push the first row of each non-empty stream onto the heap.
+    for (let i = 0; i < iterators.length; i++) {
+      const row = yield* pullNext(i);
+      if (row !== undefined) {
+        heap.push({row, idx: i});
+        siftUp(heap.length - 1);
+      }
+    }
+
+    while (heap.length > 0) {
+      // Root is the global min across all active streams.
+      const top = heap[0];
+      yield top.row;
+      const next = yield* pullNext(top.idx);
+      if (next !== undefined) {
+        // Refill root in place (top === heap[0]) and sift down. The
+        // already-yielded `top.row` value is captured by the yield, so
+        // mutating it here doesn't affect what was emitted.
+        top.row = next;
+        siftDown(0);
+      } else {
+        // Stream exhausted. Move tail to root and shrink. Pop returns
+        // the last entry; if the heap had only one entry it was the
+        // root we just yielded, so we just leave the heap empty.
+        const last = must(heap.pop());
+        if (heap.length > 0) {
+          heap[0] = last;
+          siftDown(0);
+        }
+      }
+    }
+  } finally {
+    // Close any iterators that aren't already exhausted so their
+    // `finally` blocks (which release cursors / cached statements) run.
+    for (let i = 0; i < iterators.length; i++) {
+      if (active[i]) {
+        iterators[i].return?.();
+      }
+    }
+  }
 }

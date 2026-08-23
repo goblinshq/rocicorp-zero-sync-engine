@@ -3,20 +3,18 @@ import type {ReadonlyJSONValue} from '../../../shared/src/json.ts';
 import {deepFreeze} from '../frozen-json.ts';
 import type {Read, Store, Write} from './store.ts';
 import {
+  maybeTransactionIsClosedRejection,
   throwIfStoreClosed,
-  throwIfTransactionClosed,
+  transactionError,
 } from './throw-if-closed.ts';
+import {deleteSentinel, WriteImplBase} from './write-impl-base.ts';
 
 /**
  * A SQLite prepared statement.
- *
- * `run` executes the statement with optional parameters.
- * `all` executes the statement and returns the result rows.
- * `finalize` releases the statement.
  */
 export interface PreparedStatement {
-  firstValue(params: string[]): Promise<unknown>;
   exec(params: string[]): Promise<void>;
+  all(params: string[]): Promise<unknown[][]>;
 }
 
 export interface SQLiteDatabase {
@@ -62,8 +60,8 @@ export class SQLiteStore implements Store {
     create: CreateSQLiteDatabase,
     opts?: SQLiteStoreOptions,
   ) {
-    this.#filename = safeFilename(name);
-    this.#entry = getOrCreateEntry(name, create, opts);
+    this.#filename = resolveFilename(name, opts);
+    this.#entry = getOrCreateEntry(this.#filename, create, opts);
   }
 
   async read(): Promise<Read> {
@@ -130,9 +128,17 @@ export function safeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9]/g, '_');
 }
 
+function resolveFilename(name: string, opts?: SQLiteStoreOptions): string {
+  const safe = safeFilename(name);
+  const dir = opts?.directory;
+  return dir ? `${dir}/${safe}` : safe;
+}
+
 export type PreparedStatements = {
   has: PreparedStatement;
   get: PreparedStatement;
+  hasMany: PreparedStatement;
+  getMany: PreparedStatement;
   put: PreparedStatement;
   del: PreparedStatement;
 };
@@ -143,6 +149,8 @@ export interface SQLiteStoreOptions {
   journalMode?: 'WAL' | 'DELETE';
   synchronous?: 'NORMAL' | 'FULL';
   readUncommitted?: boolean;
+  /** Directory in which to create the SQLite file. Defaults to the process CWD. */
+  directory?: string | undefined;
 }
 
 /**
@@ -165,7 +173,7 @@ export function setupDatabase(
   // Create the entry table
   delegate.execSync(`
     CREATE TABLE IF NOT EXISTS entry (
-      key TEXT PRIMARY KEY, 
+      key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     ) WITHOUT ROWID
   `);
@@ -174,38 +182,183 @@ export function setupDatabase(
   return {
     has: delegate.prepare(`SELECT 1 FROM entry WHERE key = ? LIMIT 1`),
     get: delegate.prepare('SELECT value FROM entry WHERE key = ?'),
-    put: delegate.prepare(
-      'INSERT OR REPLACE INTO entry (key, value) VALUES (?, ?)',
+    hasMany: delegate.prepare(
+      `SELECT key FROM entry WHERE key IN (SELECT value FROM json_each(?))`,
     ),
-    del: delegate.prepare('DELETE FROM entry WHERE key = ?'),
+    getMany: delegate.prepare(
+      `SELECT key, value FROM entry WHERE key IN (SELECT value FROM json_each(?))`,
+    ),
+    put: delegate.prepare(
+      `INSERT OR REPLACE INTO entry (key, value)
+   SELECT e.value->>0, e.value->1 FROM json_each(?) e`,
+    ),
+    del: delegate.prepare(
+      `DELETE FROM entry WHERE key IN (SELECT value FROM json_each(?))`,
+    ),
   };
 }
 
+// Callbacks are stored as striped pairs: [resolve, reject, resolve, reject, ...]
+const CB_STRIDE = 2;
+const CB_RESOLVE = 0;
+const CB_REJECT = 1;
+
+type GetResolve = (v: ReadonlyJSONValue | undefined) => void;
+type HasResolve = (v: boolean) => void;
+type Reject = (e: unknown) => void;
+
+function rejectAll(callbacks: unknown[], e: unknown): void {
+  for (let i = CB_REJECT; i < callbacks.length; i += CB_STRIDE) {
+    (callbacks[i] as Reject)(e);
+  }
+}
+
+function parseRawValue(raw: string | undefined): ReadonlyJSONValue | undefined {
+  return raw === undefined
+    ? undefined
+    : deepFreeze(JSON.parse(raw) as ReadonlyJSONValue);
+}
+
+function resolveGet(
+  resolve: GetResolve,
+  reject: Reject,
+  raw: string | undefined,
+): void {
+  try {
+    resolve(parseRawValue(raw));
+  } catch (e) {
+    reject(e);
+  }
+}
+
+async function flushGets(
+  keys: string[],
+  callbacks: unknown[],
+  ps: PreparedStatements,
+): Promise<void> {
+  let rows: unknown[][];
+  try {
+    rows =
+      keys.length === 1
+        ? await ps.get.all([keys[0]])
+        : await ps.getMany.all([JSON.stringify(keys)]);
+  } catch (e) {
+    rejectAll(callbacks, e);
+    return;
+  }
+  if (keys.length === 1) {
+    resolveGet(
+      callbacks[CB_RESOLVE] as GetResolve,
+      callbacks[CB_REJECT] as Reject,
+      rows[0]?.[0] as string | undefined,
+    );
+    return;
+  }
+  const resultMap = new Map(rows as [string, string][]);
+  for (let i = 0; i < keys.length; i++) {
+    resolveGet(
+      callbacks[i * CB_STRIDE + CB_RESOLVE] as GetResolve,
+      callbacks[i * CB_STRIDE + CB_REJECT] as Reject,
+      resultMap.get(keys[i]),
+    );
+  }
+}
+
+async function flushHas(
+  keys: string[],
+  callbacks: unknown[],
+  ps: PreparedStatements,
+): Promise<void> {
+  let rows: unknown[][];
+  try {
+    rows =
+      keys.length === 1
+        ? await ps.has.all([keys[0]])
+        : await ps.hasMany.all([JSON.stringify(keys)]);
+  } catch (e) {
+    rejectAll(callbacks, e);
+    return;
+  }
+  if (keys.length === 1) {
+    (callbacks[CB_RESOLVE] as HasResolve)(rows.length > 0);
+    return;
+  }
+  const existingKeys = new Set(rows.map(row => row[0] as string));
+  for (let i = 0; i < keys.length; i++) {
+    (callbacks[i * CB_STRIDE + CB_RESOLVE] as HasResolve)(
+      existingKeys.has(keys[i]),
+    );
+  }
+}
+
 export class SQLiteStoreRead implements Read {
-  #release: () => void;
+  readonly #release: () => void;
+  readonly #preparedStatements: PreparedStatements;
   #closed = false;
-  #preparedStatements: PreparedStatements;
+  #pendingGetKeys: string[] = [];
+  #pendingGetCallbacks: unknown[] = [];
+  #pendingHasKeys: string[] = [];
+  #pendingHasCallbacks: unknown[] = [];
+  #scheduled = false;
 
   constructor(release: () => void, preparedStatements: PreparedStatements) {
     this.#release = release;
     this.#preparedStatements = preparedStatements;
   }
 
-  async has(key: string): Promise<boolean> {
-    throwIfTransactionClosed(this);
-    const value = await this.#preparedStatements.has.firstValue([key]);
-    return value !== undefined;
+  has(key: string): Promise<boolean> {
+    return (
+      maybeTransactionIsClosedRejection(this) ??
+      new Promise((resolve, reject) => {
+        this.#pendingHasKeys.push(key);
+        this.#pendingHasCallbacks.push(resolve, reject);
+        this.#scheduleLookup();
+      })
+    );
   }
 
-  async get(key: string): Promise<ReadonlyJSONValue | undefined> {
-    throwIfTransactionClosed(this);
-    const value = await this.#preparedStatements.get.firstValue([key]);
-    if (!value) {
-      return undefined;
-    }
+  get(key: string): Promise<ReadonlyJSONValue | undefined> {
+    return (
+      maybeTransactionIsClosedRejection(this) ??
+      new Promise((resolve, reject) => {
+        this.#pendingGetKeys.push(key);
+        this.#pendingGetCallbacks.push(resolve, reject);
+        this.#scheduleLookup();
+      })
+    );
+  }
 
-    const parsedValue = JSON.parse(value as string) as ReadonlyJSONValue;
-    return deepFreeze(parsedValue);
+  #scheduleLookup(): void {
+    if (!this.#scheduled) {
+      this.#scheduled = true;
+      queueMicrotask(() => {
+        this.#scheduled = false;
+
+        const ps = this.#preparedStatements;
+        const getKeys = this.#pendingGetKeys;
+        this.#pendingGetKeys = [];
+        const getCallbacks = this.#pendingGetCallbacks;
+        this.#pendingGetCallbacks = [];
+        const hasKeys = this.#pendingHasKeys;
+        this.#pendingHasKeys = [];
+        const hasCallbacks = this.#pendingHasCallbacks;
+        this.#pendingHasCallbacks = [];
+
+        if (this.#closed) {
+          const e = transactionError();
+          rejectAll(getCallbacks, e);
+          rejectAll(hasCallbacks, e);
+          return;
+        }
+
+        if (getKeys.length > 0) {
+          void flushGets(getKeys, getCallbacks, ps);
+        }
+        if (hasKeys.length > 0) {
+          void flushHas(hasKeys, hasCallbacks, ps);
+        }
+      });
+    }
   }
 
   release(): void {
@@ -220,7 +373,7 @@ export class SQLiteStoreRead implements Read {
   }
 }
 
-export class SQLiteWrite implements Write {
+export class SQLiteWrite extends WriteImplBase implements Write {
   readonly #release: () => void;
   readonly #dbDelegate: SQLiteDatabase;
   readonly #preparedStatements: PreparedStatements;
@@ -232,54 +385,60 @@ export class SQLiteWrite implements Write {
     dbDelegate: SQLiteDatabase,
     preparedStatements: PreparedStatements,
   ) {
+    super(new SQLiteStoreRead(() => undefined, preparedStatements));
     this.#release = release;
     this.#dbDelegate = dbDelegate;
     this.#preparedStatements = preparedStatements;
   }
 
-  async has(key: string): Promise<boolean> {
-    throwIfTransactionClosed(this);
-    const value = await this.#preparedStatements.has.firstValue([key]);
-    return value !== undefined;
-  }
-
-  async get(key: string): Promise<ReadonlyJSONValue | undefined> {
-    throwIfTransactionClosed(this);
-    const value = await this.#preparedStatements.get.firstValue([key]);
-    if (!value) {
-      return undefined;
+  async commit(): Promise<void> {
+    if (this.#closed) {
+      throw transactionError();
     }
 
-    const parsedValue = JSON.parse(value as string) as ReadonlyJSONValue;
-    return deepFreeze(parsedValue);
-  }
+    const deleteKeys: string[] = [];
+    for (const entry of this._pending) {
+      if (entry[1] === deleteSentinel) {
+        deleteKeys.push(entry[0]);
+        this._pending.delete(entry[0]);
+      }
+    }
 
-  async put(key: string, value: ReadonlyJSONValue): Promise<void> {
-    throwIfTransactionClosed(this);
-    await this.#preparedStatements.put.exec([key, JSON.stringify(value)]);
-  }
+    const delP =
+      deleteKeys.length > 0
+        ? this.#preparedStatements.del.exec([JSON.stringify(deleteKeys)])
+        : undefined;
+    const putP =
+      this._pending.size > 0
+        ? this.#preparedStatements.put.exec([
+            JSON.stringify([...this._pending]),
+          ])
+        : undefined;
 
-  async del(key: string): Promise<void> {
-    throwIfTransactionClosed(this);
-    await this.#preparedStatements.del.exec([key]);
-  }
+    if (putP) await putP;
+    if (delP) await delP;
 
-  // oxlint-disable-next-line require-await
-  async commit(): Promise<void> {
-    throwIfTransactionClosed(this);
     this.#dbDelegate.execSync('COMMIT');
+    this._pending.clear();
     this.#committed = true;
   }
 
   release(): void {
     if (!this.#closed) {
       this.#closed = true;
-
+      super.release();
+      let rollbackError: unknown;
       if (!this.#committed) {
-        this.#dbDelegate.execSync('ROLLBACK');
+        try {
+          this.#dbDelegate.execSync('ROLLBACK');
+        } catch (e) {
+          rollbackError = e;
+        }
       }
-
       this.#release();
+      if (rollbackError !== undefined) {
+        throw rollbackError;
+      }
     }
   }
 
@@ -305,11 +464,10 @@ const stores = new Map<string, StoreEntry>();
  * name share the same database connection, lock, and delegate.
  */
 function getOrCreateEntry(
-  name: string,
+  filename: string,
   create: (filename: string, opts?: SQLiteStoreOptions) => SQLiteDatabase,
   opts?: SQLiteStoreOptions,
 ): StoreEntry {
-  const filename = safeFilename(name);
   const entry = stores.get(filename);
 
   if (entry) {
@@ -364,8 +522,9 @@ export function dropStore(
     filename: string,
     opts?: SQLiteStoreOptions,
   ) => SQLiteDatabase,
+  opts?: SQLiteStoreOptions,
 ): Promise<void> {
-  const filename = safeFilename(name);
+  const filename = resolveFilename(name, opts);
   const entry = stores.get(filename);
   if (entry) {
     try {
@@ -377,7 +536,7 @@ export function dropStore(
   }
 
   // Create a temporary delegate to handle database deletion
-  const tempDelegate = createDelegate(filename);
+  const tempDelegate = createDelegate(filename, opts);
   try {
     // we close the db before destroying it - this
     // caused an issue with expo-sqlite since it requires this

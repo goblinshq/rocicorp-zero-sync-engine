@@ -1,5 +1,5 @@
 import type {LogContext} from '@rocicorp/logger';
-import {beforeEach, describe, expect, test} from 'vitest';
+import {beforeEach, describe, expect, test, vi} from 'vitest';
 import type {JSONObject} from '../../../../shared/src/bigint-json.ts';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import {must} from '../../../../shared/src/must.ts';
@@ -14,7 +14,7 @@ import {StatementRunner} from '../../db/statements.ts';
 import {expectTables, initDB} from '../../test/lite.ts';
 import type {ChangeStreamData} from '../change-source/protocol/current/downstream.ts';
 import {ChangeProcessor} from './change-processor.ts';
-import {DEL_OP, SET_OP} from './schema/change-log.ts';
+import {DEL_OP, RESET_OP, SET_OP} from './schema/change-log.ts';
 import {ColumnMetadataStore} from './schema/column-metadata.ts';
 import {
   getSubscriptionState,
@@ -25,6 +25,7 @@ import {createChangeProcessor, ReplicationMessages} from './test-utils.ts';
 describe('replicator/change-processor', () => {
   let lc: LogContext;
   let servingReplica: Database;
+  let servingRunner: StatementRunner;
   let servingProcessor: ChangeProcessor;
   let backupReplica: Database;
   let backupProcessor: ChangeProcessor;
@@ -33,10 +34,11 @@ describe('replicator/change-processor', () => {
     lc = createSilentLogContext();
     servingReplica = new Database(lc, ':memory:');
     initReplicationState(servingReplica, ['zero_data'], '02');
+    servingRunner = new StatementRunner(servingReplica);
     servingProcessor = new ChangeProcessor(
-      new StatementRunner(servingReplica),
+      servingRunner,
       'serving',
-      (_, err) => {
+      (_, err: unknown) => {
         throw err;
       },
     );
@@ -45,7 +47,7 @@ describe('replicator/change-processor', () => {
     backupProcessor = new ChangeProcessor(
       new StatementRunner(backupReplica),
       'backup',
-      (_, err) => {
+      (_, err: unknown) => {
         throw err;
       },
     );
@@ -73,6 +75,25 @@ describe('replicator/change-processor', () => {
   const fooBarBaz = new ReplicationMessages({foo: 'id', bar: 'id', baz: 'id'});
   const tables = new ReplicationMessages({transaction: 'column'});
   const bff = new ReplicationMessages({bff: ['b', 'a', 'c']});
+
+  test('starts serving transactions with BEGIN IMMEDIATE', () => {
+    const beginImmediate = vi.spyOn(servingRunner, 'beginImmediate');
+    const beginConcurrent = vi.spyOn(servingRunner, 'beginConcurrent');
+
+    servingProcessor.processMessage(lc, [
+      'begin',
+      issues.begin(),
+      {commitWatermark: '03'},
+    ]);
+    servingProcessor.processMessage(lc, [
+      'commit',
+      issues.commit(),
+      {watermark: '03'},
+    ]);
+
+    expect(beginImmediate).toHaveBeenCalledOnce();
+    expect(beginConcurrent).not.toHaveBeenCalled();
+  });
 
   const cases: Case[] = [
     {
@@ -121,7 +142,7 @@ describe('replicator/change-processor', () => {
         ['commit', issues.commit(), {watermark: '0b'}],
       ],
       data: {
-        issues: [
+        'issues': [
           {
             issueID: 123n,
             big: null,
@@ -269,7 +290,7 @@ describe('replicator/change-processor', () => {
         ['commit', issues.commit(), {watermark: '0a'}],
       ],
       data: {
-        issues: [
+        'issues': [
           {
             issueID: 123n,
             big: 9223372036854775807n,
@@ -346,7 +367,7 @@ describe('replicator/change-processor', () => {
         ['commit', orgIssues.commit(), {watermark: '0a'}],
       ],
       data: {
-        issues: [
+        'issues': [
           {
             orgID: 2n,
             issueID: 123n,
@@ -453,7 +474,7 @@ describe('replicator/change-processor', () => {
         ['commit', orgIssues.commit(), {watermark: '0c'}],
       ],
       data: {
-        issues: [
+        'issues': [
           {
             orgID: 2n,
             issueID: 789n,
@@ -526,13 +547,13 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0i'}],
       ],
       data: {
-        foo: [{id: 101n, ['_0_version']: '0i'}],
-        bar: [
+        'foo': [{id: 101n, ['_0_version']: '0i'}],
+        'bar': [
           {id: 4n, ['_0_version']: '0e'},
           {id: 5n, ['_0_version']: '0e'},
           {id: 6n, ['_0_version']: '0e'},
         ],
-        baz: [],
+        'baz': [],
         ['_zero.changeLog2']: [
           {
             backfillingColumnVersions: '{}',
@@ -672,7 +693,7 @@ describe('replicator/change-processor', () => {
         ['commit', issues.commit(), {watermark: '0b'}],
       ],
       data: {
-        full: [
+        'full': [
           {id: 123n, bool: 0n, desc: 'foobar', ['_0_version']: '0b'},
           {id: 987n, bool: 1n, desc: 'barfoo', ['_0_version']: '0b'},
         ],
@@ -763,12 +784,12 @@ describe('replicator/change-processor', () => {
         ['commit', full.commit(), {watermark: '06'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, desc: 'replaced one', ['_0_version']: '06'},
           {id: 789n, desc: null, ['_0_version']: '06'},
           {id: 234n, desc: 'woo', ['_0_version']: '06'},
         ],
-        full: [
+        'full': [
           {id: 2n, bool: 1n, desc: 'replaced two', ['_0_version']: '06'},
           {id: 321n, bool: 0n, desc: 'voo', ['_0_version']: '06'},
           {id: 456n, bool: 0n, desc: null, ['_0_version']: '06'},
@@ -886,7 +907,7 @@ describe('replicator/change-processor', () => {
         ['commit', orgIssues.commit(), {watermark: '07'}],
       ],
       data: {
-        transaction: [],
+        'transaction': [],
         ['_zero.changeLog2']: [
           {
             stateVersion: '07',
@@ -961,7 +982,7 @@ describe('replicator/change-processor', () => {
         ['commit', orgIssues.commit(), {watermark: '08'}],
       ],
       data: {
-        issues: [
+        'issues': [
           {
             orgID: 1n,
             issueID: 456n,
@@ -1051,7 +1072,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 'bar', count: 2n, bool: 1n, serial: 1n, ['_0_version']: '0e'},
           {id: 'baz', count: 3n, bool: 0n, serial: 2n, ['_0_version']: '0e'},
         ],
@@ -1204,7 +1225,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        bar: [
+        'bar': [
           {id: 1n, ['_0_version']: '00'},
           {id: 2n, ['_0_version']: '00'},
           {id: 3n, ['_0_version']: '00'},
@@ -1318,7 +1339,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {
             id: 1n,
             newInt: 123n,
@@ -1476,7 +1497,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, ['_0_version']: '00'},
           {id: 2n, ['_0_version']: '00'},
           {id: 3n, ['_0_version']: '0e'},
@@ -1569,7 +1590,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, newName: 'hel', ['_0_version']: '00'},
           {id: 2n, newName: 'low', ['_0_version']: '00'},
           {id: 3n, newName: 'olrd', ['_0_version']: '0e'},
@@ -1658,6 +1679,9 @@ describe('replicator/change-processor', () => {
       setup: `
         CREATE TABLE foo(id INT8, nolz TEXT, _0_version TEXT);
         CREATE UNIQUE INDEX foo_pkey ON foo (id ASC);
+        INSERT INTO "_zero.column_metadata"
+          (table_name, column_name, upstream_type, is_not_null, is_enum, is_array)
+          VALUES ('foo', 'nolz', 'TEXT', 0, 0, 0);
         INSERT INTO foo(id, nolz, _0_version) VALUES (1, 'hel', '00');
         INSERT INTO foo(id, nolz, _0_version) VALUES (2, 'low', '00');
         INSERT INTO foo(id, nolz, _0_version) VALUES (3, 'orl', '00');
@@ -1677,7 +1701,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, nolz: 'hel', ['_0_version']: '00'},
           {id: 2n, nolz: 'low', ['_0_version']: '00'},
           {id: 3n, nolz: 'olrd', ['_0_version']: '0e'},
@@ -1737,7 +1761,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 3,
+              pos: 2,
             },
             ['_0_version']: {
               characterMaximumLength: null,
@@ -1745,7 +1769,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 2,
+              pos: 3,
             },
           },
           backfilling: [],
@@ -1766,6 +1790,9 @@ describe('replicator/change-processor', () => {
       setup: `
         CREATE TABLE foo(id INT8, nolz TEXT, _0_version TEXT);
         CREATE UNIQUE INDEX foo_pkey ON foo (id ASC);
+        INSERT INTO "_zero.column_metadata"
+          (table_name, column_name, upstream_type, is_not_null, is_enum, is_array)
+          VALUES ('foo', 'nolz', 'TEXT', 0, 0, 0);
         INSERT INTO foo(id, nolz, _0_version) VALUES (1, 'hel', '00');
         INSERT INTO foo(id, nolz, _0_version) VALUES (2, 'low', '00');
         INSERT INTO foo(id, nolz, _0_version) VALUES (3, 'orl', '00');
@@ -1788,7 +1815,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, nolz: 'hel', ['_0_version']: '00'},
           {id: 2n, nolz: 'low', ['_0_version']: '00'},
           {id: 3n, nolz: 'olrd', ['_0_version']: '0e'},
@@ -1848,7 +1875,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 3,
+              pos: 2,
             },
             ['_0_version']: {
               characterMaximumLength: null,
@@ -1856,7 +1883,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 2,
+              pos: 3,
             },
           },
           backfilling: [],
@@ -1897,7 +1924,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, newName: 'hel', ['_0_version']: '00'},
           {id: 2n, newName: 'low', ['_0_version']: '00'},
           {id: 3n, newName: 'olrd', ['_0_version']: '0e'},
@@ -2011,7 +2038,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, num: 3n, ['_0_version']: '00'},
           {id: 2n, num: 2n, ['_0_version']: '00'},
           {id: 3n, num: 1n, ['_0_version']: '0e'},
@@ -2071,7 +2098,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 3,
+              pos: 2,
             },
             ['_0_version']: {
               characterMaximumLength: null,
@@ -2079,7 +2106,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 2,
+              pos: 3,
             },
           },
           backfilling: [],
@@ -2121,7 +2148,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, num: 3n, ['_0_version']: '00'},
           {id: 2n, num: 2n, ['_0_version']: '00'},
           {id: 3n, num: 1n, ['_0_version']: '0e'},
@@ -2181,7 +2208,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 3,
+              pos: 2,
             },
             ['_0_version']: {
               characterMaximumLength: null,
@@ -2189,7 +2216,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 2,
+              pos: 3,
             },
           },
           backfilling: [],
@@ -2241,7 +2268,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '0e'}],
       ],
       data: {
-        foo: [
+        'foo': [
           {id: 1n, number: 3n, ['_0_version']: '00'},
           {id: 2n, number: 2n, ['_0_version']: '00'},
           {id: 3n, number: 1n, ['_0_version']: '0e'},
@@ -2301,7 +2328,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 3,
+              pos: 2,
             },
             ['_0_version']: {
               characterMaximumLength: null,
@@ -2309,7 +2336,7 @@ describe('replicator/change-processor', () => {
               dflt: null,
               notNull: false,
               elemPgTypeClass: null,
-              pos: 2,
+              pos: 3,
             },
           },
           backfilling: [],
@@ -2575,7 +2602,7 @@ describe('replicator/change-processor', () => {
         ['commit', orgIssues.commit(), {watermark: '07'}],
       ],
       data: {
-        transaction: [],
+        'transaction': [],
         ['_zero.changeLog2']: [
           {
             stateVersion: '07',
@@ -2756,7 +2783,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '123.03'}],
       ],
       data: {
-        bff: [
+        'bff': [
           {
             // Note: The version is unchanged even though backfill updated
             //       a replicated row.
@@ -2973,7 +3000,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '123.03'}],
       ],
       data: {
-        bff: [
+        'bff': [
           {
             // Note: Versions are unchanged even though backfill values
             //       are added.
@@ -3173,7 +3200,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '123.02'}],
       ],
       data: {
-        bff: [
+        'bff': [
           {
             _0_version: '101',
             a: 1n,
@@ -3387,7 +3414,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '123.02'}],
       ],
       data: {
-        bff: [
+        'bff': [
           {
             _0_version: '03',
             a: 1n,
@@ -3561,7 +3588,7 @@ describe('replicator/change-processor', () => {
         ['commit', fooBarBaz.commit(), {watermark: '123.01'}],
       ],
       data: {
-        bff: [
+        'bff': [
           {id: 2n, _0_version: '115'},
           {id: 83n, _0_version: '115'},
         ],
@@ -3757,6 +3784,87 @@ describe('replicator/change-processor-errors', () => {
     ]);
     expect(replica.inTransaction).toBe(true);
     processor.abort(lc);
+    expect(replica.inTransaction).toBe(false);
+  });
+
+  test('wraps oversized update binding errors with context', () => {
+    const failures: unknown[] = [];
+    const processor = new ChangeProcessor(
+      new StatementRunner(replica),
+      'backup',
+      (_, error) => failures.push(error),
+    );
+    const update = messages.update('foo', {id: 1, big: 1n << 63n});
+    const relation = {
+      ...update.relation,
+      relationOid: 42,
+    } as typeof update.relation & {relationOid: number};
+
+    processor.processMessage(lc, [
+      'begin',
+      messages.begin(),
+      {commitWatermark: '0e'},
+    ]);
+    processor.processMessage(lc, [
+      'data',
+      {
+        ...update,
+        relation,
+      },
+    ]);
+
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      name: 'OversizedUpdateBindingError',
+      message:
+        'Oversized SQLite update binding: tx=0e relationOid=42 table=public.foo column=big valueType=bigint fitsInt64=false',
+      cause: {
+        name: 'RangeError',
+        message: 'The bound string, buffer, or bigint is too big',
+      },
+    });
+  });
+
+  test('preserves original sqlite auto-rollback error', () => {
+    const failures: unknown[] = [];
+    const processor = createChangeProcessor(replica, (_, err) =>
+      failures.push(err),
+    );
+    const messages = new ReplicationMessages({auto_rollback: 'id'});
+
+    replica.exec(/*sql*/ `
+      CREATE TABLE auto_rollback(
+        id INTEGER,
+        _0_version TEXT,
+        PRIMARY KEY(id)
+      );
+
+      CREATE TRIGGER "AutoRollbackChangeProcessor"
+      BEFORE INSERT ON auto_rollback
+      BEGIN
+        SELECT RAISE(ROLLBACK, 'auto rollback change processor');
+      END;
+    `);
+
+    processor.processMessage(lc, [
+      'begin',
+      messages.begin(),
+      {commitWatermark: '0e'},
+    ]);
+    processor.processMessage(lc, [
+      'data',
+      messages.insert('auto_rollback', {id: 123}),
+    ]);
+
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(Error);
+    expect(String(failures[0])).toContain('auto rollback change processor');
+    expect(String(failures[0])).toContain(
+      'cannot rollback - no transaction is active',
+    );
+    expect(String((failures[0] as Error).cause)).toContain(
+      'auto rollback change processor',
+    );
     expect(replica.inTransaction).toBe(false);
   });
 });
@@ -4086,6 +4194,97 @@ describe('replicator/column-metadata-integration', () => {
       isBackfilling: false,
     });
   });
+
+  test.each([
+    {from: false, to: true},
+    {from: true, to: false},
+  ])(
+    'update column nullability from $from to $to without rebuilding the SQLite schema',
+    ({from, to}) => {
+      const messages = new ReplicationMessages({foo: 'id'});
+
+      processor.processMessage(lc, [
+        'begin',
+        messages.begin(),
+        {commitWatermark: '0d'},
+      ]);
+      processor.processMessage(lc, [
+        'data',
+        messages.createTable({
+          schema: 'public',
+          name: 'foo',
+          columns: {
+            id: {pos: 0, dataType: 'int8'},
+            value: {pos: 1, dataType: 'text', notNull: from},
+          },
+          primaryKey: ['id'],
+        }),
+      ]);
+      processor.processMessage(lc, [
+        'data',
+        messages.createIndex({
+          schema: 'public',
+          tableName: 'foo',
+          name: 'foo_value_id_idx',
+          columns: {value: 'ASC', id: 'ASC'},
+          unique: false,
+        }),
+      ]);
+      processor.processMessage(lc, [
+        'data',
+        messages.insert('foo', {id: 1, value: 'one'}),
+      ]);
+      processor.processMessage(lc, [
+        'commit',
+        messages.commit(),
+        {watermark: '0d'},
+      ]);
+
+      const sqliteSchema = replica.prepare(
+        `SELECT name, rootpage, sql FROM sqlite_master
+         WHERE name IN ('foo', 'foo_value_id_idx') ORDER BY name`,
+      );
+      const schemaBeforeUpdate = sqliteSchema.all();
+
+      processor.processMessage(lc, [
+        'begin',
+        messages.begin(),
+        {commitWatermark: '0e'},
+      ]);
+      processor.processMessage(lc, [
+        'data',
+        messages.updateColumn(
+          'foo',
+          {name: 'value', spec: {pos: 1, dataType: 'text', notNull: from}},
+          {name: 'value', spec: {pos: 1, dataType: 'text', notNull: to}},
+        ),
+      ]);
+      processor.processMessage(lc, [
+        'commit',
+        messages.commit(),
+        {watermark: '0e'},
+      ]);
+
+      expect(sqliteSchema.all()).toEqual(schemaBeforeUpdate);
+      expect(replica.prepare('SELECT id, value FROM foo').all()).toEqual([
+        {id: 1, value: 'one'},
+      ]);
+      expect(
+        must(ColumnMetadataStore.getInstance(replica)).getColumn(
+          'foo',
+          'value',
+        ),
+      ).toMatchObject({isNotNull: to});
+      expect(
+        replica
+          .prepare(
+            `SELECT stateVersion, "table", op FROM "_zero.changeLog2"
+             WHERE stateVersion = '0e'`,
+          )
+          .all(),
+      ).toContainEqual({stateVersion: '0e', table: 'foo', op: RESET_OP});
+    },
+  );
 
   test('drop column deletes metadata', () => {
     const messages = new ReplicationMessages({foo: 'id'});

@@ -1,8 +1,8 @@
+import fs from 'fs';
+import os from 'os';
 import type {LogContext} from '@rocicorp/logger';
 import auth from 'basic-auth';
 import type {FastifyReply, FastifyRequest} from 'fastify';
-import fs from 'fs';
-import os from 'os';
 import {BigIntJSON} from '../../../shared/src/bigint-json.ts';
 import {Database} from '../../../zqlite/src/db.ts';
 import type {NormalizedZeroConfig as ZeroConfig} from '../config/normalize.ts';
@@ -15,7 +15,7 @@ import {getReplicationState} from './replicator/schema/replication-state.ts';
 
 async function upstreamStats(lc: LogContext, config: ZeroConfig) {
   const schema = upstreamSchema(getShardID(config));
-  const sql = pgClient(lc, config.upstream.db);
+  const sql = pgClient(lc, config.upstream.db, 'statz-upstream');
   try {
     return await getPgStats([
       [
@@ -38,7 +38,7 @@ async function upstreamStats(lc: LogContext, config: ZeroConfig) {
 
 async function cvrStats(lc: LogContext, config: ZeroConfig) {
   const schema = upstreamSchema(getShardID(config)) + '/cvr';
-  const sql = pgClient(lc, config.cvr.db);
+  const sql = pgClient(lc, config.cvr.db, 'statz-cvr');
 
   function numQueriesPerClientGroup(
     active: boolean,
@@ -204,7 +204,7 @@ async function cvrStats(lc: LogContext, config: ZeroConfig) {
 
 async function changeLogStats(lc: LogContext, config: ZeroConfig) {
   const schema = upstreamSchema(getShardID(config)) + '/cdc';
-  const sql = pgClient(lc, config.change.db);
+  const sql = pgClient(lc, config.change.db, 'statz-change');
 
   try {
     return await getPgStats([
