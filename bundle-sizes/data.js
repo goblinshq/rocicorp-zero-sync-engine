@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771927002698,
-  "repoUrl": "https://github.com/rocicorp/mono",
+  "lastUpdate": 1787526426715,
+  "repoUrl": "https://github.com/goblinshq/rocicorp-zero-sync-engine",
   "entries": {
     "Bundle Sizes": [
       {
@@ -55233,6 +55233,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "Size of replicache.min.mjs.br (Brotli compressed)",
             "value": 31995,
+            "unit": "bytes"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "karavil.alp@gmail.com",
+            "name": "Alp",
+            "username": "Karavil"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "39d472d9f718556c055bcd8152a61fefb66fd1e0",
+          "message": "Merge pull request #12 from goblinshq/capy/sync-with-upstream-rocicorpmono\n\nSync with upstream rocicorp/mono (622 commits)",
+          "timestamp": "2026-08-23T16:05:39-07:00",
+          "tree_id": "2ad9699385bbccdbde743ed53a71280509f71c76",
+          "url": "https://github.com/goblinshq/rocicorp-zero-sync-engine/commit/39d472d9f718556c055bcd8152a61fefb66fd1e0"
+        },
+        "date": 1787526414973,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Size of replicache.mjs",
+            "value": 317629,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.mjs.br (Brotli compressed)",
+            "value": 57073,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs",
+            "value": 117348,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs.br (Brotli compressed)",
+            "value": 33538,
             "unit": "bytes"
           }
         ]
