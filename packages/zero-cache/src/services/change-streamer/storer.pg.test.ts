@@ -1,4 +1,5 @@
 import {PG_LOCK_NOT_AVAILABLE} from '@drdgvhbh/postgres-error-codes';
+import {resolver} from '@rocicorp/resolver';
 import postgres from 'postgres';
 import {afterEach, beforeEach, describe, expect} from 'vitest';
 import {BigIntJSON} from '../../../../shared/src/bigint-json.ts';
@@ -1696,24 +1697,87 @@ describe('change-streamer/storer', () => {
     });
   });
 
-  describe('back pressure timeout', () => {
+  // Back pressure is a memory-protection mechanism, not a hang watchdog: a
+  // wedged connection (e.g. one that can never even open its `BEGIN`) is
+  // instead caught by the ProgressMonitor (see 'ProgressMonitor hang
+  // detection' below), which is what actually recovers the process in that
+  // case. These tests exercise only the apply/release threshold logic.
+  describe('back pressure', () => {
     // Small enough that any nonzero backlog counts as "applying back
     // pressure", and short enough to keep the test fast.
     const TINY_BACKPRESSURE_PROPORTION = 1e-9;
-    const TIMEOUT_MS = 100;
-
-    let singleConnDb: PostgresDB;
 
     beforeEach(async () => {
+      storer = new Storer(
+        lc,
+        shard,
+        'task-id',
+        'change-streamer:12345',
+        'ws',
+        db,
+        REPLICA_VERSION,
+        msg => consumed.enqueue(msg),
+        err => fatalErrors.enqueue(err),
+        {
+          ...opts,
+          backPressureLimitHeapProportion: TINY_BACKPRESSURE_PROPORTION,
+        },
+      );
+      await storer.assumeOwnership();
+      done = storer.run();
+    });
+
+    test('readyForMore() applies pressure once queued, and releases once the backlog drains', async () => {
+      storer.store('20', ['begin', messages.begin(), {commitWatermark: '20'}]);
+      storer.store('20', ['data', messages.insert('issues', {id: '0'})]);
+      // Called synchronously with the store()s above (no intervening
+      // `await`), so the async queue-processing loop has not yet had a
+      // chance to run and decrement approximateQueuedBytes.
+      const readyForMore = storer.readyForMore();
+      expect(readyForMore).toBeDefined();
+
+      storer.store('20', ['commit', messages.commit(), {watermark: '20'}]);
+      await expectConsumed('20');
+
+      // The backlog drains once the transaction is processed (a real,
+      // unwedged connection), resolving readyForMore().
+      await readyForMore;
+
+      // With nothing queued, back pressure is no longer in effect.
+      expect(storer.readyForMore()).toBeUndefined();
+    });
+  });
+
+  // The ProgressMonitor is the storer's watchdog for a db operation that hangs
+  // without ever returning (e.g. a half-open connection). These tests exercise
+  // real #processQueue / catchup code paths and assert that a hang surfaces as
+  // a *fatal* error (via onFatal), which is what the ProgressMonitor -- and
+  // *only* the ProgressMonitor -- produces (the write pool has no per-statement
+  // response timeout of its own, and the write-path test wedges *before any
+  // statement is dispatched* -- the sole connection is reserved -- so there
+  // is nothing else that could possibly time it out).
+  describe('ProgressMonitor hang detection', () => {
+    const TIMEOUT_MS = 100;
+
+    function newRawConnection() {
       const {host, port, database, user: username, pass} = db.options;
-      // A dedicated, single-connection pool to the same test database, so
-      // that reserving its one connection deterministically blocks the
-      // storer from ever acquiring a connection for its next transaction --
-      // simulating a wedge that happens *before* any statement is sent to
-      // PG. This is the gap that TransactionPool's own
-      // statementResponseTimeout cannot see, since it only tracks
-      // statements that have already been dispatched.
-      singleConnDb = postgres({
+      return postgres({
+        host: host[0],
+        port: port[0],
+        username,
+        password: pass ?? undefined,
+        database,
+        ...postgresTypeConfig({sendStringAsJson: true}),
+      });
+    }
+
+    test('a hung write transaction (begin/commit) triggers a fatal error', async () => {
+      // Single-connection pool: reserving its one connection means the storer's
+      // write TransactionPool can never even open its `BEGIN`, so the commit's
+      // `await tx.startingReplicationState` (the begin-time SELECT ... FOR
+      // UPDATE) never resolves -- a hang *before* any statement reaches PG.
+      const {host, port, database, user: username, pass} = db.options;
+      const singleConnDb = postgres({
         host: host[0],
         port: port[0],
         username,
@@ -1733,74 +1797,170 @@ describe('change-streamer/storer', () => {
         REPLICA_VERSION,
         msg => consumed.enqueue(msg),
         err => fatalErrors.enqueue(err),
-        {
-          ...opts,
-          statementTimeoutMs: TIMEOUT_MS,
-          backPressureLimitHeapProportion: TINY_BACKPRESSURE_PROPORTION,
-          // Flush every change immediately, so that the *second* flush of
-          // the backlog blocks awaiting the still-pending first flush (which
-          // itself can never complete: the sole connection is reserved, so
-          // TransactionPool can't even start its `BEGIN`). This is what
-          // stalls #processQueue's loop mid-message, before it reaches the
-          // per-message #maybeReleaseBackPressure() call for that message,
-          // leaving the still-unprocessed backlog behind it counted against
-          // approximateQueuedBytes -- which is what keeps back pressure
-          // (and the watchdog timer) engaged instead of self-releasing.
-          changeLogBatchSize: 1,
-        },
+        {...opts, statementTimeoutMs: TIMEOUT_MS, drainTimeoutMs: 5_000},
       );
       await storer.assumeOwnership();
       done = storer.run();
+
+      const reserved = await singleConnDb.reserve();
+      try {
+        storer.store('08', [
+          'begin',
+          messages.begin(),
+          {commitWatermark: '08'},
+        ]);
+        storer.store('08', ['data', messages.insert('issues', {id: 'a'})]);
+        storer.store('08', ['commit', messages.commit(), {watermark: '08'}]);
+
+        const err = await fatalErrors.dequeue();
+        // The commit's queue-entry task is the one that fails to progress.
+        expect(err.message).toContain('failed to progress');
+        expect(err.message).toContain('queue-entry');
+      } finally {
+        // Release so #processQueue unwedges and stop() can drain in afterEach.
+        reserved.release();
+        await storer.stop().catch(() => {});
+        await singleConnDb.end();
+      }
+    });
+
+    test('a hung catchup read triggers a fatal error', async () => {
+      storer = new Storer(
+        lc,
+        shard,
+        'task-id',
+        'change-streamer:12345',
+        'ws',
+        db,
+        REPLICA_VERSION,
+        msg => consumed.enqueue(msg),
+        err => fatalErrors.enqueue(err),
+        {...opts, statementTimeoutMs: TIMEOUT_MS, drainTimeoutMs: 5_000},
+      );
+      await storer.assumeOwnership();
+      done = storer.run();
+
+      // Hold an ACCESS EXCLUSIVE lock on the changeLog so the catchup cursor
+      // read blocks indefinitely. (The lastWatermark read in #startCatchup is
+      // against replicationState, so it still completes; the hang is in the
+      // background #catchup cursor.) The lock is held until `release` resolves,
+      // so cleanup can let the transaction commit and end the connection
+      // cleanly rather than tearing down an in-flight query.
+      const lockConn = newRawConnection();
+      const acquired = resolver<void>();
+      const release = resolver<void>();
+      void lockConn
+        .begin(async tx => {
+          await tx`LOCK TABLE "xero_5/cdc"."changeLog" IN ACCESS EXCLUSIVE MODE`;
+          acquired.resolve();
+          await release.promise;
+        })
+        .catch(() => {});
+      await acquired.promise;
+
+      // A subscriber behind the durable watermark forces a catchup read.
+      // Consume its stream in the background so that, once the lock is
+      // released during cleanup, the catchup can send its buffered entries,
+      // complete, and close its reader connection (otherwise the orphaned
+      // reader keeps the worker alive after the test).
+      const [sub, , subStream] = createSubscriber('03');
+      const draining = drain(subStream, '06');
+
+      try {
+        storer.catchup(sub, 'serving');
+
+        const err = await fatalErrors.dequeue();
+        expect(err.message).toContain('failed to progress');
+        expect(err.message).toContain('catchup');
+      } finally {
+        release.resolve(); // let the held tx commit, releasing the lock
+        await draining; // catchup drains to the subscriber and completes
+        await lockConn.end();
+        await storer.stop().catch(() => {});
+      }
+    });
+  });
+
+  // assumeOwnership(), getStartStreamInitializationParameters(),
+  // getMinWatermarkForCatchup(), and getCatchupBounds() are one-off db calls,
+  // not part of the main storer loop or the background catchup read, so they
+  // are bounded by a plain #withTimeout() race instead of the ProgressMonitor.
+  // This matters concretely for assumeOwnership() and
+  // getStartStreamInitializationParameters(): both are called by
+  // ChangeStreamerImpl.run() *before* Storer.run() (see
+  // change-streamer-service.ts), i.e. before the ProgressMonitor's polling
+  // has started -- so a hang in either must be caught without relying on it.
+  // These tests call the methods directly, without ever calling
+  // `storer.run()`, to prove that.
+  describe('one-off db call timeout', () => {
+    const TIMEOUT_MS = 100;
+    let singleConnDb: PostgresDB;
+
+    beforeEach(() => {
+      const {host, port, database, user: username, pass} = db.options;
+      singleConnDb = postgres({
+        host: host[0],
+        port: port[0],
+        username,
+        password: pass ?? undefined,
+        database,
+        max: 1,
+        ...postgresTypeConfig({sendStringAsJson: true}),
+      });
+      storer = new Storer(
+        lc,
+        shard,
+        'task-id',
+        'change-streamer:12345',
+        'ws',
+        singleConnDb,
+        REPLICA_VERSION,
+        msg => consumed.enqueue(msg),
+        err => fatalErrors.enqueue(err),
+        {...opts, statementTimeoutMs: TIMEOUT_MS},
+      );
     });
 
     afterEach(async () => {
-      await storer.stop();
       await singleConnDb.end();
     });
 
-    // Queues a 'begin' plus enough data changes that #processQueue gets
-    // stuck (per the note above) with some of the backlog still undrained,
-    // and returns the resulting readyForMore() promise.
-    function storeUntilWedged() {
-      storer.store('20', ['begin', messages.begin(), {commitWatermark: '20'}]);
-      for (let i = 0; i < 4; i++) {
-        storer.store('20', ['data', messages.insert('issues', {id: `${i}`})]);
-      }
-      // Called synchronously with the store()s above (no intervening
-      // `await`) so that the async queue-processing loop has not yet had a
-      // chance to run and decrement approximateQueuedBytes.
-      return storer.readyForMore();
-    }
-
-    test('rejects with AbortError when the connection cannot be acquired within the timeout', async () => {
+    // Reserving the sole connection means the call can never even dispatch
+    // its statement, so its own #withTimeout is the only thing that can
+    // possibly reject it (there is no in-flight statement for anything else
+    // to time out).
+    async function withReservedConnection(fn: () => Promise<unknown>) {
       const reserved = await singleConnDb.reserve();
       try {
-        const readyForMore = storeUntilWedged();
-        expect(readyForMore).toBeDefined();
-
         const start = Date.now();
-        await expect(readyForMore).rejects.toThrow(
-          /Considering the change-log to be wedged/,
+        await expect(fn()).rejects.toThrow(
+          `did not complete within ${TIMEOUT_MS}ms`,
         );
         expect(Date.now() - start).toBeLessThan(TIMEOUT_MS * 5);
+        // Not the ProgressMonitor's doing: run() (and thus its polling) was
+        // never called.
+        expect(fatalErrors.size()).toBe(0);
       } finally {
         reserved.release();
       }
+    }
+
+    test('assumeOwnership rejects on a hang, without run() ever having started the ProgressMonitor', async () => {
+      await withReservedConnection(() => storer.assumeOwnership());
     });
 
-    test('recovers after a timeout once the backlog can drain again', async () => {
-      const reserved = await singleConnDb.reserve();
-      const firstReadyForMore = storeUntilWedged();
-      await expect(firstReadyForMore).rejects.toThrow(/wedged/);
+    test('getStartStreamInitializationParameters rejects on a hang', async () => {
+      await withReservedConnection(() =>
+        storer.getStartStreamInitializationParameters(),
+      );
+    });
 
-      // Release the connection so the storer can make progress again.
-      reserved.release();
-      storer.store('20', ['commit', messages.commit(), {watermark: '20'}]);
-      await expectConsumed('20');
+    test('getMinWatermarkForCatchup rejects on a hang', async () => {
+      await withReservedConnection(() => storer.getMinWatermarkForCatchup());
+    });
 
-      // A stale, already-rejected resolver must not be reused: with nothing
-      // queued, back pressure should no longer be in effect.
-      expect(storer.readyForMore()).toBeUndefined();
+    test('getCatchupBounds rejects on a hang', async () => {
+      await withReservedConnection(() => storer.getCatchupBounds());
     });
   });
 
