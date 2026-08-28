@@ -1030,7 +1030,7 @@ export class PipelineDriver {
         const advanceContext = must(this.#advanceContext);
         advanceContext.currentChangeStartMs = start;
 
-        let type;
+        let type: 'add' | 'remove' | 'edit' | undefined;
         try {
           try {
             const tableSource = this.#tables.get(table);
@@ -1053,6 +1053,7 @@ export class PipelineDriver {
                 if (nextValue) {
                   this.#conflictRowsDeleted.add(1);
                 }
+                type = 'remove';
                 yield* this.#push(
                   tableSource,
                   makeSourceChangeRemove(prevValue as Row),
@@ -1061,11 +1062,13 @@ export class PipelineDriver {
             }
             if (nextValue) {
               if (editOldRow) {
+                type = 'edit';
                 yield* this.#push(
                   tableSource,
                   makeSourceChangeEdit(nextValue as Row, editOldRow),
                 );
               } else {
+                type = 'add';
                 yield* this.#push(
                   tableSource,
                   makeSourceChangeAdd(nextValue as Row),

@@ -14,6 +14,7 @@ import type {BoundedPlanCache} from '../../../zql/src/builder/plan-cache.ts';
 import {resolveAuth, type Auth, type ValidateLegacyJWT} from '../auth/auth.ts';
 import {tokenConfigOptions} from '../auth/jwt.ts';
 import {type ZeroConfig} from '../config/zero-config.ts';
+import {startEventLoopMonitor} from '../observability/event-loop.ts';
 import {
   getOrCreateCounter,
   getOrCreateGauge,
@@ -408,6 +409,7 @@ export class Syncer implements SingletonService {
   #viewSyncerLagSampleInterval: ReturnType<typeof setInterval> | undefined;
   #eligibilityLogInterval: ReturnType<typeof setInterval> | undefined;
   readonly #planCache: BoundedPlanCache;
+  #stopEventLoopMonitor: (() => void) | undefined;
 
   constructor(
     lc: LogContext,
@@ -614,6 +616,8 @@ export class Syncer implements SingletonService {
       SHARED_ADVANCE_ELIGIBILITY_LOG_INTERVAL_MS,
     );
     this.#eligibilityLogInterval.unref?.();
+
+    this.#stopEventLoopMonitor = startEventLoopMonitor();
   }
 
   #computeServingLagDistribution(): ServingLagDistribution {
@@ -930,6 +934,7 @@ export class Syncer implements SingletonService {
     clearInterval(this.#viewSyncerLagSampleInterval);
     clearInterval(this.#eligibilityLogInterval);
     this.#planCache.clear();
+    this.#stopEventLoopMonitor?.();
     this.#wss.close();
     this.#stopped.resolve();
     return promiseVoid;
