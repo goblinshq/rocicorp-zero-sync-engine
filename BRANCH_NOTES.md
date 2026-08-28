@@ -1,3 +1,84 @@
+# INTEGRATION PREVIEW -- do not open a pull request from this branch
+
+`capy/zc-combined-preview` exists to prove that the seven zero-cache performance
+branches compose and to measure the stack against the same-machine baseline. The
+six optimizations land individually, on their own branches, with their own
+reviews. Nothing here is new work: every code change on this branch arrived
+through a merge, and the only hand-written content is this preamble and the
+conflict log below.
+
+Base: `main` @ `16019afa4`.
+
+## Merge order
+
+Each optimization branch was merged separately with `--no-ff`, so every merge is
+one reviewable commit and no conflict is hidden inside an octopus. The harness
+branch is merged last, because its stage probes have to sit on top of the
+optimized code for `diagnosis-*` events to describe what the optimized code
+actually does.
+
+1. `capy/planner-blueprint-cache`
+2. `capy/scalar-gate-propagation`
+3. `capy/scalar-compound-guard`
+4. `capy/zqlite-fetch-cost`
+5. `capy/streamer-batch`
+6. `capy/flipped-join-batch-cost`
+7. `capy/syncer-observability`
+8. `capy/zc-baseline-harness` (instrumentation, must be last)
+
+## Conflicts and resolutions
+
+**`BRANCH_NOTES.md`, add/add, on all seven merges.** Every branch writes its own
+notes to the same path. Resolved by concatenation: the accumulated file stays
+first and the incoming branch's notes follow under a
+`# Merged branch notes: capy/<branch>` heading. Documentation only, no code
+effect.
+
+**`packages/zqlite/src/resolve-scalar-subqueries.test.ts`, merge 3
+(`scalar-compound-guard` onto `scalar-gate-propagation`).** Gate propagation
+widened the file's `makeTableSpecs` helper with an optional `columns` parameter
+that defaults to `{}` and appended its propagation suite; compound guard appended
+a separate compound-correlation suite onto the unmodified base, so git saw two
+different rewrites of the same tail. Resolved by keeping the gate-propagation
+file in full and re-appending the compound-guard tail after it. Compound guard's
+`makeTableSpecs({parent: …, child: …})` calls bind to the widened signature
+unchanged because the new parameter is optional. Both suites run and pass.
+
+**`packages/zero-cache/src/workers/syncer.ts`, merge 7
+(`syncer-observability` onto `planner-blueprint-cache`).** Both branches add one
+field to `Syncer` and one line to `stop()`, at the same two places. Resolved by
+keeping both: `#planCache` next to `#stopEventLoopMonitor`, and
+`this.#planCache.clear()` next to `this.#stopEventLoopMonitor?.()`.
+
+**`packages/zero-cache/src/services/view-syncer/view-syncer.ts`, merge 8
+(`zc-baseline-harness` onto `syncer-observability`).** The two branches
+instrument the same three points for different consumers. Observability
+restructured `#runInLockWithCVR` so the whole locked body sits in a `try`, and
+records `lockWaitTime`/`lockHoldTime` histograms around it; the harness left the
+body flat and added `diagnosis-view-syncer-lock-acquired` and
+`-lock-released` logs at the same boundaries. Resolved by keeping
+observability's structure and feeding both consumers from one measurement:
+`lockHoldStart` is taken once on lock entry, `lockWaitMs` is derived from it for
+both the histogram and the acquired log, and the `finally` block computes
+`lockHoldMs` once for both the hold histogram and the released log's
+`lockWorkMs`. The harness's duplicated copy of the pre-`try` body was dropped,
+since observability's restructure already contains it. At the end of the query
+wave both sides are additive, so `#waveWallTime`/`#waveRows` and the
+`diagnosis-query-wave-stages` log both stay.
+
+No conflict required a behavioral choice: every resolution keeps both branches'
+observable effects.
+
+## What was validated on this tree
+
+`pnpm --filter zql test` (1335), `--filter zqlite test` (228), `--filter
+zero-cache test:no-pg` (1997), `--filter zero-cache test:pg17` (719), `--filter
+zql-integration-tests test` (1165), plus `check-types`, `lint` and
+`check-format` on all four packages. No test fails on the combination that
+passes on the branches alone.
+
+---
+
 # Cache planner decisions across client groups
 
 ## Problem
