@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787839039396,
+  "lastUpdate": 1787926877515,
   "repoUrl": "https://github.com/goblinshq/rocicorp-zero-sync-engine",
   "entries": {
     "Bundle Sizes": [
@@ -55301,6 +55301,50 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/goblinshq/rocicorp-zero-sync-engine/commit/16019afa40817773ef8854386668ba74e0d06509"
         },
         "date": 1787839029655,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Size of replicache.mjs",
+            "value": 317629,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.mjs.br (Brotli compressed)",
+            "value": 57073,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs",
+            "value": 117348,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs.br (Brotli compressed)",
+            "value": 33538,
+            "unit": "bytes"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "41898282+github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "committer": {
+            "email": "41898282+github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "distinct": true,
+          "id": "c6d5e95e69f0fae497f1cc64923b57041d4ccffb",
+          "message": "Merge remote-tracking branch 'upstream/main'",
+          "timestamp": "2026-08-28T14:20:01Z",
+          "tree_id": "51d93428e0d2d454c94b31a3c0def29d1383fbbd",
+          "url": "https://github.com/goblinshq/rocicorp-zero-sync-engine/commit/c6d5e95e69f0fae497f1cc64923b57041d4ccffb"
+        },
+        "date": 1787926865528,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
