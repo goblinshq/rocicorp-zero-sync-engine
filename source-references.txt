@@ -1,0 +1,918 @@
+
+=== packages/zero-client/src/client/query-manager.ts:438-476 ===
+   438	        name: entry.name,
+   439	        args: entry.args,
+   440	        ttl,
+   441	      });
+   442	    }
+   443	  }
+   444	
+   445	  #queueQueryChange(op: UpQueriesPatchOp) {
+   446	    this.#pendingQueryChanges.push(op);
+   447	    this.#scheduleBatch();
+   448	  }
+   449	
+   450	  #scheduleBatch() {
+   451	    if (this.#batchTimer === undefined) {
+   452	      this.#batchTimer = setTimeout(
+   453	        () => this.flushBatch(),
+   454	        this.#queryChangeThrottleMs,
+   455	      );
+   456	    }
+   457	  }
+   458	
+   459	  flushBatch() {
+   460	    if (this.#batchTimer !== undefined) {
+   461	      clearTimeout(this.#batchTimer);
+   462	      this.#batchTimer = undefined;
+   463	    }
+   464	    if (this.#pendingQueryChanges.length > 0) {
+   465	      this.#send([
+   466	        'changeDesiredQueries',
+   467	        {
+   468	          desiredQueriesPatch: [...this.#pendingQueryChanges],
+   469	        },
+   470	      ]);
+   471	      this.#pendingQueryChanges.length = 0;
+   472	    }
+   473	  }
+   474	
+   475	  #remove(entry: Entry, astHash: string, gotCallback: GotCallback | undefined) {
+   476	    if (gotCallback) {
+
+=== packages/zero-cache/src/server/worker-dispatcher.ts:60-84 ===
+    60	    ).addCallback(result => {
+    61	      if (maxProtocolVersion) {
+    62	        result.observe(maxProtocolVersion);
+    63	      }
+    64	    });
+    65	
+    66	    const handleSync = (req: IncomingMessageSubset) => {
+    67	      assert(syncers.length, 'Received a sync request with no sync workers.');
+    68	      const params = connectParams(req);
+    69	      const {clientGroupID, protocolVersion} = params;
+    70	      maxProtocolVersion = Math.max(maxProtocolVersion, protocolVersion);
+    71	
+    72	      // Include the TaskID when hash-bucketting the client group to the sync
+    73	      // worker. This diversifies the distribution of client groups (across
+    74	      // workers) for different tasks, so that if one task sheds connections
+    75	      // from its most heavily loaded sync worker(s), those client groups will
+    76	      // be distributed uniformly across workers on the receiving task(s).
+    77	      const syncer = h32(taskID + '/' + clientGroupID) % syncers.length;
+    78	
+    79	      lc.debug?.(`connecting ${clientGroupID} to syncer ${syncer}`);
+    80	      return {payload: params, sender: syncers[syncer]};
+    81	    };
+    82	
+    83	    const handleChangeStream = (req: IncomingMessageSubset) => {
+    84	      // Note: The change-streamer is generally not dispatched via the main
+
+=== packages/zero-cache/src/server/runner/main.ts:65-104 ===
+
+=== packages/zero-cache/src/server/runner/main.ts:150-176 ===
+
+=== packages/zero-cache/src/services/view-syncer/view-syncer.ts:475-550 ===
+   475	      () => this.#stateChanges.cancel(),
+   476	    );
+   477	    this.#setTimeout = setTimeoutFn;
+   478	    this.#runPriorityOp = runPriorityOp;
+   479	    // Wait for the first connection to init.
+   480	    this.keepalive();
+   481	  }
+   482	
+   483	  #runInLockWithCVR(
+   484	    fn: (lc: LogContext, cvr: CVRSnapshot) => Promise<void> | void,
+   485	  ): Promise<void> {
+   486	    const rid = randomID();
+   487	    this.#lc.debug?.('about to acquire lock for cvr ', rid);
+   488	    const lockWaitStart = performance.now();
+   489	    return this.#lock.withLock(async () => {
+   490	      this.#lockWaitTime.recordMs(performance.now() - lockWaitStart);
+   491	      this.#lc.debug?.('acquired lock in #runInLockWithCVR ', rid);
+   492	      const lc = this.#lc.withContext('lock', rid);
+   493	      if (!this.#stateChanges.active) {
+   494	        // view-syncer has been shutdown. this can be a backlog of tasks
+   495	        // queued on the lock, or it can be a race condition in which a
+   496	        // client connects before the ViewSyncer has been deleted from the
+   497	        // ServiceRunner.
+   498	        this.#lc.debug?.('state changes are inactive');
+   499	        clearTimeout(this.#expiredQueriesTimer);
+   500	        throw new ProtocolErrorWithLevel(
+   501	          {
+   502	            kind: ErrorKind.Rehome,
+   503	            message: 'Reconnect required',
+   504	            origin: ErrorOrigin.ZeroCache,
+   505	          },
+   506	          'info',
+   507	        );
+   508	      }
+   509	      // If all clients have disconnected, cancel all pending work.
+   510	      if (await this.#checkForShutdownConditionsInLock()) {
+   511	        this.#lc.info?.(`closing clientGroupID=${this.id}`);
+   512	        // Reject #initialized so that run() unblocks if it is still
+   513	        // waiting on readyState(). This is a no-op if already resolved.
+   514	        this.#initialized.reject(shutdownBeforeInitializationError());
+   515	        this.#stateChanges.cancel(); // Note: #stateChanges.active becomes false.
+   516	        return;
+   517	      }
+   518	      if (!this.#cvr) {
+   519	        this.#lc.debug?.('loading cvr');
+   520	        this.#cvr = await this.#runPriorityOp(lc, 'loading cvr', () =>
+   521	          this.#cvrStore.load(lc, this.#lastConnectTime),
+   522	        );
+   523	        this.#ttlClock = this.#cvr.ttlClock;
+   524	        this.#ttlClockBase = Date.now();
+   525	      } else {
+   526	        // Make sure the CVR ttlClock is up to date.
+   527	        const now = Date.now();
+   528	        this.#cvr = {
+   529	          ...this.#cvr,
+   530	          ttlClock: this.#getTTLClock(now),
+   531	        };
+   532	      }
+   533	
+   534	      try {
+   535	        await fn(lc, this.#cvr);
+   536	      } catch (e) {
+   537	        // Clear cached state if an error is encountered.
+   538	        this.#cvr = undefined;
+   539	        throw e;
+   540	      } finally {
+   541	        // Lock-scoped work is where validated connections gain or lose
+   542	        // schedulable auth-maintenance deadlines. Recompute the single wakeup
+   543	        // after every locked operation; out-of-lock fail/close transitions only
+   544	        // clear or relax deadlines, so a stale earlier wakeup is harmless.
+   545	        this.#scheduleAuthMaintenance(lc);
+   546	      }
+   547	    });
+   548	  }
+   549	
+   550	  readyState(): Promise<'initialized' | 'draining'> {
+
+=== packages/zero-cache/src/services/view-syncer/view-syncer.ts:1970-2150 ===
+  1970	   * This must be called from within the #lock.
+  1971	   */
+  1972	  #syncQueryPipelineSet(
+  1973	    lc: LogContext,
+  1974	    cvr: CVRSnapshot,
+  1975	    customQueryTransformMode: CustomQueryTransformMode,
+  1976	    connCtx: ConnectionContext | undefined,
+  1977	    driftedQueryIDs: Set<string> = new Set(),
+  1978	  ) {
+  1979	    return startAsyncSpan(tracer, 'vs.#syncQueryPipelineSet', async span => {
+  1980	      const start = performance.now();
+  1981	      span.setAttribute('clientGroupID', this.id);
+  1982	      assert(
+  1983	        this.#pipelines.initialized(),
+  1984	        'pipelines must be initialized (syncQueryPipelineSet)',
+  1985	      );
+  1986	
+  1987	      if (this.#ttlClock === undefined) {
+  1988	        // Get it from the CVR or initialize it to now.
+  1989	        this.#ttlClock = cvr.ttlClock;
+  1990	      }
+  1991	      const now = Date.now();
+  1992	      const ttlClock = this.#getTTLClock(now);
+  1993	
+  1994	      // group cvr queries into:
+  1995	      // 1. custom queries
+  1996	      // 2. everything else
+  1997	      // Handle transformation appropriately
+  1998	      // Then hydrate as `serverQueries`
+  1999	      const cvrQueryEntires = Object.entries(cvr.queries);
+  2000	      const customQueries: Map<string, CustomQueryRecord> = new Map();
+  2001	      const otherQueries: {
+  2002	        id: string;
+  2003	        query: ClientQueryRecord | InternalQueryRecord;
+  2004	      }[] = [];
+  2005	      const transformedQueries: {
+  2006	        id: string;
+  2007	        origQuery: QueryRecord;
+  2008	        transformed: TransformedAndHashed;
+  2009	      }[] = [];
+  2010	      // When a specific connection triggered this work, use its context.
+  2011	      // Only background/shared sync work falls back to the selected
+  2012	      // validated connection.
+  2013	      const resolvedConnCtx =
+  2014	        connCtx ?? this.connContextManager.mustGetBackgroundConnectionContext();
+  2015	
+  2016	      for (const [id, query] of cvrQueryEntires) {
+  2017	        if (query.type === 'custom') {
+  2018	          // This should always match, no?
+  2019	          assert(id === query.id, 'custom query id mismatch');
+  2020	          customQueries.set(id, query);
+  2021	        } else {
+  2022	          otherQueries.push({id, query});
+  2023	        }
+  2024	      }
+  2025	
+  2026	      for (const {id, query: origQuery} of otherQueries) {
+  2027	        // This should always match, no?
+  2028	        assert(id === origQuery.id, 'query id mismatch');
+  2029	        const transformed = transformAndHashQuery(
+  2030	          lc,
+  2031	          origQuery.id,
+  2032	          origQuery.ast,
+  2033	          must(this.#pipelines.currentPermissions()).permissions ?? {
+  2034	            tables: {},
+  2035	          },
+  2036	          resolvedConnCtx.auth?.type === 'jwt'
+  2037	            ? resolvedConnCtx.auth
+  2038	            : undefined,
+  2039	          origQuery.type === 'internal',
+  2040	        );
+  2041	        transformedQueries.push({
+  2042	          id,
+  2043	          origQuery,
+  2044	          transformed,
+  2045	        });
+  2046	      }
+  2047	
+  2048	      if (customQueries.size > 0 && !this.#customQueryTransformer) {
+  2049	        lc.warn?.(
+  2050	          'Custom/named queries were requested but no `ZERO_QUERY_URL` is configured for Zero Cache.',
+  2051	        );
+  2052	      }
+  2053	
+  2054	      let erroredQueryIDs: string[] | undefined;
+  2055	      const customQueriesToTransform =
+  2056	        customQueryTransformMode === 'all'
+  2057	          ? [...customQueries.values()]
+  2058	          : (customQueryTransformMode satisfies 'missing') &&
+  2059	            [...customQueries.values()].filter(
+  2060	              q => !this.#pipelines.queries().has(q.id),
+  2061	            );
+  2062	      const customQueryTransformer = this.#customQueryTransformer;
+  2063	      if (customQueryTransformer && customQueriesToTransform.length > 0) {
+  2064	        // Always re-transform custom queries on client connection for security.
+  2065	        // This ensures the user's API server validates authorization with the
+  2066	        // current auth context.
+  2067	        const transformStart = performance.now();
+  2068	        let transformedCustomQueries: HashedTransformResponse;
+  2069	        try {
+  2070	          transformedCustomQueries = await this.#runPriorityOp(
+  2071	            lc,
+  2072	            '#syncQueryPipelineSet transforming custom queries',
+  2073	            () =>
+  2074	              customQueryTransformer.transform(
+  2075	                resolvedConnCtx,
+  2076	                customQueriesToTransform,
+  2077	              ),
+  2078	          );
+  2079	
+  2080	          // Check if transform failed entirely (HTTP error or server-side failure).
+  2081	          // This should disconnect the client and keep existing pipelines intact.
+  2082	          if (transformedCustomQueries.kind === 'failed') {
+  2083	            throw new ProtocolErrorWithLevel(
+  2084	              transformedCustomQueries.result,
+  2085	              'warn',
+  2086	            );
+  2087	          } else {
+  2088	            // If the transform wasn't cached, we mark the connection as validated.
+  2089	            // This also threads the authoritative server userID through the
+  2090	            // revision check so auth races do not validate stale credentials.
+  2091	            if (!transformedCustomQueries.cached) {
+  2092	              this.connContextManager.validateConnection(
+  2093	                resolvedConnCtx,
+  2094	                resolvedConnCtx.revision,
+  2095	                transformedCustomQueries.validation,
+  2096	              );
+  2097	            }
+  2098	            this.#queryTransformations.add(1, {result: 'success'});
+  2099	          }
+  2100	        } catch (e) {
+  2101	          this.#queryTransformations.add(1, {result: 'error'});
+  2102	          throw e;
+  2103	        } finally {
+  2104	          const transformDuration = performance.now() - transformStart;
+  2105	          this.#queryTransformationTime.recordMs(transformDuration);
+  2106	        }
+  2107	
+  2108	        // Process the transformed queries and track which ones succeeded.
+  2109	        const successfullyTransformedCustomQueries = new Map<
+  2110	          string,
+  2111	          TransformedAndHashed
+  2112	        >();
+  2113	        erroredQueryIDs = this.#processTransformedCustomQueries(
+  2114	          lc,
+  2115	          transformedCustomQueries.result,
+  2116	          (q: TransformedAndHashed) => {
+  2117	            const origQuery = customQueries.get(q.id);
+  2118	            if (origQuery) {
+  2119	              successfullyTransformedCustomQueries.set(q.id, q);
+  2120	              transformedQueries.push({
+  2121	                id: q.id,
+  2122	                origQuery,
+  2123	                transformed: q,
+  2124	              });
+  2125	            }
+  2126	          },
+  2127	          customQueries,
+  2128	        );
+  2129	
+  2130	        // Check for queries whose transformation hash changed and log for debugging.
+  2131	        // The old pipelines will be removed and destroyed when
+  2132	        // PipelineManager.addQuery is called with an existing query id and
+  2133	        // different transformation hash.
+  2134	        for (const [
+  2135	          queryID,
+  2136	          newTransform,
+  2137	        ] of successfullyTransformedCustomQueries) {
+  2138	          const existingTransformHash =
+  2139	            cvr.queries[queryID]?.transformationHash;
+  2140	          if (existingTransformHash) {
+  2141	            const oldHash = existingTransformHash;
+  2142	            const newHash = newTransform.transformationHash;
+  2143	
+  2144	            if (oldHash !== newHash) {
+  2145	              // Transformation changed - log and check for thrashing.
+  2146	              // The unhydrateQueries mechanism below will remove the old pipeline,
+  2147	              // and addQueries will add the new one.
+  2148	              lc.info?.(
+  2149	                `Query ${queryID} transformation changed: ${oldHash} -> ${newHash}`,
+  2150	              );
+
+=== packages/zero-cache/src/services/view-syncer/view-syncer.ts:2260-2485 ===
+  2260	    removeQueries: {id: string}[],
+  2261	    driftedQueryIDs: Set<string> = new Set(),
+  2262	  ): Promise<void> {
+  2263	    return startAsyncSpan(tracer, 'vs.#addAndRemoveQueries', async () => {
+  2264	      assert(
+  2265	        addQueries.length > 0 || removeQueries.length > 0,
+  2266	        'Must have queries to add or remove',
+  2267	      );
+  2268	      const start = performance.now();
+  2269	
+  2270	      const stateVersion = this.#pipelines.currentVersion();
+  2271	      lc = lc.withContext('stateVersion', stateVersion);
+  2272	      lc.info?.(`hydrating ${addQueries.length} queries`);
+  2273	
+  2274	      const updater = new CVRQueryDrivenUpdater(
+  2275	        this.#cvrStore,
+  2276	        cvr,
+  2277	        stateVersion,
+  2278	        this.#pipelines.replicaVersion,
+  2279	        queryID => this.#pipelines.rowSetSignature(queryID),
+  2280	      );
+  2281	
+  2282	      const sameHashRehydratedQueryIDs = addQueries
+  2283	        .filter(
+  2284	          q => cvr.queries[q.id]?.transformationHash === q.transformationHash,
+  2285	        )
+  2286	        .map(q => q.id);
+  2287	      const trackQueriesWillBumpVersion =
+  2288	        stateVersion > cvr.version.stateVersion ||
+  2289	        removeQueries.length > 0 ||
+  2290	        addQueries.some(
+  2291	          q => cvr.queries[q.id]?.transformationHash !== q.transformationHash,
+  2292	        );
+  2293	
+  2294	      // For already-gotten queries being re-executed without a stateVersion
+  2295	      // or transformationHash change, trackQueries does not bump configVersion.
+  2296	      // Force a bump so any row diff produced by received() gets propagated to
+  2297	      // the client via a poke. Must happen before startPoke so the pokers see
+  2298	      // the final cookie version.
+  2299	      if (
+  2300	        sameHashRehydratedQueryIDs.length > 0 &&
+  2301	        !trackQueriesWillBumpVersion
+  2302	      ) {
+  2303	        const drifted = sameHashRehydratedQueryIDs.filter(id =>
+  2304	          driftedQueryIDs.has(id),
+  2305	        ).length;
+  2306	        const missing = sameHashRehydratedQueryIDs.length - drifted;
+  2307	        const reason =
+  2308	          drifted && missing
+  2309	            ? 'mixed'
+  2310	            : drifted
+  2311	              ? 'row-set-signature-drift'
+  2312	              : 'missing-pipeline';
+  2313	        this.#sameHashRehydrationVersionBumps.add(1, {reason});
+  2314	        updater.ensureNewVersion();
+  2315	      }
+  2316	
+  2317	      // Note: This kicks off background PG queries for CVR data associated with the
+  2318	      // executed and removed queries.
+  2319	      const {queryPatches, newVersion} = updater.trackQueries(
+  2320	        lc,
+  2321	        addQueries,
+  2322	        removeQueries,
+  2323	      );
+  2324	
+  2325	      const clients = this.#getClients();
+  2326	      const pokers = startPoke(clients, newVersion);
+  2327	      for (const patch of queryPatches) {
+  2328	        // Bump patches' toVersion to the post-drift-bump version so that
+  2329	        // pokers don't see them as belonging to a stale cookie.
+  2330	        await pokers.addPatch(patch);
+  2331	      }
+  2332	
+  2333	      // Removing queries is easy. The pipelines are dropped, and the CVR
+  2334	      // updater handles the updates and pokes.
+  2335	      for (const q of removeQueries) {
+  2336	        this.#pipelines.removeQuery(q.id);
+  2337	        // Remove per-query server metrics when query is deleted
+  2338	        this.#inspectorDelegate.removeQuery(q.id);
+  2339	        // Clean up thrashing detection for removed queries
+  2340	        this.#queryReplacements.delete(q.id);
+  2341	      }
+  2342	
+  2343	      let totalProcessTime = 0;
+  2344	      const timer = new TimeSliceTimer(lc);
+  2345	      const pipelines = this.#pipelines;
+  2346	      const hydrations = this.#hydrations;
+  2347	      const hydrationTime = this.#hydrationTime;
+  2348	      const queryCoveringIndex = this.#config.enableQueryCovering
+  2349	        ? new QueryCoveringIndex(this.#pipelines.queries())
+  2350	        : undefined;
+  2351	      let totalHydratedQueries = 0;
+  2352	      let coveredHydratedQueries = 0;
+  2353	      let firstCoveredQuery: QueryCoverageShadowHit | undefined;
+  2354	      // oxlint-disable-next-line @typescript-eslint/no-this-alias
+  2355	      const self = this;
+  2356	
+  2357	      // yield at the very beginning so that the first time slice
+  2358	      // is properly processed by the time-slice queue.
+  2359	      await yieldProcess(lc);
+  2360	
+  2361	      function* generateRowChanges(slowHydrateThreshold: number) {
+  2362	        for (const q of addQueries) {
+  2363	          let queryLC = lc
+  2364	            .withContext('hash', q.id)
+  2365	            .withContext('queryHash', q.id)
+  2366	            .withContext('transformationHash', q.transformationHash);
+  2367	          if (q.name !== undefined) {
+  2368	            queryLC = queryLC.withContext('queryName', q.name);
+  2369	          }
+  2370	          queryLC.debug?.(`adding pipeline for query`, q.ast);
+  2371	
+  2372	          const covered = queryCoveringIndex
+  2373	            ? self.#findQueryCoverageShadowHit(
+  2374	                queryCoveringIndex,
+  2375	                q.id,
+  2376	                q.transformationHash,
+  2377	                q.ast,
+  2378	                q.name,
+  2379	              )
+  2380	            : undefined;
+  2381	          totalHydratedQueries++;
+  2382	          if (covered) {
+  2383	            coveredHydratedQueries++;
+  2384	            firstCoveredQuery ??= covered;
+  2385	          }
+  2386	          yield* pipelines.addQuery(
+  2387	            q.transformationHash,
+  2388	            q.id,
+  2389	            q.ast,
+  2390	            timer.startWithoutYielding(),
+  2391	            q.name,
+  2392	            'query-set-sync',
+  2393	          );
+  2394	          const elapsed = timer.stop();
+  2395	          totalProcessTime += elapsed;
+  2396	
+  2397	          self.#addQueryMaterializationServerMetric(q.id, elapsed);
+  2398	          self.#inspectorDelegate.addQuery(q.id, q.ast);
+  2399	          queryCoveringIndex?.add(q.id, {
+  2400	            transformedAst: q.ast,
+  2401	            transformationHash: q.transformationHash,
+  2402	            ...(q.name !== undefined && {queryName: q.name}),
+  2403	          });
+  2404	
+  2405	          if (elapsed > slowHydrateThreshold) {
+  2406	            queryLC.warn?.('Slow query materialization', elapsed, q.ast);
+  2407	          }
+  2408	          manualSpan(tracer, 'vs.addAndConsumeQuery', elapsed, {
+  2409	            hash: q.id,
+  2410	            transformationHash: q.transformationHash,
+  2411	            ...(q.name !== undefined && {name: q.name}),
+  2412	          });
+  2413	        }
+  2414	        hydrations.add(1);
+  2415	        hydrationTime.recordMs(totalProcessTime);
+  2416	      }
+  2417	      // #processChanges does batched de-duping of rows. Wrap all pipelines in
+  2418	      // a single generator in order to maximize de-duping.
+  2419	      await this.#processChanges(
+  2420	        lc,
+  2421	        timer,
+  2422	        generateRowChanges(this.#slowHydrateThreshold),
+  2423	        updater,
+  2424	        pokers,
+  2425	      );
+  2426	      this.#logQueryCoverageShadowSummary(
+  2427	        lc,
+  2428	        'add',
+  2429	        totalHydratedQueries,
+  2430	        coveredHydratedQueries,
+  2431	        firstCoveredQuery,
+  2432	      );
+  2433	
+  2434	      await startAsyncSpan(
+  2435	        tracer,
+  2436	        'vs.#syncQueryPipelineSet.deleteUnreferencedRows',
+  2437	        async () => {
+  2438	          for (const patch of await updater.deleteUnreferencedRows(lc)) {
+  2439	            await pokers.addPatch(patch);
+  2440	          }
+  2441	        },
+  2442	      );
+  2443	
+  2444	      // Commit the changes and update the CVR snapshot.
+  2445	      this.#cvr = await this.#flushUpdater(lc, updater);
+  2446	
+  2447	      const finalVersion = this.#cvr.version;
+  2448	
+  2449	      // Before ending the poke, catch up clients that were behind the old CVR.
+  2450	      await this.#catchupClients(
+  2451	        lc,
+  2452	        cvr,
+  2453	        finalVersion,
+  2454	        addQueries.map(q => q.id),
+  2455	        pokers,
+  2456	      );
+  2457	
+  2458	      // Signal clients to commit.
+  2459	      await startAsyncSpan(tracer, 'vs.#syncQueryPipelineSet.pokeEnd', () =>
+  2460	        pokers.end(finalVersion),
+  2461	      );
+  2462	      // `stateVersion` is the replica version the queries were hydrated at,
+  2463	      // which is what the CVR was advanced to. See #markVersionServed.
+  2464	      this.#markVersionServed(stateVersion);
+  2465	
+  2466	      const wallTime = performance.now() - start;
+  2467	      lc.info?.(
+  2468	        `finished processing queries (process: ${totalProcessTime} ms, wall: ${wallTime} ms)`,
+  2469	      );
+  2470	    });
+  2471	  }
+  2472	
+  2473	  /**
+  2474	   * @param cvr The CVR to which clients should be caught up to. This does
+  2475	   *     not necessarily need to be the current CVR.
+  2476	   * @param current The expected current CVR version. Before performing
+  2477	   *     catchup, the snapshot read will verify that the CVR has not been
+  2478	   *     concurrently modified. Note that this only needs to be done for
+  2479	   *     catchup because it is the only time data from the CVR DB is
+  2480	   *     "exported" without being gated by a CVR flush (which provides
+  2481	   *     concurrency protection in all other cases).
+  2482	   *
+  2483	   *     If unspecified, the version of the `cvr` is used.
+  2484	   * @param excludeQueryHashes Exclude patches from rows associated with
+  2485	   *     the specified queries.
+
+=== packages/zero-cache/src/services/view-syncer/view-syncer.ts:2570-2650 ===
+  2570	      }
+  2571	    });
+  2572	  }
+  2573	
+  2574	  #processChanges(
+  2575	    lc: LogContext,
+  2576	    timer: TimeSliceTimer,
+  2577	    changes: Iterable<RowChange | 'yield'>,
+  2578	    updater: CVRQueryDrivenUpdater,
+  2579	    pokers: PokeHandler,
+  2580	  ) {
+  2581	    return startAsyncSpan(tracer, 'vs.#processChanges', async () => {
+  2582	      const start = performance.now();
+  2583	
+  2584	      const rows = new CustomKeyMap<RowID, RowUpdate>(rowIDString);
+  2585	      let total = 0;
+  2586	
+  2587	      const processBatch = () =>
+  2588	        startAsyncSpan(tracer, 'processBatch', async () => {
+  2589	          const wallElapsed = performance.now() - start;
+  2590	          total += rows.size;
+  2591	          lc.debug?.(
+  2592	            `processing ${rows.size} (of ${total}) rows (${wallElapsed} ms)`,
+  2593	          );
+  2594	          const patches = await updater.received(lc, rows);
+  2595	
+  2596	          await startAsyncSpan(
+  2597	            tracer,
+  2598	            'processBatch.flushToClient',
+  2599	            async span => {
+  2600	              span.setAttribute('patches', patches.length);
+  2601	              for (const patch of patches) {
+  2602	                await pokers.addPatch(patch);
+  2603	              }
+  2604	            },
+  2605	          );
+  2606	          rows.clear();
+  2607	        });
+  2608	
+  2609	      await startAsyncSpan(tracer, 'loopingChanges', async span => {
+  2610	        for (const change of changes) {
+  2611	          if (change === 'yield') {
+  2612	            await timer.yieldProcess('yield in processChanges');
+  2613	            continue;
+  2614	          }
+  2615	          const {type, queryID, table, rowKey, row} = change;
+  2616	          const rowID: RowID = {schema: '', table, rowKey: rowKey as RowKey};
+  2617	
+  2618	          let parsedRow = rows.get(rowID);
+  2619	          if (!parsedRow) {
+  2620	            parsedRow = {refCounts: {}};
+  2621	            rows.set(rowID, parsedRow);
+  2622	          }
+  2623	          parsedRow.refCounts[queryID] ??= 0;
+  2624	
+  2625	          const updateVersion = (row: Row) => {
+  2626	            // IVM can output multiple versions of a row as it goes through its
+  2627	            // intermediate stages. Always update the version and contents;
+  2628	            // the last version will reflect the final state.
+  2629	            const {version, contents} = contentsAndVersion(row);
+  2630	            parsedRow.version = version;
+  2631	            parsedRow.contents = contents;
+  2632	          };
+  2633	          switch (type) {
+  2634	            case ChangeType.ADD:
+  2635	              updateVersion(row);
+  2636	              parsedRow.refCounts[queryID]++;
+  2637	              break;
+  2638	            case ChangeType.EDIT:
+  2639	              updateVersion(row);
+  2640	              // No update to refCounts.
+  2641	              break;
+  2642	            case ChangeType.REMOVE:
+  2643	              parsedRow.refCounts[queryID]--;
+  2644	              break;
+  2645	            default:
+  2646	              unreachable(type);
+  2647	          }
+  2648	
+  2649	          if (rows.size % CURSOR_PAGE_SIZE === 0) {
+  2650	            await processBatch();
+
+=== packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:590-655 ===
+   590	   * Henceforth, updates to the query will be returned when the driver is
+   591	   * {@link advance}d. The query and its pipeline can be removed with
+   592	   * {@link removeQuery()}.
+   593	   *
+   594	   * If a query with the same queryID is already added, the existing pipeline
+   595	   * will be removed and destroyed before adding the new pipeline.
+   596	   *
+   597	   * @param timer The caller-controlled {@link Timer} used to determine the
+   598	   *        final hydration time. (The caller may pause and resume the timer
+   599	   *        when yielding the thread for time-slicing).
+   600	   * @return The rows from the initial hydration of the query.
+   601	   */
+   602	  addQuery(
+   603	    transformationHash: string,
+   604	    queryID: string,
+   605	    query: AST,
+   606	    timer: Timer,
+   607	    queryName?: string,
+   608	    hydrationReason: PipelineHydrationReason = 'query-set-sync',
+   609	  ): Iterable<RowChange | 'yield'> {
+   610	    return this.#trackRowSetSignatures(
+   611	      this.#addQueryImpl(
+   612	        transformationHash,
+   613	        queryID,
+   614	        query,
+   615	        timer,
+   616	        queryName,
+   617	        hydrationReason,
+   618	      ),
+   619	    );
+   620	  }
+   621	
+   622	  *#addQueryImpl(
+   623	    transformationHash: string,
+   624	    queryID: string,
+   625	    query: AST,
+   626	    timer: Timer,
+   627	    queryName?: string,
+   628	    hydrationReason: PipelineHydrationReason = 'query-set-sync',
+   629	  ): Iterable<RowChange | 'yield'> {
+   630	    assert(
+   631	      this.initialized(),
+   632	      'Pipeline driver must be initialized before adding queries',
+   633	    );
+   634	    this.removeQuery(queryID, 'replace-query');
+   635	    const pipelineRunID = randomID();
+   636	    this.#logQueryPipelineLifecycle({
+   637	      zeroEvent: 'query-pipeline-hydrate-start',
+   638	      pipelineRunID,
+   639	      queryHash: queryID,
+   640	      transformationHash,
+   641	      queryName,
+   642	      hydrationReason,
+   643	    });
+   644	    const debugDelegate = runtimeDebugFlags.trackRowsVended
+   645	      ? new Debug()
+   646	      : undefined;
+   647	
+   648	    const costModel = this.#ensureCostModelExistsIfEnabled(
+   649	      this.#snapshotter.current().db.db,
+   650	    );
+   651	
+   652	    assert(
+   653	      this.#advanceContext === null,
+   654	      'Cannot hydrate while advance is in progress',
+   655	    );
+
+=== packages/zero-cache/src/services/view-syncer/pipeline-driver.ts:1300-1400 ===
+  1300	
+  1301	  readonly #changes: [
+  1302	    queryID: string,
+  1303	    schema: SourceSchema,
+  1304	    changes: Iterable<Change | 'yield'>,
+  1305	  ][] = [];
+  1306	
+  1307	  accumulate(
+  1308	    queryID: string,
+  1309	    schema: SourceSchema,
+  1310	    changes: Iterable<Change | 'yield'>,
+  1311	  ): this {
+  1312	    this.#changes.push([queryID, schema, changes]);
+  1313	    return this;
+  1314	  }
+  1315	
+  1316	  *stream(): Iterable<RowChange | 'yield'> {
+  1317	    for (const [queryID, schema, changes] of this.#changes) {
+  1318	      try {
+  1319	        yield* this.#streamChanges(queryID, schema, changes);
+  1320	      } catch (e) {
+  1321	        this.#logQueryFailure?.(queryID, e);
+  1322	        throw e;
+  1323	      }
+  1324	    }
+  1325	  }
+  1326	
+  1327	  *#streamChanges(
+  1328	    queryID: string,
+  1329	    schema: SourceSchema,
+  1330	    changes: Iterable<Change | 'yield'>,
+  1331	  ): Iterable<RowChange | 'yield'> {
+  1332	    // We do not sync rows gathered by the permissions
+  1333	    // system to the client.
+  1334	    if (schema.system === 'permissions') {
+  1335	      return;
+  1336	    }
+  1337	
+  1338	    for (const change of changes) {
+  1339	      if (change === 'yield') {
+  1340	        yield change;
+  1341	        continue;
+  1342	      }
+  1343	      const type = change[ChangeIndex.TYPE];
+  1344	      switch (type) {
+  1345	        case ChangeType.REMOVE:
+  1346	        case ChangeType.ADD: {
+  1347	          yield* this.#streamNodes(queryID, schema, type, () => [
+  1348	            change[ChangeIndex.NODE],
+  1349	          ]);
+  1350	          break;
+  1351	        }
+  1352	
+  1353	        case ChangeType.CHILD: {
+  1354	          const child = change[ChangeIndex.CHILD_DATA];
+  1355	          const childSchema = must(
+  1356	            schema.relationships[child.relationshipName],
+  1357	          );
+  1358	
+  1359	          yield* this.#streamChanges(queryID, childSchema, [child.change]);
+  1360	          break;
+  1361	        }
+  1362	        case ChangeType.EDIT:
+  1363	          yield* this.#streamNodes(queryID, schema, type, () => [
+  1364	            {row: change[ChangeIndex.NODE].row, relationships: {}},
+  1365	          ]);
+  1366	          break;
+  1367	        default:
+  1368	          unreachable(change[ChangeIndex.TYPE]);
+  1369	      }
+  1370	    }
+  1371	  }
+  1372	
+  1373	  *#streamNodes(
+  1374	    queryID: string,
+  1375	    schema: SourceSchema,
+  1376	    op: ChangeType.ADD | ChangeType.REMOVE | ChangeType.EDIT,
+  1377	    nodes: () => Iterable<Node | 'yield'>,
+  1378	  ): Iterable<RowChange | 'yield'> {
+  1379	    const {tableName: table, system} = schema;
+  1380	
+  1381	    const primaryKey = must(this.#primaryKeys.get(table));
+  1382	    const spec = must(this.#tableSpecs.get(table)).tableSpec;
+  1383	
+  1384	    // We do not sync rows gathered by the permissions
+  1385	    // system to the client.
+  1386	    if (system === 'permissions') {
+  1387	      return;
+  1388	    }
+  1389	
+  1390	    for (const node of nodes()) {
+  1391	      if (node === 'yield') {
+  1392	        yield node;
+  1393	        continue;
+  1394	      }
+  1395	      const {relationships} = node;
+  1396	      let {row} = node;
+  1397	      const rowKey = getRowKey(primaryKey, row);
+  1398	      if (op !== ChangeType.REMOVE) {
+  1399	        const rowVersion = row[ZERO_VERSION_COLUMN_NAME];
+  1400	        if (
+
+=== packages/zero-cache/src/services/view-syncer/cvr-store.ts:830-930 ===
+   830	          "transformationVersion",
+   831	          "internal",
+   832	          "deleted",
+   833	          "rowSetSignature"
+   834	        )
+   835	        SELECT
+   836	          "clientGroupID",
+   837	          "queryHash",
+   838	          "clientAST",
+   839	          "queryName",
+   840	          CASE
+   841	            WHEN "queryArgs" IS NULL THEN NULL
+   842	            ELSE "queryArgs"::json
+   843	          END,
+   844	          "patchVersion",
+   845	          "transformationHash",
+   846	          "transformationVersion",
+   847	          "internal",
+   848	          "deleted",
+   849	          "rowSetSignature"
+   850	        FROM json_to_recordset(${rows}) AS x(
+   851	          "clientGroupID" TEXT,
+   852	          "queryHash" TEXT,
+   853	          "clientAST" JSONB,
+   854	          "queryName" TEXT,
+   855	          "queryArgs" TEXT,
+   856	          "patchVersion" TEXT,
+   857	          "transformationHash" TEXT,
+   858	          "transformationVersion" TEXT,
+   859	          "internal" BOOLEAN,
+   860	          "deleted" BOOLEAN,
+   861	          "rowSetSignature" TEXT
+   862	        )
+   863	        ON CONFLICT ("clientGroupID", "queryHash") DO UPDATE SET
+   864	          "clientAST" = excluded."clientAST",
+   865	          "queryName" = excluded."queryName",
+   866	          "queryArgs" = CASE
+   867	            WHEN excluded."queryArgs" IS NULL THEN NULL
+   868	            ELSE excluded."queryArgs"::json
+   869	          END,
+   870	          "patchVersion" = excluded."patchVersion",
+   871	          "transformationHash" = excluded."transformationHash",
+   872	          "transformationVersion" = excluded."transformationVersion",
+   873	          "internal" = excluded."internal",
+   874	          "deleted" = excluded."deleted",
+   875	          "rowSetSignature" = excluded."rowSetSignature"
+   876	      `);
+   877	    }
+   878	
+   879	    // Batch partial-only updates
+   880	    if (partialOnly.size > 0) {
+   881	      lc.debug?.(`Batch flushing ${partialOnly.size} partial query updates`);
+   882	      const rows = Array.from(
+   883	        partialOnly.entries(),
+   884	        ([queryHash, partial]) => ({
+   885	          clientGroupID: this.#id,
+   886	          queryHash,
+   887	          patchVersionSet: partial.patchVersion !== undefined,
+   888	          patchVersion: partial.patchVersion ?? null,
+   889	          deletedSet: partial.deleted !== undefined,
+   890	          deleted: partial.deleted ?? null,
+   891	          transformationHashSet: partial.transformationHash !== undefined,
+   892	          transformationHash: partial.transformationHash ?? null,
+   893	          transformationVersionSet: partial.transformationVersion !== undefined,
+   894	          transformationVersion: partial.transformationVersion ?? null,
+   895	          rowSetSignatureSet: partial.rowSetSignature !== undefined,
+   896	          rowSetSignature: partial.rowSetSignature ?? null,
+   897	        }),
+   898	      );
+   899	      queries.push(tx`
+   900	        UPDATE ${this.#cvr('queries')} AS q
+   901	        SET
+   902	          "patchVersion" = CASE
+   903	            WHEN u."patchVersionSet" THEN u."patchVersion"
+   904	            ELSE q."patchVersion"
+   905	          END,
+   906	          "deleted" = CASE
+   907	            WHEN u."deletedSet" THEN u."deleted"
+   908	            ELSE q."deleted"
+   909	          END,
+   910	          "transformationHash" = CASE
+   911	            WHEN u."transformationHashSet" THEN u."transformationHash"
+   912	            ELSE q."transformationHash"
+   913	          END,
+   914	          "transformationVersion" = CASE
+   915	            WHEN u."transformationVersionSet" THEN u."transformationVersion"
+   916	            ELSE q."transformationVersion"
+   917	          END,
+   918	          "rowSetSignature" = CASE
+   919	            WHEN u."rowSetSignatureSet" THEN u."rowSetSignature"
+   920	            ELSE q."rowSetSignature"
+   921	          END
+   922	        FROM json_to_recordset(${rows}) AS u(
+   923	          "clientGroupID" TEXT,
+   924	          "queryHash" TEXT,
+   925	          "patchVersionSet" BOOLEAN,
+   926	          "patchVersion" TEXT,
+   927	          "deletedSet" BOOLEAN,
+   928	          "deleted" BOOLEAN,
+   929	          "transformationHashSet" BOOLEAN,
+   930	          "transformationHash" TEXT,
