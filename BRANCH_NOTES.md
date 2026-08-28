@@ -1,6 +1,6 @@
 # `capy/zqlite-fetch-cost` — per-fetch and per-row cost in `TableSource`
 
-Five commits, all inside `packages/zqlite`, all behavior-preserving. No API
+Six commits, all inside `packages/zqlite`, all behavior-preserving. No API
 changes outside the package. Measured against the seeded assignment replica
 from the zero-cache diagnosis kit.
 
@@ -31,7 +31,7 @@ zqlite `format` at 8.2–8.6% inclusive, `formatStandard` at 5.2–5.6% self, an
 `normalizeWhitespace` at ~1% self, over a warm tracker hydration that runs
 7,795 fetches across only 12 distinct SQL texts.
 
-## The five commits
+## The commits
 
 1. **Log a completed SQLite iterator's slow-query epilogue once.** An exhausted
    iterator logged twice: `next()` logs on `done`, then `#fetch`'s `finally`
@@ -64,7 +64,8 @@ zqlite `format` at 8.2–8.6% inclusive, `formatStandard` at 5.2–5.6% self, an
 5. **Reuse a fetch's SQL text across fetches of the same shape.** A
    per-connection template keyed by the constrained columns in order, each
    multi-constraint's columns and arity, and `reverse`; values are rebound in
-   `buildSelectQuery`'s order. The connection already fixes the table, columns,
+   `buildSelectQuery`'s order, with the same per-entry column check
+   `multiConstraintToSQL` makes. The connection already fixes the table, columns,
    filters and ordering, and values never change the text because
    `constraintsToSQL` emits `col = ?` even for a null. `StatementCache` grows
    `getNormalized` so the canonical text is normalized once per template rather
@@ -85,15 +86,15 @@ median of 25 waves.
 
 | round | before | after |
 | ----: | -----: | ----: |
-| 1 | 55.0 ms | 37.3 ms |
-| 2 | 54.4 ms | 37.7 ms |
-| 3 | 54.9 ms | 37.1 ms |
-| 4 | 54.3 ms | 37.6 ms |
-| 5 | 56.2 ms | 37.3 ms |
-| 6 | 55.2 ms | 37.2 ms |
+| 1 | 54.9 ms | 37.3 ms |
+| 2 | 54.9 ms | 37.5 ms |
+| 3 | 55.2 ms | 37.3 ms |
+| 4 | 54.8 ms | 37.1 ms |
+| 5 | 54.0 ms | 37.6 ms |
+| 6 | 55.1 ms | 37.1 ms |
 
-**54.95 ms → 37.30 ms, −32.1%** on medians, and −32.1% on per-round minima
-(54.25 → 36.85 ms). The before and after ranges do not overlap.
+**54.98 ms → 37.32 ms, −32.1%** on medians, and −32.1% on per-round minima
+(54.833 → 36.80 ms). The before and after ranges do not overlap.
 
 Cumulative through each commit, same method, three interleaved rounds each:
 
@@ -159,12 +160,14 @@ and connection filters. Each cached shape is compared against building and
 formatting the query from scratch, twice, so it is served once by a fresh
 template and once by a cached one. Deliberately breaking the template key on
 `reverse`, on the constraint columns, on multi-constraint arity, on the
-filter-value position, or on the compound column order fails those tests.
+filter-value position, or on the compound column order fails those tests. A
+heterogeneous multi-constraint must throw rather than misbind, on the fresh path
+and on the cached one.
 
 ## Tests
 
 ```
-pnpm --filter zqlite test                 202 passed (13 files)
+pnpm --filter zqlite test                 203 passed (13 files)
 pnpm --filter zql test                    1316 passed, 2 skipped (76 files)
 pnpm --filter zql-integration-tests test  1165 passed, 16 skipped (91 files)
 pnpm --filter zero-cache test             4851 passed, 32 skipped (344 files)
@@ -182,7 +185,7 @@ npx oxfmt --check packages/zqlite/src     clean
 The harness is scratch and is not committed; it is archived with the raw logs in
 `~/.capy/work/zc-fetch-results/` on the run machine (`hydration-mix.ts`,
 `format-counters.ts`, `row-cost.ts`, `format-variants.ts`, `conv-variants.ts`,
-`fetch-cost.ts`, `prof-subtree.mjs`, `ab.sh`).
+`fetch-cost.ts`, `mc-heavy.ts`, `prof-subtree.mjs`, `ab.sh`).
 
 ```bash
 # fixture: copy the db together with its wal and shm
@@ -195,11 +198,44 @@ ROUNDS=6 REPS=25 ./ab.sh
 # work eliminated
 node --experimental-strip-types packages/zqlite/scratch/format-counters.ts
 
+# price the multi-constraint guard (needs a second worktree with it removed)
+node --experimental-strip-types packages/zqlite/scratch/mc-heavy.ts
+
 # equality diff
 MODE=dump OUT=rows-before.jsonl node --experimental-strip-types hydration-mix.ts  # baseline
 MODE=dump OUT=rows-after.jsonl  node --experimental-strip-types hydration-mix.ts  # branch
 cmp rows-before.jsonl rows-after.jsonl
 ```
+
+## What the multi-constraint guard costs
+
+`multiConstraintToSQL` asserts that every entry of a multi-constraint carries
+the first entry's columns, and a fetch served from a template never reaches it.
+An earlier revision of the template cache trusted that invariant instead of
+re-deriving it, which would have turned a loud assert into silently wrong
+bindings on a cache hit for any future caller that broke the shape. The
+templated binding path now makes the same check -- a column count per entry,
+plus a presence check per expected column.
+
+On the production-shaped wave, which binds 787 multi-constraint entries, the
+guard is invisible: 37.30 ms without it, 37.32 ms with it, under 0.1% of the
+wave.
+
+Priced on a pathological wave that is nothing but arity-126 multi-constraint
+fetches -- 800 fetches, 100,800 entries checked per wave, single-column and
+compound -- against the same branch with the guard removed:
+
+| | median | min |
+| --- | ---: | ---: |
+| without guard | 95.7 ms | 94.4 ms |
+| with guard | 96.4 ms | 95.4 ms |
+
+**+1.2%** of a wave that does nothing else, or roughly 12 ns per entry. It stays
+unconditional.
+
+Both halves are load-bearing, and the test proves it: removing the count check
+lets an entry with an extra column through, and removing the presence check lets
+an entry with the right number of columns but a different one through.
 
 ## Not done, and why
 
@@ -214,10 +250,3 @@ repeat a shape often enough to pay for that risk; in the replay they are 68 of
 row, 7.8% of `#fetch` self time. `#sqliteRowTimeSum` and the total elapsed
 measure genuinely different intervals, so collapsing them would change when the
 `type=sqlite` warning fires.
-
-**One invariant is now trusted rather than re-derived.** `multiConstraintToSQL`
-asserts that every entry of a multi-constraint carries the first entry's
-columns. A templated fetch takes the column order from the first entry without
-re-checking the rest, because re-checking would cost per entry on every fetch.
-FlippedJoin builds those entries from a single parentKey, which is what that
-assertion documents.
