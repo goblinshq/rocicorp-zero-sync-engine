@@ -1,6 +1,12 @@
 import {spawn, type ChildProcess} from 'node:child_process';
 import {once} from 'node:events';
-import {createWriteStream, mkdirSync, type WriteStream} from 'node:fs';
+import {
+  copyFileSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  type WriteStream,
+} from 'node:fs';
 import {rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -11,6 +17,8 @@ import {
   profileQueryName,
 } from './profile-queries.ts';
 import {sleep} from './util.ts';
+
+const OTLP_METRICS_PATH_REGEX = /\/v1\/metrics$/;
 
 export type ProcessCommand = {
   readonly name: string;
@@ -156,14 +164,139 @@ export function queryPlanAnalysisLogPath(config: BenchmarkConfig): string {
 }
 
 export async function removeReplicaFiles(replicaFile: string): Promise<void> {
-  await Promise.all(
-    [replicaFile, `${replicaFile}-shm`, `${replicaFile}-wal`].map(file =>
-      rm(file, {force: true}),
-    ),
-  );
+  const files: string[] = [
+    replicaFile,
+    `${replicaFile}-shm`,
+    `${replicaFile}-wal`,
+    `${replicaFile}-rm`,
+    `${replicaFile}-rm-shm`,
+    `${replicaFile}-rm-wal`,
+  ];
+  for (let i = 0; i < 20; i++) {
+    files.push(
+      `${replicaFile}-vs${i}`,
+      `${replicaFile}-vs${i}-shm`,
+      `${replicaFile}-vs${i}-wal`,
+    );
+  }
+  await Promise.all(files.map(file => rm(file, {force: true})));
 }
 
-export function startZeroCache(config: BenchmarkConfig): ManagedProcess {
+export type StartedTopology = {
+  readonly processes: readonly ManagedProcess[];
+  readonly readyURLs: readonly string[];
+  stop(): Promise<void>;
+};
+
+export async function startZeroTopology(
+  config: BenchmarkConfig,
+  metricsEndpoint?: string | undefined,
+): Promise<StartedTopology> {
+  if (config.profileRM || config.profileVS) {
+    mkdirSync(appPath(config.profileDir), {recursive: true});
+  }
+
+  if (config.topology === 'single') {
+    const singleProc = spawnZeroProcess({
+      config,
+      name: 'zero-cache',
+      port: config.zero.port,
+      numSyncWorkers: config.zero.numSyncWorkers,
+      replicaFile: config.zero.replicaFile,
+      metricsEndpoint,
+      profile: config.profileVS,
+    });
+    return {
+      processes: [singleProc],
+      readyURLs: [config.cacheURL],
+      stop: () => singleProc.stop(),
+    };
+  }
+
+  // Distributed topology: 1 RM + N View-Syncers
+  const processes: ManagedProcess[] = [];
+  const basePort = config.zero.port;
+  const rmPort = basePort;
+  const rmChangeStreamerPort = basePort + 1;
+
+  // 1. Replication Manager
+  const rmProcess = spawnZeroProcess({
+    config,
+    name: 'rm',
+    port: rmPort,
+    changeStreamerPort: rmChangeStreamerPort,
+    changeStreamerMode: 'dedicated',
+    numSyncWorkers: 0,
+    replicaFile: `${config.zero.replicaFile}-rm`,
+    metricsEndpoint,
+    profile: config.profileRM,
+  });
+  processes.push(rmProcess);
+
+  // The RM must finish initial sync before copying its replica to View-Syncers
+  await waitForZeroCache(
+    `http://127.0.0.1:${rmPort}`,
+    config.zero.readyTimeoutMs,
+    rmProcess,
+  );
+
+  // 2. View-Syncers (1 to N)
+  const readyURLs: string[] = [];
+  for (let i = 0; i < config.numViewSyncers; i++) {
+    const vsPort = basePort + 10 + i;
+    const vsURL = `http://127.0.0.1:${vsPort}`;
+    readyURLs.push(vsURL);
+
+    copyReplicaFile(
+      `${config.zero.replicaFile}-rm`,
+      `${config.zero.replicaFile}-vs${i}`,
+    );
+
+    const vs = spawnZeroProcess({
+      config,
+      name: `vs-${i}`,
+      port: vsPort,
+      changeStreamerURI: `http://127.0.0.1:${rmChangeStreamerPort}`,
+      numSyncWorkers: config.zero.numSyncWorkers,
+      replicaFile: `${config.zero.replicaFile}-vs${i}`,
+      metricsEndpoint,
+      profile: config.profileVS && i === 0,
+    });
+    processes.push(vs);
+  }
+
+  return {
+    processes,
+    readyURLs,
+    stop: async () => {
+      await Promise.all(processes.map(p => p.stop()));
+    },
+  };
+}
+
+function copyReplicaFile(src: string, dst: string): void {
+  copyFileSync(src, dst);
+  if (existsSync(`${src}-wal`)) {
+    copyFileSync(`${src}-wal`, `${dst}-wal`);
+  }
+  if (existsSync(`${src}-shm`)) {
+    copyFileSync(`${src}-shm`, `${dst}-shm`);
+  }
+}
+
+function spawnZeroProcess(args: {
+  readonly config: BenchmarkConfig;
+  readonly name: string;
+  readonly port: number;
+  readonly numSyncWorkers: number;
+  readonly replicaFile: string;
+  readonly changeStreamerURI?: string | undefined;
+  readonly changeStreamerPort?: number | undefined;
+  readonly changeStreamerMode?: string | undefined;
+  readonly metricsEndpoint?: string | undefined;
+  readonly profile?: boolean | undefined;
+}): ManagedProcess {
+  const {config, name, port, numSyncWorkers, replicaFile} = args;
   const zeroCacheMain = fileURLToPath(
     new URL(
       '../../../packages/zero-cache/src/server/runner/main.ts',
@@ -171,10 +304,56 @@ export function startZeroCache(config: BenchmarkConfig): ManagedProcess {
     ),
   );
   const command = [process.execPath, '--trace-warnings', zeroCacheMain];
-  const env = zeroCacheEnv(config);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_ENV: 'development',
+    DO_NOT_TRACK: '1',
+    ZERO_ENABLE_TELEMETRY: 'false',
+    ZERO_UPSTREAM_DB: config.pg.url,
+    ZERO_CVR_DB: config.pg.url,
+    ZERO_CHANGE_DB: config.pg.url,
+    ZERO_REPLICA_FILE: replicaFile,
+    ZERO_APP_ID: config.zero.appID,
+    ZERO_TASK_ID: `zero-throughput-${name}-${config.runID}`,
+    ZERO_PORT: String(port),
+    ZERO_NUM_SYNC_WORKERS: String(numSyncWorkers),
+    ZERO_UPSTREAM_MAX_CONNS: String(config.zero.upstreamMaxConns),
+    ZERO_CVR_MAX_CONNS: String(config.zero.cvrMaxConns),
+    ZERO_CHANGE_MAX_CONNS: String(config.zero.changeMaxConns),
+    ZERO_LOG_LEVEL: config.zero.logLevel,
+    ZERO_LOG_FORMAT: 'text',
+    ZERO_ALLOW_LEGACY_QUERIES: 'true',
+  };
+
+  if (args.changeStreamerURI) {
+    env.ZERO_CHANGE_STREAMER_URI = args.changeStreamerURI;
+  }
+  if (args.changeStreamerPort !== undefined) {
+    env.ZERO_CHANGE_STREAMER_PORT = String(args.changeStreamerPort);
+  }
+  if (args.changeStreamerMode) {
+    env.ZERO_CHANGE_STREAMER_MODE = args.changeStreamerMode;
+  }
+
+  if (args.metricsEndpoint) {
+    const baseURL = args.metricsEndpoint.replace(OTLP_METRICS_PATH_REGEX, '');
+    env.OTEL_EXPORTER_OTLP_ENDPOINT = baseURL;
+    env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = args.metricsEndpoint;
+    env.OTEL_METRICS_EXPORTER = 'otlp';
+    env.OTEL_EXPORTER_OTLP_PROTOCOL = 'http/json';
+    env.OTEL_METRIC_EXPORT_INTERVAL = '500';
+    env.OTEL_METRIC_EXPORT_TIMEOUT = '500';
+  }
+
+  if (args.profile) {
+    const profDir = appPath(config.profileDir);
+    mkdirSync(profDir, {recursive: true});
+    env.NODE_OPTIONS = `--cpu-prof --cpu-prof-dir="${profDir}" ${process.env.NODE_OPTIONS ?? ''}`;
+  }
+
   const logPath =
     config.processLogMode === 'file'
-      ? join(processLogsDir(config), `${config.runID}-zero-cache.log`)
+      ? join(processLogsDir(config), `${config.runID}-${name}.log`)
       : undefined;
   const logStream =
     logPath === undefined ? undefined : createWriteStream(logPath);
@@ -193,7 +372,7 @@ export function startZeroCache(config: BenchmarkConfig): ManagedProcess {
   pipeProcessLogs(child, logStream);
 
   return {
-    name: 'zero-cache',
+    name,
     command,
     cwd: repoRoot,
     logPath,
@@ -236,30 +415,6 @@ export async function waitForZeroCache(
   throw new Error(
     `Timed out waiting for zero-cache after ${timeoutMs}ms: ${String(lastError)}`,
   );
-}
-
-function zeroCacheEnv(config: BenchmarkConfig): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    NODE_ENV: 'development',
-    DO_NOT_TRACK: '1',
-    ZERO_ENABLE_TELEMETRY: 'false',
-    ZERO_UPSTREAM_DB: config.pg.url,
-    ZERO_CVR_DB: config.pg.url,
-    ZERO_CHANGE_DB: config.pg.url,
-    ZERO_REPLICA_FILE: config.zero.replicaFile,
-    ZERO_APP_ID: config.zero.appID,
-    ZERO_TASK_ID: `zero-throughput-${config.runID}`,
-    ZERO_PORT: String(config.zero.port),
-    ZERO_NUM_SYNC_WORKERS: String(config.zero.numSyncWorkers),
-    ZERO_UPSTREAM_MAX_CONNS: String(config.zero.upstreamMaxConns),
-    ZERO_CVR_MAX_CONNS: String(config.zero.cvrMaxConns),
-    ZERO_CHANGE_MAX_CONNS: String(config.zero.changeMaxConns),
-    ZERO_CHANGE_STREAMER_STARTUP_DELAY_MS: '0',
-    ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS: '1000',
-    ZERO_LOG_LEVEL: config.zero.logLevel,
-    ZERO_LOG_FORMAT: 'text',
-  };
 }
 
 async function runCommand(
