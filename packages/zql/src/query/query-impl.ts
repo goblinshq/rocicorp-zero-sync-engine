@@ -16,7 +16,7 @@ import {
   SUBQ_PREFIX,
   tableAST,
 } from '../../../zero-protocol/src/ast.ts';
-import {hashOfNormalizedAST} from '../../../zero-protocol/src/query-hash.ts';
+import {hashOfQueryInternals} from '../../../zero-protocol/src/query-hash-visitor.ts';
 import type {Schema} from '../../../zero-types/src/schema.ts';
 import {NotImplementedError} from '../error.ts';
 import {defaultFormat} from '../ivm/default-format.ts';
@@ -209,7 +209,7 @@ export class QueryImpl<
 
   hash(): string {
     if (!this.#hash) {
-      this.#hash = hashOfNormalizedAST(this.#ast);
+      this.#hash = hashOfQueryInternals(this.#ast, this.format);
     }
     return this.#hash;
   }
@@ -552,8 +552,9 @@ export class QueryImpl<
           },
           subquery: {
             ...tableAST(junctionSchema, `${SUBQ_PREFIX}${relationship}`),
-            // A single condition is flattened and sorted.
-            where: {
+            // A single condition needs no flattening or sorting, but the node
+            // itself still has to be rebuilt into the canonical field order.
+            where: normalizeCondition({
               type: 'correlatedSubquery',
               related: {
                 system: this.#system,
@@ -566,7 +567,7 @@ export class QueryImpl<
               op: 'EXISTS',
               ...(flip !== undefined ? {flip} : {}),
               ...(scalar !== undefined ? {scalar} : {}),
-            },
+            }),
           },
         },
         op: 'EXISTS',

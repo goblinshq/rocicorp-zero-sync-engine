@@ -5,8 +5,9 @@ import {
   toStaticParam,
   type AST,
   type Condition,
+  type NormalizedAST,
 } from '../../../zero-protocol/src/ast.ts';
-import {hashOfAST} from '../../../zero-protocol/src/query-hash.ts';
+import {hashOfNormalizedAST} from '../../../zero-protocol/src/query-hash.ts';
 import type {ExpressionFactory} from './expression.ts';
 import {newQuery} from './query-impl.ts';
 import {asQueryInternals} from './query-internals.ts';
@@ -41,6 +42,7 @@ describe('building the AST', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "EXISTS",
           "related": {
             "correlation": {
@@ -51,6 +53,7 @@ describe('building the AST', () => {
                 "id",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_labels",
               "limit": undefined,
@@ -60,6 +63,7 @@ describe('building the AST', () => {
               "start": undefined,
               "table": "issueLabel",
               "where": {
+                "flip": undefined,
                 "op": "EXISTS",
                 "related": {
                   "correlation": {
@@ -70,6 +74,7 @@ describe('building the AST', () => {
                       "labelId",
                     ],
                   },
+                  "hidden": undefined,
                   "subquery": {
                     "alias": "zsubq_zhidden_labels",
                     "limit": undefined,
@@ -110,11 +115,13 @@ describe('building the AST', () => {
                   },
                   "system": "client",
                 },
+                "scalar": undefined,
                 "type": "correlatedSubquery",
               },
             },
             "system": "client",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -1627,6 +1634,7 @@ describe('exists', () => {
           "start": undefined,
           "table": "issue",
           "where": {
+            "flip": undefined,
             "op": "EXISTS",
             "related": {
               "correlation": {
@@ -1637,6 +1645,7 @@ describe('exists', () => {
                   "ownerId",
                 ],
               },
+              "hidden": undefined,
               "subquery": {
                 "alias": "zsubq_owner",
                 "limit": undefined,
@@ -1649,6 +1658,7 @@ describe('exists', () => {
               },
               "system": "client",
             },
+            "scalar": undefined,
             "type": "correlatedSubquery",
           },
         }
@@ -1665,6 +1675,7 @@ describe('exists', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "EXISTS",
           "related": {
             "correlation": {
@@ -1675,6 +1686,7 @@ describe('exists', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -1687,6 +1699,7 @@ describe('exists', () => {
             },
             "system": "client",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -1707,6 +1720,7 @@ describe('exists', () => {
           "start": undefined,
           "table": "issue",
           "where": {
+            "flip": undefined,
             "op": "EXISTS",
             "related": {
               "correlation": {
@@ -1717,6 +1731,7 @@ describe('exists', () => {
                   "ownerId",
                 ],
               },
+              "hidden": undefined,
               "subquery": {
                 "alias": "zsubq_owner",
                 "limit": undefined,
@@ -1740,6 +1755,7 @@ describe('exists', () => {
               },
               "system": "client",
             },
+            "scalar": undefined,
             "type": "correlatedSubquery",
           },
         }
@@ -1761,6 +1777,7 @@ describe('exists', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "EXISTS",
           "related": {
             "correlation": {
@@ -1771,6 +1788,7 @@ describe('exists', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -1811,6 +1829,7 @@ describe('exists', () => {
             },
             "system": "client",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -1830,6 +1849,7 @@ describe('exists', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "EXISTS",
           "related": {
             "correlation": {
@@ -1840,6 +1860,7 @@ describe('exists', () => {
                 "id",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_labels",
               "limit": undefined,
@@ -1849,6 +1870,7 @@ describe('exists', () => {
               "start": undefined,
               "table": "issueLabel",
               "where": {
+                "flip": undefined,
                 "op": "EXISTS",
                 "related": {
                   "correlation": {
@@ -1859,6 +1881,7 @@ describe('exists', () => {
                       "labelId",
                     ],
                   },
+                  "hidden": undefined,
                   "subquery": {
                     "alias": "zsubq_zhidden_labels",
                     "limit": undefined,
@@ -1871,11 +1894,13 @@ describe('exists', () => {
                   },
                   "system": "client",
                 },
+                "scalar": undefined,
                 "type": "correlatedSubquery",
               },
             },
             "system": "client",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -1903,6 +1928,7 @@ describe('exists', () => {
         "where": {
           "conditions": [
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -1913,6 +1939,7 @@ describe('exists', () => {
                     "id",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_comments",
                   "limit": undefined,
@@ -1925,9 +1952,11 @@ describe('exists', () => {
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -1938,6 +1967,7 @@ describe('exists', () => {
                     "ownerId",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_owner",
                   "limit": undefined,
@@ -1950,6 +1980,7 @@ describe('exists', () => {
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
           ],
@@ -1973,6 +2004,7 @@ describe('exists', () => {
           "start": undefined,
           "table": "issue",
           "where": {
+            "flip": undefined,
             "op": "NOT EXISTS",
             "related": {
               "correlation": {
@@ -1983,6 +2015,7 @@ describe('exists', () => {
                   "id",
                 ],
               },
+              "hidden": undefined,
               "subquery": {
                 "alias": "zsubq_comments",
                 "limit": undefined,
@@ -1995,6 +2028,7 @@ describe('exists', () => {
               },
               "system": "permissions",
             },
+            "scalar": undefined,
             "type": "correlatedSubquery",
           },
         }
@@ -2017,6 +2051,7 @@ describe('exists', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "NOT EXISTS",
           "related": {
             "correlation": {
@@ -2027,6 +2062,7 @@ describe('exists', () => {
                 "id",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_labels",
               "limit": undefined,
@@ -2036,6 +2072,7 @@ describe('exists', () => {
               "start": undefined,
               "table": "issueLabel",
               "where": {
+                "flip": undefined,
                 "op": "EXISTS",
                 "related": {
                   "correlation": {
@@ -2046,6 +2083,7 @@ describe('exists', () => {
                       "labelId",
                     ],
                   },
+                  "hidden": undefined,
                   "subquery": {
                     "alias": "zsubq_zhidden_labels",
                     "limit": undefined,
@@ -2058,11 +2096,13 @@ describe('exists', () => {
                   },
                   "system": "permissions",
                 },
+                "scalar": undefined,
                 "type": "correlatedSubquery",
               },
             },
             "system": "permissions",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -2091,6 +2131,7 @@ describe('exists', () => {
         "where": {
           "conditions": [
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -2101,6 +2142,7 @@ describe('exists', () => {
                     "id",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_comments",
                   "limit": undefined,
@@ -2113,9 +2155,11 @@ describe('exists', () => {
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -2126,6 +2170,7 @@ describe('exists', () => {
                     "id",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_labels",
                   "limit": undefined,
@@ -2135,6 +2180,7 @@ describe('exists', () => {
                   "start": undefined,
                   "table": "issueLabel",
                   "where": {
+                    "flip": undefined,
                     "op": "EXISTS",
                     "related": {
                       "correlation": {
@@ -2145,6 +2191,7 @@ describe('exists', () => {
                           "labelId",
                         ],
                       },
+                      "hidden": undefined,
                       "subquery": {
                         "alias": "zsubq_zhidden_labels",
                         "limit": undefined,
@@ -2157,14 +2204,17 @@ describe('exists', () => {
                       },
                       "system": "client",
                     },
+                    "scalar": undefined,
                     "type": "correlatedSubquery",
                   },
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -2175,6 +2225,7 @@ describe('exists', () => {
                     "ownerId",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_owner",
                   "limit": undefined,
@@ -2187,6 +2238,7 @@ describe('exists', () => {
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
           ],
@@ -2222,6 +2274,7 @@ describe('exists', () => {
                   "ownerId",
                 ],
               },
+              "hidden": undefined,
               "subquery": {
                 "alias": "zsubq_owner",
                 "limit": undefined,
@@ -2234,6 +2287,7 @@ describe('exists', () => {
               },
               "system": "client",
             },
+            "scalar": undefined,
             "type": "correlatedSubquery",
           },
         }
@@ -2267,6 +2321,7 @@ describe('exists', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -2279,6 +2334,7 @@ describe('exists', () => {
             },
             "system": "client",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -2310,6 +2366,7 @@ describe('exists', () => {
                   "id",
                 ],
               },
+              "hidden": undefined,
               "subquery": {
                 "alias": "zsubq_labels",
                 "limit": undefined,
@@ -2330,6 +2387,7 @@ describe('exists', () => {
                         "labelId",
                       ],
                     },
+                    "hidden": undefined,
                     "subquery": {
                       "alias": "zsubq_zhidden_labels",
                       "limit": undefined,
@@ -2342,11 +2400,13 @@ describe('exists', () => {
                     },
                     "system": "client",
                   },
+                  "scalar": undefined,
                   "type": "correlatedSubquery",
                 },
               },
               "system": "client",
             },
+            "scalar": undefined,
             "type": "correlatedSubquery",
           },
         }
@@ -2381,6 +2441,7 @@ describe('exists', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -2404,6 +2465,7 @@ describe('exists', () => {
             },
             "system": "client",
           },
+          "scalar": undefined,
           "type": "correlatedSubquery",
         },
       }
@@ -2433,6 +2495,7 @@ describe('exists', () => {
         "where": {
           "conditions": [
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -2443,6 +2506,7 @@ describe('exists', () => {
                     "ownerId",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_owner",
                   "limit": undefined,
@@ -2466,9 +2530,11 @@ describe('exists', () => {
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
             {
+              "flip": undefined,
               "op": "EXISTS",
               "related": {
                 "correlation": {
@@ -2479,6 +2545,7 @@ describe('exists', () => {
                     "ownerId",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_owner",
                   "limit": undefined,
@@ -2502,6 +2569,7 @@ describe('exists', () => {
                 },
                 "system": "client",
               },
+              "scalar": undefined,
               "type": "correlatedSubquery",
             },
           ],
@@ -2566,6 +2634,7 @@ test('scalar option on two-hop relationship applies to inner condition', () => {
               "id",
             ],
           },
+          "hidden": undefined,
           "subquery": {
             "alias": "zsubq_labels",
             "limit": undefined,
@@ -2586,6 +2655,7 @@ test('scalar option on two-hop relationship applies to inner condition', () => {
                     "labelId",
                   ],
                 },
+                "hidden": undefined,
                 "subquery": {
                   "alias": "zsubq_zhidden_labels",
                   "limit": undefined,
@@ -2615,6 +2685,7 @@ test('scalar option on two-hop relationship applies to inner condition', () => {
           },
           "system": "client",
         },
+        "scalar": undefined,
         "type": "correlatedSubquery",
       },
     }
@@ -2641,6 +2712,7 @@ describe('whereExists with scalar option', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "EXISTS",
           "related": {
             "correlation": {
@@ -2651,6 +2723,7 @@ describe('whereExists with scalar option', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -2700,6 +2773,7 @@ describe('whereExists with scalar option', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "EXISTS",
           "related": {
             "correlation": {
@@ -2710,6 +2784,7 @@ describe('whereExists with scalar option', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -2785,6 +2860,7 @@ describe('whereExists with scalar option', () => {
         "start": undefined,
         "table": "issue",
         "where": {
+          "flip": undefined,
           "op": "NOT EXISTS",
           "related": {
             "correlation": {
@@ -2795,6 +2871,7 @@ describe('whereExists with scalar option', () => {
                 "ownerId",
               ],
             },
+            "hidden": undefined,
             "subquery": {
               "alias": "zsubq_owner",
               "limit": undefined,
@@ -2860,7 +2937,15 @@ describe('normalized by construction', () => {
 
   function expectNormalized(q: AnyQuery) {
     expect(JSON.stringify(ast(q))).toBe(JSON.stringify(normalizedCopyOf(q)));
-    expect(asQueryInternals(q).hash()).toBe(hashOfAST(normalizedCopyOf(q)));
+    // Hash without normalizing: if the built AST were not already normalized,
+    // it would hash differently from the normalized copy. Going through
+    // `hashOfAST` would normalize both sides and assert nothing, and `hash()`
+    // covers the format too, so neither is the right instrument here.
+    // The cast is the claim under test: QueryInternals exposes `ast` as a
+    // plain AST, and this asserts the one a query built is in fact normalized.
+    expect(hashOfNormalizedAST(ast(q) as NormalizedAST)).toBe(
+      hashOfNormalizedAST(normalizedCopyOf(q)),
+    );
     // The JSON encoding says nothing about the fields that are undefined, so
     // check the shape (which V8 cares about) as well.
     expectNormalizedShape(ast(q));
