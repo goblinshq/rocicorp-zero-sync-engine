@@ -61,6 +61,7 @@ import type {
   Condition,
   CorrelatedSubquery,
   Ordering,
+  System,
   ValuePosition,
 } from './ast.ts';
 
@@ -142,6 +143,14 @@ const TAG_AND = 0x2006;
 const TAG_OR = 0x2007;
 const TAG_FORMAT = 0x2008;
 const TAG_NAME_ARGS = 0x2009;
+// `System` is a closed set of three, so it folds as one word rather than as a
+// string -- on an AST it appears once per correlated subquery, so this is on
+// the walk's hot path. The switch below is exhaustive, so adding a member is a
+// type error rather than a silent collision with an existing one.
+const TAG_SYSTEM_PERMISSIONS = 0x200a;
+const TAG_SYSTEM_CLIENT = 0x200b;
+const TAG_SYSTEM_TEST = 0x200c;
+const TAG_JUNCTION = 0x200d;
 
 // Set on a string's length word. High enough that no array length reaches it.
 const STR_MARK = 0x40000000;
@@ -236,6 +245,30 @@ function visitOptionalString(s: string | undefined): void {
   }
 }
 
+function mixOptionalSystem(system: System | undefined): void {
+  if (system === undefined) {
+    mix(TAG_UNDEF);
+  } else {
+    mixSystem(system);
+  }
+}
+
+function mixSystem(system: System): void {
+  switch (system) {
+    case 'permissions':
+      mix(TAG_SYSTEM_PERMISSIONS);
+      break;
+    case 'client':
+      mix(TAG_SYSTEM_CLIENT);
+      break;
+    case 'test':
+      mix(TAG_SYSTEM_TEST);
+      break;
+    default:
+      unreachable(system);
+  }
+}
+
 function visitCompoundKey(k: readonly string[]): void {
   mix(k.length);
   for (let i = 0; i < k.length; i++) {
@@ -313,7 +346,7 @@ function visitCorrelatedSubquery(csq: CorrelatedSubquery): void {
   visitCompoundKey(csq.correlation.parentField);
   visitCompoundKey(csq.correlation.childField);
   mix(csq.hidden === undefined ? TAG_UNDEF : csq.hidden ? TAG_TRUE : TAG_FALSE);
-  visitOptionalString(csq.system);
+  mixOptionalSystem(csq.system);
   visitAST(csq.subquery);
 }
 
@@ -407,7 +440,39 @@ export function hashNameAndArgs(
   }
 }
 
-export function hashOfQueryInternals(ast: AST, format: Format): string {
+/**
+ * The identity of a query as the client sees it: its AST, the shape it returns,
+ * the system it was built for, and -- for a custom query -- the name and
+ * arguments it was declared with.
+ *
+ * Everything past the AST is here because it is part of what makes two queries
+ * different while leaving no trace, or an incomplete one, in the AST itself:
+ *
+ * - **name and args**: `nameAndArgs` reuses the AST it is given and only
+ *   attaches a `CustomQueryID`, so without these two different named queries
+ *   over the same table would be indistinguishable.
+ * - **system**: a query stamps it onto every `related` entry and every `exists`
+ *   correlation it builds, so it is already hashed via
+ *   {@link visitCorrelatedSubquery} -- but a query with neither has nowhere to
+ *   put it, and would otherwise hash the same whether it was built for the
+ *   client or for permissions.
+ * - **currentJunction**: builder state, set on the sub-query handed to a
+ *   two-hop relationship's callback, which makes `limit` and `orderBy` throw.
+ *   It leaves no trace in the AST at all, so two queries that differ only in
+ *   whether those methods work would otherwise be indistinguishable.
+ *
+ * The name and args are taken apart rather than as a `CustomQueryID` because
+ * that type lives in `zql`, which is above this package; `hashNameAndArgs`
+ * splits them the same way.
+ */
+export function hashOfQueryInternals(
+  ast: AST,
+  format: Format,
+  system: System,
+  currentJunction: string | undefined,
+  customQueryName: string | undefined,
+  customQueryArgs: readonly unknown[] | undefined,
+): string {
   const s1 = h1;
   const s2 = h2;
   try {
@@ -415,6 +480,20 @@ export function hashOfQueryInternals(ast: AST, format: Format): string {
     visitAST(ast);
     mix(TAG_FORMAT);
     visitValue(format);
+    mixSystem(system);
+    if (currentJunction === undefined) {
+      mix(TAG_UNDEF);
+    } else {
+      mix(TAG_JUNCTION);
+      mixString(currentJunction);
+    }
+    if (customQueryName === undefined) {
+      mix(TAG_UNDEF);
+    } else {
+      mix(TAG_NAME_ARGS);
+      mixString(customQueryName);
+      visitValue(customQueryArgs);
+    }
     return finalize();
   } finally {
     h1 = s1;

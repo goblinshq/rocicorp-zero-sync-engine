@@ -32,9 +32,27 @@ export interface QueryInternals<
   readonly format: Format;
 
   /**
-   * A string that uniquely identifies this query. This can be used to determine
-   * if two queries are the same, i.e. whether they would produce the same
-   * result from the same data.
+   * A string that uniquely identifies this query object: two queries share it
+   * exactly when they are interchangeable, down to how their builder methods
+   * behave.
+   *
+   * It covers the AST, the {@linkcode format} the results take, the system the
+   * query was built for, the junction relationship it is being built inside,
+   * and, for a custom query, the name and arguments it was declared with.
+   * Everything past the AST is hashed explicitly because it leaves no trace
+   * there: {@linkcode nameAndArgs} reuses the AST it is given, a query with no
+   * relationship and no `exists` has nowhere to stamp its system, and the
+   * junction flag -- which decides whether `limit` and `orderBy` throw --
+   * appears nowhere in the AST at all. Without them, such queries would share a
+   * hash and anything keyed by it would conflate them.
+   *
+   * It does *not* cover the schema, which has no stable identity to hash.
+   * Anything keyed by this that could see more than one schema has to scope
+   * itself by schema as well.
+   *
+   * This is entirely client-side and never reaches the server. The server knows
+   * a custom query by the hash of its name and args, and any other query by the
+   * hash of its AST alone -- see `materializeImpl`.
    */
   hash(): string;
 

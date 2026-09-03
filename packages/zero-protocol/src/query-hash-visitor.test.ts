@@ -1,6 +1,11 @@
 import {expect, test} from 'vitest';
+import type {Format} from '../../zero-types/src/format.ts';
 import {normalizeAST, type AST, type Condition} from './ast.ts';
-import {hashAST, hashNameAndArgs} from './query-hash-visitor.ts';
+import {
+  hashAST,
+  hashNameAndArgs,
+  hashOfQueryInternals,
+} from './query-hash-visitor.ts';
 
 const base: AST = {table: 'issue'};
 
@@ -328,6 +333,21 @@ test('hashAST reads every field of the AST', () => {
       ...full,
       related: [{...full.related![0], system: 'permissions'}, full.related![1]],
     },
+    // The remaining member, and the absent case. Each of these only has to
+    // differ from `full`; that two systems also differ from *each other* is
+    // what the pairwise test below covers, since this loop compares against
+    // `baseHash` alone.
+    'related system test': {
+      ...full,
+      related: [{...full.related![0], system: 'test'}, full.related![1]],
+    },
+    // Clearing it, which has to come off the *second* entry: normalizeAST sorts
+    // related by alias, so `related[0]` is `assignee`, which has no system to
+    // begin with, and `related[1]` is `creator`, which does.
+    'related system absent': {
+      ...full,
+      related: [full.related![0], {...full.related![1], system: undefined}],
+    },
     'related subquery': {
       ...full,
       related: [
@@ -522,4 +542,204 @@ test('a hash taken from inside another walk does not corrupt it', () => {
   };
   expect(hashNameAndArgs('q', [sneaky])).toBe(plain);
   expect(inner).toBe(innerExpected);
+});
+
+const fmt: Format = {singular: false, relationships: {}};
+
+test('hashOfQueryInternals separates queries that differ only by name or args', () => {
+  const a = CORPUS[0];
+  // `nameAndArgs` reuses the AST it is given, so the name and args are the only
+  // thing telling these apart -- the AST and the format are identical.
+  const seen = new Map<string, string>();
+  const cases: [string | undefined, readonly unknown[] | undefined][] = [
+    [undefined, undefined],
+    ['foo', []],
+    ['foo', [1]],
+    ['foo', [2]],
+    ['foo', [1, 2]],
+    ['bar', [1]],
+    ['bar', []],
+  ];
+  for (const [name, args] of cases) {
+    const key = `${name} ${JSON.stringify(args)}`;
+    const h = hashOfQueryInternals(a, fmt, 'client', undefined, name, args);
+    const existing = seen.get(h);
+    expect(
+      existing,
+      `collision between\n  ${existing}\n  ${key}`,
+    ).toBeUndefined();
+    seen.set(h, key);
+  }
+});
+
+test('hashOfQueryInternals still separates every AST in the corpus', () => {
+  const byHash = new Map<string, number>();
+  CORPUS.forEach((a, i) => {
+    const h = hashOfQueryInternals(a, fmt, 'client', undefined, 'q', [1]);
+    expect(byHash.get(h), `collision at corpus ${i}`).toBeUndefined();
+    byHash.set(h, i);
+  });
+});
+
+test('hashOfQueryInternals depends only on the values, not call order', () => {
+  const a = CORPUS[0];
+  const h = hashOfQueryInternals(a, fmt, 'client', undefined, 'foo', [
+    1,
+    {b: 2},
+  ]);
+  hashAST(CORPUS[1]);
+  hashNameAndArgs('other', [9]);
+  expect(
+    hashOfQueryInternals(a, fmt, 'client', undefined, 'foo', [1, {b: 2}]),
+  ).toBe(h);
+  // Structurally equal but distinct args hash the same.
+  expect(
+    hashOfQueryInternals(a, fmt, 'client', undefined, 'foo', [1, {b: 2}]),
+  ).toBe(h);
+});
+
+test('an absent custom query is not confusable with a named one', () => {
+  const a = CORPUS[0];
+  // The absent case mixes its own tag rather than nothing at all, so a query
+  // with no name cannot fold like some query that has one.
+  expect(
+    hashOfQueryInternals(a, fmt, 'client', undefined, undefined, undefined),
+  ).not.toBe(hashOfQueryInternals(a, fmt, 'client', undefined, '', []));
+});
+
+test('hashOfQueryInternals separates queries that differ only by system', () => {
+  // A query with no relationship and no `exists` has nowhere to stamp its
+  // system, so the AST is identical whether it was built for the client or for
+  // permissions. This is the only place system is not already covered.
+  const a = CORPUS[0];
+  const client = hashOfQueryInternals(
+    a,
+    fmt,
+    'client',
+    undefined,
+    undefined,
+    undefined,
+  );
+  const perms = hashOfQueryInternals(
+    a,
+    fmt,
+    'permissions',
+    undefined,
+    undefined,
+    undefined,
+  );
+  const test_ = hashOfQueryInternals(
+    a,
+    fmt,
+    'test',
+    undefined,
+    undefined,
+    undefined,
+  );
+  expect(new Set([client, perms, test_]).size).toBe(3);
+});
+
+test('every simple operator hashes distinctly', () => {
+  // `visitCondition` folds the operator with `mixString`, so what has to hold
+  // is that no two operator strings fold to the same words -- `mixString`
+  // length-prefixes, which is what keeps 'IS' and 'IS NOT' apart. Nothing in
+  // the walk enumerates the operators, so a member added to `SimpleOperator`
+  // would be hashed without anyone touching this file; pinning all fourteen
+  // apart is what would catch a folding change that collapsed any of them.
+  const ops = [
+    '=',
+    '!=',
+    'IS',
+    'IS NOT',
+    '<',
+    '>',
+    '<=',
+    '>=',
+    'LIKE',
+    'NOT LIKE',
+    'ILIKE',
+    'NOT ILIKE',
+    'IN',
+    'NOT IN',
+  ] as const;
+  const byHash = new Map<string, string>();
+  for (const op of ops) {
+    const h = hashAST(
+      where({
+        type: 'simple',
+        op,
+        left: {type: 'column', name: 'title'},
+        right: {type: 'literal', value: 'x'},
+      }),
+    );
+    const existing = byHash.get(h);
+    expect(existing, `${op} collided with ${existing}`).toBeUndefined();
+    byHash.set(h, op);
+  }
+  expect(byHash.size).toBe(ops.length);
+});
+
+test('both exists operators hash distinctly', () => {
+  const related = {
+    correlation: {parentField: ['id'], childField: ['issueId']},
+    subquery: {table: 'comment', alias: 'c'},
+  } as const;
+  const cond = (op: 'EXISTS' | 'NOT EXISTS') =>
+    hashAST(where({type: 'correlatedSubquery', op, related}));
+  expect(cond('EXISTS')).not.toBe(cond('NOT EXISTS'));
+});
+
+test('both parameter anchors hash distinctly', () => {
+  const cond = (anchor: 'authData' | 'preMutationRow') =>
+    hashAST(
+      where({
+        type: 'simple',
+        op: '=',
+        left: {type: 'column', name: 'ownerID'},
+        right: {type: 'static', anchor, field: 'sub'},
+      }),
+    );
+  expect(cond('authData')).not.toBe(cond('preMutationRow'));
+});
+
+test('every system on a correlated subquery hashes distinctly', () => {
+  // The mutation test above compares each variant against one baseline, so two
+  // systems sharing a tag by accident would satisfy it. Pin all four against
+  // each other.
+  const variants = [undefined, 'client', 'permissions', 'test'] as const;
+  const byHash = new Map<string, string>();
+  for (const system of variants) {
+    const h = hashAST(
+      normalizeAST({
+        table: 'issue',
+        related: [
+          {
+            correlation: {parentField: ['id'], childField: ['issueId']},
+            subquery: {table: 'comment', alias: 'c'},
+            system,
+          },
+        ],
+      }),
+    );
+    const existing = byHash.get(h);
+    expect(
+      existing,
+      `system ${system} collided with ${existing}`,
+    ).toBeUndefined();
+    byHash.set(h, String(system));
+  }
+  expect(byHash.size).toBe(variants.length);
+});
+
+test('hashOfQueryInternals separates queries that differ only by currentJunction', () => {
+  // Set on the sub-query handed to a two-hop relationship's callback, where it
+  // makes `limit` and `orderBy` throw. It leaves no trace in the AST, so this is
+  // the only thing telling these apart.
+  const a = CORPUS[0];
+  const seen = new Set(
+    [undefined, 'labels', 'issues'].map(j =>
+      hashOfQueryInternals(a, fmt, 'client', j, undefined, undefined),
+    ),
+  );
+  expect(seen.size).toBe(3);
 });

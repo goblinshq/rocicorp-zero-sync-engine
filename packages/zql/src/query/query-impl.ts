@@ -209,7 +209,14 @@ export class QueryImpl<
 
   hash(): string {
     if (!this.#hash) {
-      this.#hash = hashOfQueryInternals(this.#ast, this.format);
+      this.#hash = hashOfQueryInternals(
+        this.#ast,
+        this.format,
+        this.#system,
+        this.#currentJunction,
+        this.customQueryID?.name,
+        this.customQueryID?.args,
+      );
     }
     return this.#hash;
   }
