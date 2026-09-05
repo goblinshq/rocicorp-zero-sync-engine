@@ -477,9 +477,12 @@ export const zeroOptions = {
     },
 
     garbageCollectionInactivityThresholdHours: {
-      type: v.number().default(48),
+      type: v.number().default(24 * 7),
       desc: [
         `The duration after which an inactive CVR is eligible for garbage collection.`,
+        `Purging a CVR forces the next connection from that client group to`,
+        `re-sync from scratch, so this should comfortably exceed how long a`,
+        `typical user goes between sessions.`,
         `Note that garbage collection is an incremental, periodic process which does not`,
         `necessarily purge all eligible CVRs immediately.`,
       ],
@@ -555,6 +558,25 @@ export const zeroOptions = {
       `spend in IVM (processing query hydration and advancement) before yielding`,
       `to the event loop. Lower values increase responsiveness and fairness at`,
       `the cost of reduced throughput.`,
+    ],
+  },
+
+  viewSyncerHydrationBudgetMs: {
+    type: v
+      .number()
+      .assert(
+        value => Number.isSafeInteger(value) && value >= 0,
+        'must be a nonnegative integer',
+      )
+      .default(0),
+    desc: [
+      `The soft time budget in milliseconds for hydrating inactive queries`,
+      `during a view-syncer hydration pass. Active and internal queries always`,
+      `finish, and time spent in custom-query transform round trips is not`,
+      `charged to the budget. An inactive query not reached before the budget`,
+      `is spent is evicted: its CVR record and the remaining TTL that would`,
+      `have kept it warm are both dropped. A value of 0 disables`,
+      `hydration-budget eviction.`,
     ],
   },
 

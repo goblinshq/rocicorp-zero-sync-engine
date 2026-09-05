@@ -238,9 +238,12 @@ test('zero-cache --help', () => {
                                                                                    Note that this number must allow for at least one connection per                                                           
                                                                                    sync worker, or zero-cache will fail to start. See num-sync-workers                                                        
                                                                                                                                                                                                               
-     --cvr-garbage-collection-inactivity-threshold-hours number                    default: 48                                                                                                                
+     --cvr-garbage-collection-inactivity-threshold-hours number                    default: 168                                                                                                               
        ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS env                                                                                                                                             
                                                                                    The duration after which an inactive CVR is eligible for garbage collection.                                               
+                                                                                   Purging a CVR forces the next connection from that client group to                                                         
+                                                                                   re-sync from scratch, so this should comfortably exceed how long a                                                         
+                                                                                   typical user goes between sessions.                                                                                        
                                                                                    Note that garbage collection is an incremental, periodic process which does not                                            
                                                                                    necessarily purge all eligible CVRs immediately.                                                                           
                                                                                                                                                                                                               
@@ -288,6 +291,16 @@ test('zero-cache --help', () => {
                                                                                    spend in IVM (processing query hydration and advancement) before yielding                                                  
                                                                                    to the event loop. Lower values increase responsiveness and fairness at                                                    
                                                                                    the cost of reduced throughput.                                                                                            
+                                                                                                                                                                                                              
+     --view-syncer-hydration-budget-ms number                                      default: 0                                                                                                                 
+       ZERO_VIEW_SYNCER_HYDRATION_BUDGET_MS env                                                                                                                                                               
+                                                                                   The soft time budget in milliseconds for hydrating inactive queries                                                        
+                                                                                   during a view-syncer hydration pass. Active and internal queries always                                                    
+                                                                                   finish, and time spent in custom-query transform round trips is not                                                        
+                                                                                   charged to the budget. An inactive query not reached before the budget                                                     
+                                                                                   is spent is evicted: its CVR record and the remaining TTL that would                                                       
+                                                                                   have kept it warm are both dropped. A value of 0 disables                                                                  
+                                                                                   hydration-budget eviction.                                                                                                 
                                                                                                                                                                                                               
      --change-db string                                                            optional                                                                                                                   
        ZERO_CHANGE_DB env                                                                                                                                                                                     
@@ -901,6 +914,39 @@ test('--enable-query-covering can be disabled', () => {
 
   expect(config.enableQueryCovering).toBe(false);
 });
+
+test('view-syncer hydration budget defaults to disabled and accepts milliseconds', () => {
+  const defaults = parseOptionsAdvanced(zeroOptions, {
+    envNamePrefix: 'ZERO_',
+    allowUnknown: false,
+    allowPartial: true,
+  });
+  expect(defaults.config.viewSyncerHydrationBudgetMs).toBe(0);
+
+  const configured = parseOptionsAdvanced(zeroOptions, {
+    envNamePrefix: 'ZERO_',
+    allowUnknown: false,
+    allowPartial: true,
+    env: {ZERO_VIEW_SYNCER_HYDRATION_BUDGET_MS: '250'},
+  });
+  expect(configured.config.viewSyncerHydrationBudgetMs).toBe(250);
+});
+
+test.each(['-1', '1.5'])(
+  'view-syncer hydration budget rejects %s',
+  hydrationBudgetMs => {
+    expect(() =>
+      parseOptionsAdvanced(zeroOptions, {
+        envNamePrefix: 'ZERO_',
+        allowUnknown: false,
+        allowPartial: true,
+        env: {
+          ZERO_VIEW_SYNCER_HYDRATION_BUDGET_MS: hydrationBudgetMs,
+        },
+      }),
+    ).toThrow();
+  },
+);
 
 test('legacy queries are disabled by default', () => {
   const {config} = parseOptionsAdvanced(zeroOptions, {
