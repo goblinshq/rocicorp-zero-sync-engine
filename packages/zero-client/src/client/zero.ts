@@ -145,7 +145,6 @@ import {
   type ZeroError,
   getBackoffParams,
   getErrorConnectionTransition,
-  isAuthError,
   isClientError,
   isServerError,
   isZeroError,
@@ -879,10 +878,16 @@ export class Zero<
 
     this.#pokeHandler = new PokeHandler(
       async poke => {
+        const socket = this.#socket;
         await this.#rep.poke(poke);
         // poke() fires the got-queries watch synchronously, so `#gotQueries` is
         // up to date and safe to trust now that the server has caught us up.
-        this.#queryManager.markGotQueriesAuthoritative();
+        // Unless the connection went away while the poke was applied: the
+        // disconnect already re-gated trust, and the next connection's first
+        // poke must be the one to restore it.
+        if (socket !== undefined && this.#socket === socket) {
+          this.#queryManager.markGotQueriesAuthoritative();
+        }
       },
       e => this.#onPokeError(e),
       rep.clientID,
@@ -920,14 +925,15 @@ export class Zero<
   }
 
   #enableRefresh(): boolean {
-    // Don't refresh if connected or connecting, unless #forceEnableRefresh to
-    // avoid receiving new snapshots from refresh before receiving the new
-    // snapshot via poke from the connection (which results in a "unexpected
-    // base cookie for poke" error).
+    // Don't refresh if connected, connecting, or about to connect, unless
+    // #forceEnableRefresh to avoid receiving new snapshots from refresh before
+    // receiving the new snapshot via poke from the connection (which results
+    // in a "unexpected base cookie for poke" error).
     return (
       this.#forceEnableRefresh ||
       (!this.#connectionManager.is(ConnectionStatus.Connected) &&
-        !this.#connectionManager.is(ConnectionStatus.Connecting))
+        !this.#connectionManager.is(ConnectionStatus.Connecting) &&
+        !this.#connectionManager.is(ConnectionStatus.Initializing))
     );
   }
 
@@ -1011,8 +1017,11 @@ export class Zero<
    * This function is useful when you want to populate the cache ahead of time,
    * for example after login, to avoid a flash of loading screen on the next page.
    *
-   * Returns an object with two properties:
-   * - `complete`: a Promise that resolves when the data is loaded
+   * Returns an object with three properties:
+   * - `complete`: a Promise that resolves when the server has confirmed the
+   *   data on this connection
+   * - `cached`: a Promise that resolves as soon as the store holds a
+   *   server-confirmed result, from this connection or a previous one
    * - `cleanup`: a function that can be called to cancel the preload
    *
    * @example
@@ -1041,7 +1050,9 @@ export class Zero<
    * Executes a query once and returns the results.
    *
    * By default, runs immediately with whatever data is available locally.
-   * Use `{type: 'complete'}` to wait for fresh results from the server.
+   * Use `{type: 'complete'}` to wait for fresh results from the server, or
+   * `{type: 'cached'}` to accept a result the server confirmed on a previous
+   * connection when the store holds one.
    *
    * @param query - The query to execute
    * @param runOptions - Options controlling query execution
@@ -1972,6 +1983,7 @@ export class Zero<
         lc.debug?.('disconnect() called while closed');
         return;
 
+      case ConnectionStatus.Initializing:
       case ConnectionStatus.Disconnected:
       case ConnectionStatus.Connecting:
       case ConnectionStatus.NeedsAuth:
@@ -2196,6 +2208,39 @@ export class Zero<
     const {auth} = this.#options;
     this.#setAuth(auth);
 
+    // Wait for the local work every connect attempt starts with: the replica
+    // loaded (the cookie is read once it is), the client group ID and the
+    // active clients. On a slow device with a large replica this takes tens of
+    // seconds, and none of it depends on the server, so it happens in
+    // `initializing` instead of spending the connecting window and the setup
+    // deadline of the first attempts.
+    // A local store that never finishes loading must not keep the run loop
+    // alive past close().
+    const {signal: closeSignal} = this.#closeAbortController;
+    const closed = resolver<void>();
+    const onClose = () => closed.resolve();
+    closeSignal.addEventListener('abort', onClose, {once: true});
+    try {
+      const result = await promiseRace({
+        initialized: Promise.all([
+          this.#rep.cookie,
+          this.clientGroupID,
+          this.#activeClientsManager,
+        ]),
+        closed: closed.promise,
+      });
+      if (result.key === 'closed') {
+        this.#lc.debug?.('Closed while initializing, not connecting');
+        return;
+      }
+    } catch {
+      // The first connect attempt awaits the same promises and reports the
+      // failure through the usual disconnect path.
+    } finally {
+      closeSignal.removeEventListener('abort', onClose);
+    }
+    this.#connectionManager.initialized();
+
     let backoffMs: number | undefined;
     let additionalConnectParams: Record<string, string> | undefined;
 
@@ -2405,6 +2450,10 @@ export class Zero<
             // run loop will terminate
             break;
 
+          case ConnectionStatus.Initializing:
+            // initialized() is called before the loop starts.
+            unreachable();
+
           default:
             unreachable(currentState);
         }
@@ -2412,11 +2461,27 @@ export class Zero<
         const isClientClosedError =
           isClientError(ex) && ex.kind === ClientErrorKind.ClientClosed;
 
+        const transition = getErrorConnectionTransition(ex);
+
         if (
           !this.#connectionManager.is(ConnectionStatus.Connected) &&
           !isClientClosedError
         ) {
-          const level = isAuthError(ex) ? 'warn' : 'error';
+          // Only errors that stop the run loop are logged at error. Routine
+          // reconnects (dropped sockets, timeouts, rebalances) and auth
+          // failures are expected in practice.
+          let level: LogLevel;
+          switch (transition.status) {
+            case ConnectionStatus.Error:
+              level = 'error';
+              break;
+            case ConnectionStatus.Disconnected:
+            case ConnectionStatus.Closed:
+              level = 'info';
+              break;
+            default:
+              level = 'warn';
+          }
           const kind = isServerError(ex) ? ex.kind : 'Unknown Error';
           lc[level]?.('Failed to connect', ex, ...getErrorCauses(ex), kind, {
             lmid: this.#lastMutationIDReceived,
@@ -2432,7 +2497,6 @@ export class Zero<
           ex,
         );
 
-        const transition = getErrorConnectionTransition(ex);
         let sleepMs: number | undefined = undefined;
         switch (transition.status) {
           case NO_STATUS_TRANSITION: {
