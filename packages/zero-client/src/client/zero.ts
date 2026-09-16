@@ -6,6 +6,7 @@ import {
   ReplicacheImpl,
   type ReplicacheImplOptions,
 } from '../../../replicache/src/impl.ts';
+import type {Store as KVStore} from '../../../replicache/src/kv/store.ts';
 import {dropDatabase as dropReplicacheDatabase} from '../../../replicache/src/persist/collect-idb-databases.ts';
 import {IDBDatabasesStore} from '../../../replicache/src/persist/idb-databases-store.ts';
 import type {Puller, PullerResult} from '../../../replicache/src/puller.ts';
@@ -333,7 +334,7 @@ function onClientStateNotFoundServerReason(serverErrMsg: string) {
   return `Server could not find state needed to synchronize this client. ${serverErrMsg}`;
 }
 const ON_CLIENT_STATE_NOT_FOUND_REASON_CLIENT =
-  'The local persistent state needed to synchronize this client has been garbage collected.';
+  'The local persistent state needed to synchronize this client has been garbage collected or was found to be corrupt.';
 
 // Keep in sync with packages/replicache/src/replicache-options.ts
 export interface ReplicacheInternalAPI {
@@ -1167,6 +1168,17 @@ export class Zero<
    */
   get idbName(): string {
     return this.#rep.idbName;
+  }
+
+  /**
+   * The KV store backing this instance of Zero. Its `kind` is the storage
+   * currently in use: `'idb'`, `'mem'`, `'op-sqlite'`, `'expo-sqlite'`, or
+   * whatever a custom store reports. An IndexedDB store that fails to open
+   * falls back to memory, so `kind` can change from `'idb'` to `'mem'` after
+   * the first read or write.
+   */
+  get kvStore(): KVStore {
+    return this.#rep.kvStore;
   }
 
   /**
