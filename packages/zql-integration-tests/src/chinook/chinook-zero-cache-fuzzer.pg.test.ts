@@ -7,6 +7,7 @@ import {Queue} from '../../../shared/src/queue.ts';
 import type {NormalizedZeroConfig} from '../../../zero-cache/src/config/normalize.ts';
 import {InspectorDelegate} from '../../../zero-cache/src/server/inspector-delegate.ts';
 import {initializePostgresChangeSource} from '../../../zero-cache/src/services/change-source/pg/change-source-init.ts';
+import {isPreSerializedBatch} from '../../../zero-cache/src/services/change-streamer/broadcast.ts';
 import {
   initializeStreamer,
   type TuningOptions,
@@ -42,7 +43,10 @@ import {
 } from '../../../zero-cache/src/test/db.ts';
 import {DbFile} from '../../../zero-cache/src/test/lite.ts';
 import type {PostgresDB} from '../../../zero-cache/src/types/pg.ts';
-import type {Source} from '../../../zero-cache/src/types/streams.ts';
+import type {
+  PreSerialized,
+  Source,
+} from '../../../zero-cache/src/types/streams.ts';
 import type {Subscription} from '../../../zero-cache/src/types/subscription.ts';
 import {
   getPragmaConfig,
@@ -253,14 +257,23 @@ function selectWriteFuzzSkeletons(
 }
 
 function parseStringifiedSource(
-  source: Source<string>,
+  source: Source<string | PreSerialized>,
 ): Source<SizedDownstream> {
   return {
     cancel: err => source.cancel(err),
     signal: source.signal,
     async *[Symbol.asyncIterator]() {
-      for await (const json of source) {
-        yield {data: BigIntJSON.parse(json) as Downstream, size: json.length};
+      for await (const item of source) {
+        if (typeof item === 'string') {
+          yield {data: BigIntJSON.parse(item) as Downstream, size: item.length};
+        } else if (isPreSerializedBatch(item)) {
+          for (const c of item.changes) {
+            yield {
+              data: BigIntJSON.parse(c[2]) as Downstream,
+              size: c[2].length,
+            };
+          }
+        }
       }
     },
   };

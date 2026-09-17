@@ -10,7 +10,7 @@ import {getConnectionURI, test, type PgTest} from '../../test/db.ts';
 import {DbFile} from '../../test/lite.ts';
 import type {PostgresDB} from '../../types/pg.ts';
 import {forkChildWorker, type Worker} from '../../types/processes.ts';
-import type {Source} from '../../types/streams.ts';
+import {type PreSerialized, type Source} from '../../types/streams.ts';
 import type {
   ChangeSource,
   ChangeStream,
@@ -21,6 +21,7 @@ import type {
   BackfillRequest,
   ChangeSourceUpstream,
 } from '../change-source/protocol/current.ts';
+import {isPreSerializedBatch} from '../change-streamer/broadcast.ts';
 import {
   initializeStreamer,
   type TuningOptions,
@@ -168,7 +169,7 @@ function sendChild(child: Worker, msg: ChildMessage): void {
 }
 
 type ActiveBridge = {
-  source: Source<string>;
+  source: Source<string | PreSerialized>;
   waiters: Map<number, Resolver<void, Error>>;
 };
 
@@ -276,18 +277,35 @@ class ForkedReplicator {
       }
 
       for await (const {value, consumed} of pipeline) {
-        const seq = ++this.#seq;
-        sendChild(this.#child, [
-          'replication-resumption:downstream',
-          {
-            seq,
-            msg: {
-              data: BigIntJSON.parse(value) as Downstream,
-              size: value.length,
+        if (typeof value === 'string') {
+          const seq = ++this.#seq;
+          sendChild(this.#child, [
+            'replication-resumption:downstream',
+            {
+              seq,
+              msg: {
+                data: BigIntJSON.parse(value) as Downstream,
+                size: value.length,
+              },
             },
-          },
-        ]);
-        await this.#waitForConsumed(bridge, seq);
+          ]);
+          await this.#waitForConsumed(bridge, seq);
+        } else if (isPreSerializedBatch(value)) {
+          for (const c of value.changes) {
+            const seq = ++this.#seq;
+            sendChild(this.#child, [
+              'replication-resumption:downstream',
+              {
+                seq,
+                msg: {
+                  data: BigIntJSON.parse(c[2]) as Downstream,
+                  size: c[2].length,
+                },
+              },
+            ]);
+            await this.#waitForConsumed(bridge, seq);
+          }
+        }
         consumed();
       }
 

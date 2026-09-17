@@ -3,12 +3,14 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {LogContext} from '@rocicorp/logger';
 import {nanoid} from 'nanoid/non-secure';
-import {beforeEach, describe, expect} from 'vitest';
+import {beforeEach, describe, expect, vi} from 'vitest';
 import {
   createSilentLogContext,
   TestLogSink,
 } from '../../../../../shared/src/logging-test-utils.ts';
+import {sleep} from '../../../../../shared/src/sleep.ts';
 import type {ZeroEvent} from '../../../../../zero-events/src/index.ts';
+import type {ReplicationStatusEvent} from '../../../../../zero-events/src/status.ts';
 import {Database} from '../../../../../zqlite/src/db.ts';
 import {listIndexes, listTables} from '../../../db/lite-tables.ts';
 import {mapPostgresToLiteIndex} from '../../../db/pg-to-lite.ts';
@@ -26,8 +28,10 @@ import {
 } from '../../../test/lite.ts';
 import {PG_17} from '../../../types/pg-versions.ts';
 import {type PostgresDB} from '../../../types/pg.ts';
+import {ReplicationStatusPublisher} from '../../replicator/replication-status.ts';
 import {ZERO_VERSION_COLUMN_NAME} from '../../replicator/schema/replication-state.ts';
 import {
+  createLiteIndices,
   getInitialDownloadState,
   initialSync,
   INSERT_BATCH_SIZE,
@@ -2773,16 +2777,107 @@ describe('change-source/pg/initial-sync', {timeout: 10000}, () => {
             description: /Copying \d+ upstream tables at version \w+/,
           },
         ]);
-        expect(eventSink.at(-1)).toMatchObject({
+        const indexing = eventSink.filter(
+          e => (e as ReplicationStatusEvent).stage === 'Indexing',
+        ) as ReplicationStatusEvent[];
+        expect(indexing[0]).toMatchObject({
           type: 'zero/events/status/replication/v1',
           component: 'replication',
           stage: 'Indexing',
           status: 'OK',
           description: /Creating \d+ indexes/,
         });
+        const numIndexes = Number(
+          /Created (\d+) indexes/.exec(indexing.at(-1)?.description ?? '')?.[1],
+        );
+        expect(numIndexes).toBeGreaterThan(0);
+        for (let n = 1; n <= numIndexes; n++) {
+          expect(
+            indexing.find(e => e.state?.indexingStatus?.index === n),
+          ).toMatchObject({
+            description: new RegExp(`Creating index ${n}/${numIndexes} on `),
+            state: {
+              indexingStatus: {
+                index: n,
+                totalIndexes: numIndexes,
+                done: false,
+              },
+            },
+          });
+        }
+        expect(eventSink.at(-1)).toMatchObject({
+          type: 'zero/events/status/replication/v1',
+          component: 'replication',
+          stage: 'Indexing',
+          status: 'OK',
+          description: `Created ${numIndexes} indexes`,
+          state: {
+            indexingStatus: {
+              index: numIndexes,
+              totalIndexes: numIndexes,
+              done: true,
+            },
+          },
+        });
       }
     });
   }
+
+  test('reports completion when there are no indexes to create', async () => {
+    const lc = createSilentLogContext();
+    const replica = new Database(lc, ':memory:');
+    const publish = vi.fn().mockResolvedValue(undefined);
+    expect(
+      await createLiteIndices(
+        lc,
+        replica,
+        [],
+        ReplicationStatusPublisher.forRunningTransaction(replica, publish),
+      ),
+    ).toBe(0);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish.mock.calls[0][1]).toMatchObject({
+      stage: 'Indexing',
+      description: 'Created 0 indexes',
+    });
+    expect(publish.mock.calls[0][1].state).not.toHaveProperty('indexingStatus');
+  });
+
+  test('excludes progress reporting from the reported index time', async () => {
+    const lc = createSilentLogContext();
+    const replica = new Database(lc, ':memory:');
+    replica.exec(`CREATE TABLE foo(a INTEGER, b TEXT)`);
+    const publish = vi.fn(() => sleep(200));
+    const start = performance.now();
+    const indexMs = await createLiteIndices(
+      lc,
+      replica,
+      [
+        {
+          schema: 'public',
+          tableName: 'foo',
+          name: 'foo_a',
+          columns: {a: 'ASC'},
+          unique: false,
+        },
+        {
+          schema: 'public',
+          tableName: 'foo',
+          name: 'foo_b',
+          columns: {b: 'DESC'},
+          unique: true,
+        },
+      ],
+      ReplicationStatusPublisher.forRunningTransaction(replica, publish),
+    );
+    expect(performance.now() - start).toBeGreaterThanOrEqual(400);
+    expect(indexMs).toBeLessThan(200);
+    expect(
+      replica
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`)
+        .all(),
+    ).toEqual([{name: 'foo_a'}, {name: 'foo_b'}]);
+  });
 
   test('resume initial sync with invalid table', async () => {
     const lc = createSilentLogContext();
