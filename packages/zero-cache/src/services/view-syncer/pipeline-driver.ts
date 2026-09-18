@@ -97,13 +97,15 @@ type Pipeline = {
   readonly pipelineRunID: string;
   readonly pipelineReadyAtMs: number;
   readonly transformedAst: AST;
+  readonly originalAst: AST;
   readonly transformationHash: string;
   readonly queryName?: string | undefined;
   readonly companions: readonly CompanionPipeline[];
 };
 
-type QueryInfo = {
+export type QueryInfo = {
   readonly transformedAst: AST;
+  readonly originalAst?: AST | undefined;
   readonly transformationHash: string;
   readonly queryName?: string | undefined;
 };
@@ -450,6 +452,7 @@ export class PipelineDriver {
       this.#pipelines.delete(queryID);
       this.#destroyPipeline(queryID, pipeline, 'destroy');
     }
+    this.#tables.clear();
     this.#rowSetSignatures.clear();
     this.#storage.destroy();
     this.#snapshotter.destroy();
@@ -823,6 +826,7 @@ export class PipelineDriver {
         pipelineRunID,
         pipelineReadyAtMs,
         transformedAst: resolvedQuery,
+        originalAst: query,
         transformationHash,
         ...(queryName !== undefined && {queryName}),
         companions: liveCompanions,
@@ -874,6 +878,7 @@ export class PipelineDriver {
         for (const input of builtInputs) {
           input.destroy();
         }
+        this.#pruneUnusedTables();
         // Rows may already have been yielded through #trackRowSetSignatures,
         // and rowSetSignature() must not report a signature for a query
         // without an active pipeline.
@@ -895,8 +900,17 @@ export class PipelineDriver {
     if (pipeline) {
       this.#pipelines.delete(queryID);
       this.#destroyPipeline(queryID, pipeline, stopReason);
+      this.#pruneUnusedTables();
     }
     this.#rowSetSignatures.delete(queryID);
+  }
+
+  #pruneUnusedTables() {
+    for (const [table, source] of this.#tables.entries()) {
+      if (!source.hasConnections()) {
+        this.#tables.delete(table);
+      }
+    }
   }
 
   #destroyPipeline(
@@ -988,6 +1002,7 @@ export class PipelineDriver {
     const diff = this.#snapshotter.advance(
       this.#tableSpecs,
       this.#allTableNames,
+      this.#tables,
     );
     const {prev, curr, changes} = diff;
     this.#lc.debug?.(
