@@ -890,7 +890,25 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       return;
     }
 
-    const version = this.#pipelines.advanceWithoutDiff();
+    let version: string;
+    try {
+      version = this.#pipelines.advanceWithoutDiff();
+    } catch (e) {
+      if (!(e instanceof ResetPipelinesSignal)) {
+        throw e;
+      }
+      // A schema change landed after the table specs were computed (i.e.
+      // while waiting to hydrate). Recompute them at the new head. Nothing
+      // is hydrated at this point, so there is nothing else to tear down,
+      // and `previousQueries` remain reusable for the same reason they were
+      // for the reset that produced them.
+      lc.info?.(`resetting pipelines: ${e.message}`);
+      this.#pipelineResets.add(1, {reason: e.reason});
+      this.#pipelines.reset(
+        must(cvr.clientSchema, 'cvr.clientSchema missing after initialization'),
+      );
+      version = this.#pipelines.currentVersion();
+    }
     const cvrVer = versionString(cvr.version);
 
     if (version < cvr.version.stateVersion) {
@@ -1545,6 +1563,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         'vs.#updateCVRConfig.pokeClients',
         async () => {
           const pokers = startPoke(
+            lc,
             this.#getClients(cvr.version),
             newCVR.version,
           );
@@ -2947,7 +2966,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       }
 
       const clients = this.#getClients();
-      const pokers = startPoke(clients, newVersion);
+      const pokers = startPoke(lc, clients, newVersion);
       for (const patch of queryPatches) {
         // Bump patches' toVersion to the post-drift-bump version so that
         // pokers don't see them as belonging to a stale cookie.
@@ -3230,7 +3249,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     return startAsyncSpan(tracer, 'vs.#catchupClients', async span => {
       current ??= cvr.version;
       const clients = this.#getClients();
-      const pokers = usePokers ?? startPoke(clients, cvr.version);
+      const pokers = usePokers ?? startPoke(lc, clients, cvr.version);
       span.setAttribute('numClients', clients.length);
 
       const catchupFrom = clients
@@ -3433,6 +3452,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
         // are behind need to first be caught up when their initConnection
         // message is processed (and #syncQueryPipelines is called).
         pokers = startPoke(
+          lc,
           this.#getClients(cvr.version),
           updater.updatedVersion(),
         );
