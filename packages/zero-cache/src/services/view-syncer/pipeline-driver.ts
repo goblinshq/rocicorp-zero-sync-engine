@@ -1,6 +1,7 @@
 import type {LogContext} from '@rocicorp/logger';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
 import {deepEqual, type JSONValue} from '../../../../shared/src/json.ts';
+import {getOrInsertComputed} from '../../../../shared/src/map.ts';
 import {must} from '../../../../shared/src/must.ts';
 import {randInt} from '../../../../shared/src/rand.ts';
 import type {AST, LiteralValue} from '../../../../zero-protocol/src/ast.ts';
@@ -547,6 +548,10 @@ export class PipelineDriver {
     }
   }
 
+  #disableCorrelatedPredicatePushdown(): boolean {
+    return this.#config?.enableCorrelatedPredicatePushdown === false;
+  }
+
   #resolveScalarSubqueries(ast: AST): {
     ast: AST;
     companionRows: {table: string; row: Row}[];
@@ -564,6 +569,8 @@ export class PipelineDriver {
       const input = buildPipeline(
         subqueryAST,
         {
+          disableCorrelatedPredicatePushdown:
+            this.#disableCorrelatedPredicatePushdown(),
           getSource: name => this.#getSource(name),
           createStorage: () => this.#createStorage(),
           decorateSourceInput: (input: SourceInput): Input => input,
@@ -711,6 +718,10 @@ export class PipelineDriver {
         {
           debug: debugDelegate,
           enableNotExists: true, // Server-side can handle NOT EXISTS
+          disableCorrelatedPredicatePushdown:
+            this.#disableCorrelatedPredicatePushdown(),
+          enablePlannerAwarePushdown:
+            this.#config?.enablePlannerAwarePushdown !== false,
           getSource: name => this.#getSource(name),
           createStorage: () => this.#createStorage(),
           decorateSourceInput: (input: SourceInput, _queryID: string): Input =>
@@ -1139,27 +1150,26 @@ export class PipelineDriver {
 
   /** Implements `BuilderDelegate.getSource()` */
   #getSource(tableName: string): Source {
-    let source = this.#tables.get(tableName);
-    if (source) {
+    return getOrInsertComputed(this.#tables, tableName, tableName => {
+      const tableSpec = mustGetTableSpec(this.#tableSpecs, tableName);
+      const primaryKey = mustGetPrimaryKey(this.#primaryKeys, tableName);
+
+      const {db} = this.#snapshotter.current();
+      const source = new TableSource(
+        this.#lc,
+        this.#logConfig,
+        db.db,
+        tableName,
+        tableSpec.zqlSpec,
+        primaryKey,
+        () => this.#shouldYield(),
+        // Pipelines only read tables through their connections, and the
+        // sources are moved to the next snapshot after every advancement.
+        {skipUnobservableChanges: true},
+      );
+      this.#lc.debug?.(`created TableSource for ${tableName}`);
       return source;
-    }
-
-    const tableSpec = mustGetTableSpec(this.#tableSpecs, tableName);
-    const primaryKey = mustGetPrimaryKey(this.#primaryKeys, tableName);
-
-    const {db} = this.#snapshotter.current();
-    source = new TableSource(
-      this.#lc,
-      this.#logConfig,
-      db.db,
-      tableName,
-      tableSpec.zqlSpec,
-      primaryKey,
-      () => this.#shouldYield(),
-    );
-    this.#tables.set(tableName, source);
-    this.#lc.debug?.(`created TableSource for ${tableName}`);
-    return source;
+    });
   }
 
   #shouldYield(): boolean {

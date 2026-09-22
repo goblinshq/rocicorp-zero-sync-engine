@@ -33,6 +33,7 @@ import {Join} from '../ivm/join.ts';
 import type {Input, InputBase, Storage} from '../ivm/operator.ts';
 import {Skip} from '../ivm/skip.ts';
 import type {Source, SourceInput} from '../ivm/source.ts';
+import {TakeGate, type TakeBoundProvider} from '../ivm/take-gate.ts';
 import {Take} from '../ivm/take.ts';
 import {UnionFanIn} from '../ivm/union-fan-in.ts';
 import {UnionFanOut} from '../ivm/union-fan-out.ts';
@@ -40,6 +41,7 @@ import {planQuery} from '../planner/planner-builder.ts';
 import type {ConnectionCostModel} from '../planner/planner-connection.ts';
 import type {PlanDebugger} from '../planner/planner-debug.ts';
 import {completeOrdering} from '../query/complete-ordering.ts';
+import {pushDownCorrelatedPredicates} from './correlated-predicate-pushdown.ts';
 import type {DebugDelegate} from './debug-delegate.ts';
 import {
   createPredicate,
@@ -72,6 +74,27 @@ export interface BuilderDelegate {
    * 3. NOT EXISTS requires complete knowledge of what doesn't exist
    */
   readonly enableNotExists?: boolean | undefined;
+
+  /**
+   * When true, does not copy a parent's conditions on correlation columns
+   * into its subqueries (see {@link pushDownCorrelatedPredicates}).
+   * Defaults to false.
+   *
+   * Only zero-cache sets this, as a kill switch.
+   */
+  readonly disableCorrelatedPredicatePushdown?: boolean | undefined;
+
+  /**
+   * When true, copies a parent's conditions into its subqueries before
+   * planning instead of after, and tells the planner which conditions it
+   * copied. The planner then sees when a copied condition makes a flipped
+   * join cheap. Has no effect when `disableCorrelatedPredicatePushdown` is
+   * true. Defaults to false.
+   *
+   * Only zero-cache sets this. This changes plans, and the pushdown alone
+   * does not.
+   */
+  readonly enablePlannerAwarePushdown?: boolean | undefined;
 
   /**
    * Called once for each source needed by the AST.
@@ -141,8 +164,25 @@ export function buildPipeline(
     tableName => must(delegate.getSource(tableName)).tableSchema.primaryKey,
   );
 
-  if (costModel) {
-    ast = planQuery(ast, costModel, planDebugger, lc);
+  const columnsOf = (tableName: string) =>
+    must(delegate.getSource(tableName)).tableSchema.columns;
+  if (delegate.disableCorrelatedPredicatePushdown) {
+    if (costModel) {
+      ast = planQuery(ast, costModel, planDebugger, lc);
+    }
+  } else if (delegate.enablePlannerAwarePushdown) {
+    const pushed = new Set<SimpleCondition>();
+    ast = pushDownCorrelatedPredicates(ast, columnsOf, pushed);
+    if (costModel) {
+      ast = planQuery(ast, costModel, planDebugger, lc, pushed);
+    }
+  } else {
+    if (costModel) {
+      ast = planQuery(ast, costModel, planDebugger, lc);
+    }
+    // After planning, so that the planner does not read the pushed conditions
+    // as selective filters.
+    ast = pushDownCorrelatedPredicates(ast, columnsOf);
   }
   return buildPipelineInternal(ast, delegate, queryID, '');
 }
@@ -263,7 +303,7 @@ function buildPipelineInternal(
   queryID: string,
   name: string,
   partitionKey?: CompoundKey,
-  isNonFlippedExistsChild?: boolean | undefined,
+  isNonFlippedExistsChild?: boolean,
 ): Input {
   const source = delegate.getSource(ast.table);
   if (!source) {
@@ -330,6 +370,14 @@ function buildPipelineInternal(
     end = delegate.decorateInput(skip, `${name}:skip)`);
   }
 
+  let takeGate: TakeGate | undefined;
+  if (ast.limit !== undefined && !useCap) {
+    const takeGateName = `${name}:take-gate`;
+    takeGate = new TakeGate(end);
+    delegate.addEdge(end, takeGate);
+    end = delegate.decorateInput(takeGate, takeGateName);
+  }
+
   for (const csqCondition of csqConditions) {
     // flipped EXISTS are handled in applyWhere
     if (!csqCondition.flip) {
@@ -349,12 +397,14 @@ function buildPipelineInternal(
         end,
         name,
         true,
+        undefined,
+        takeGate,
       );
     }
   }
 
   if (ast.where && (!fullyAppliedFilters || delegate.applyFiltersAnyway)) {
-    end = applyWhere(end, ast.where, delegate, name);
+    end = applyWhere(end, ast.where, delegate, name, partitionKey, takeGate);
   }
 
   if (ast.limit !== undefined) {
@@ -383,6 +433,10 @@ function buildPipelineInternal(
       );
       delegate.addEdge(end, take);
       end = delegate.decorateInput(take, takeName);
+      takeGate?.setBoundProvider(take);
+      if (takeGate) {
+        take.setTakeGate(takeGate);
+      }
     }
   }
 
@@ -393,7 +447,15 @@ function buildPipelineInternal(
       byAlias.set(csq.subquery.alias ?? '', csq);
     }
     for (const csq of byAlias.values()) {
-      end = applyCorrelatedSubQuery(csq, delegate, queryID, end, name, false);
+      end = applyCorrelatedSubQuery(
+        csq,
+        delegate,
+        queryID,
+        end,
+        name,
+        false,
+        partitionKey,
+      );
     }
   }
 
@@ -405,6 +467,8 @@ function applyWhere(
   condition: Condition,
   delegate: BuilderDelegate,
   name: string,
+  parentPartitionKey?: CompoundKey,
+  boundProvider?: TakeBoundProvider,
 ): Input {
   if (!conditionIncludesFlippedSubqueryAtAnyLevel(condition)) {
     return buildFilterPipeline(
@@ -415,7 +479,14 @@ function applyWhere(
     );
   }
 
-  return applyFilterWithFlips(input, condition, delegate, name);
+  return applyFilterWithFlips(
+    input,
+    condition,
+    delegate,
+    name,
+    parentPartitionKey,
+    boundProvider,
+  );
 }
 
 function applyFilterWithFlips(
@@ -423,6 +494,8 @@ function applyFilterWithFlips(
   condition: Condition,
   delegate: BuilderDelegate,
   name: string,
+  parentPartitionKey?: CompoundKey,
+  boundProvider?: TakeBoundProvider,
 ): Input {
   let end = input;
   assert(condition.type !== 'simple', 'Simple conditions cannot have flips');
@@ -447,7 +520,14 @@ function applyFilterWithFlips(
       }
       assert(withFlipped.length > 0, 'Impossible to have no flips here');
       for (const cond of withFlipped) {
-        end = applyFilterWithFlips(end, cond, delegate, name);
+        end = applyFilterWithFlips(
+          end,
+          cond,
+          delegate,
+          name,
+          parentPartitionKey,
+          boundProvider,
+        );
       }
       break;
     }
@@ -479,7 +559,16 @@ function applyFilterWithFlips(
       }
 
       for (const cond of withFlipped) {
-        branches.push(applyFilterWithFlips(end, cond, delegate, name));
+        branches.push(
+          applyFilterWithFlips(
+            end,
+            cond,
+            delegate,
+            name,
+            parentPartitionKey,
+            boundProvider,
+          ),
+        );
       }
 
       const ufi = new UnionFanIn(ufo, branches);
@@ -511,6 +600,8 @@ function applyFilterWithFlips(
         ),
         hidden: sq.hidden ?? false,
         system: sq.system ?? 'client',
+        parentPartitionKey,
+        boundProvider,
       });
       delegate.addEdge(end, flippedJoin);
       delegate.addEdge(child, flippedJoin);
@@ -659,6 +750,8 @@ function applyCorrelatedSubQuery(
   end: Input,
   name: string,
   fromCondition: boolean,
+  parentPartitionKey?: CompoundKey,
+  boundProvider?: TakeBoundProvider,
 ) {
   // TODO: we only omit the join if the CSQ if from a condition since
   // we want to create an empty array for `related` fields that are `limit(0)`
@@ -685,6 +778,9 @@ function applyCorrelatedSubQuery(
     relationshipName: sq.subquery.alias,
     hidden: sq.hidden ?? false,
     system: sq.system ?? 'client',
+    parentPartitionKey: fromCondition ? undefined : parentPartitionKey,
+    boundProvider,
+    trackPartitions: !fromCondition,
   });
   delegate.addEdge(end, join);
   delegate.addEdge(child, join);

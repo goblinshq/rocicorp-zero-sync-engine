@@ -593,6 +593,20 @@ export const zeroOptions = {
     hidden: true,
   },
 
+  snapshotRowCacheSize: {
+    type: v.number().default(50_000),
+    desc: [
+      `The maximum number of entries in the per-worker cache of replica rows`,
+      `read while advancing IVM pipelines. Every client group on a sync worker`,
+      `reads the new and previous value of each replicated row change; the`,
+      `cache lets the client groups on a worker share those reads. A replicated`,
+      `transaction of N rows produces up to 2N entries.`,
+      ``,
+      `Setting this to 0 disables the cache.`,
+    ],
+    hidden: true,
+  },
+
   enableQueryPlanner: {
     type: v.boolean().default(true),
     desc: [
@@ -603,6 +617,30 @@ export const zeroOptions = {
       ``,
       `You can disable the planner if it is picking bad strategies.`,
     ],
+  },
+
+  enableCorrelatedPredicatePushdown: {
+    type: v.boolean().default(true),
+    desc: [
+      `Copy a query's equality conditions on a relationship's join columns`,
+      `into the related subquery. This reduces the rows that are read when a`,
+      `change is pushed through the query.`,
+      ``,
+      `This is a kill switch. It will be removed.`,
+    ],
+    hidden: true,
+  },
+
+  enablePlannerAwarePushdown: {
+    type: v.boolean().default(true),
+    desc: [
+      `Copy the conditions of correlated predicate pushdown before the query`,
+      `planner runs instead of after, so that the planner can use them. This`,
+      `can change the plans that the planner picks.`,
+      ``,
+      `Has no effect when correlated predicate pushdown is off.`,
+    ],
+    hidden: true,
   },
 
   enableQueryCovering: {

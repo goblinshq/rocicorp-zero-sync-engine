@@ -18,7 +18,11 @@ import {expect} from 'vitest';
 import {astToZQL} from '../../../../ast-to-zql/src/ast-to-zql.ts';
 import {formatOutput} from '../../../../ast-to-zql/src/format.ts';
 import {must} from '../../../../shared/src/must.ts';
-import type {AST, Condition} from '../../../../zero-protocol/src/ast.ts';
+import type {
+  AST,
+  LiteralValue,
+  SimpleOperator,
+} from '../../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
 import type {NameMapper} from '../../../../zero-schema/src/name-mapper.ts';
 import {makeServerTransaction} from '../../../../zero-server/src/custom.ts';
@@ -35,6 +39,7 @@ import type {AnyQuery} from '../../../../zql/src/query/query.ts';
 import {mapResultToClientNames} from '../../../../zqlite/src/test/source-factory.ts';
 import {type Delegates, runAndCompare} from '../../helpers/runner.ts';
 import {schema} from '../schema.ts';
+import {pinOn, relOf} from './axes.ts';
 import type {CostModel} from './cost.ts';
 import {
   applyLimit,
@@ -47,10 +52,20 @@ import {
   rowLabel,
 } from './cover.ts';
 import {Coverage} from './coverage.ts';
-import {flipAssignments, flippableExistsCount, setFlips} from './flip.ts';
+import {
+  flipAssignments,
+  flippableExistsCount,
+  flipVariants,
+  setFlips,
+} from './flip.ts';
 import type {Data} from './literals.ts';
 import {mutate} from './mutate.ts';
-import {fourPhase, type Mutation, pushForSkeleton} from './push.ts';
+import {
+  fourPhase,
+  type Mutation,
+  pushForSkeleton,
+  queryTables,
+} from './push.ts';
 import type {Regression} from './regressions.ts';
 import {rng} from './rng.ts';
 import {scalarizableExistsCount, setScalars} from './scalar.ts';
@@ -150,7 +165,7 @@ export function skeletonQueryCases(
  * that matter are 3-way — a flipped gate must sit *inside an OR* (that is what makes
  * `builder.ts` construct the `UnionFanOut`/`UnionFanIn` pair) *and* carry a `limit` (to
  * put a `Take` above the fan-in). At `t=2` the greedy cover realizes
- * `flip x exists_or x limit` in zero rows; at `t=3`, in 17.
+ * `flip x exists_or x limit` in zero rows; at `t=3`, in 19.
  */
 export function l1QueryCases(
   data: Data,
@@ -618,6 +633,79 @@ export function decoratedPushCases(
 }
 
 /**
+ * Push cases whose root `where` pins the join column of the root's first relationship,
+ * with `=` on one present value or `IN` on two. Correlated predicate pushdown copies such
+ * a pin into the child, and on down a chain that correlates on the same column, so these
+ * are the queries it rewrites. Every table in the query is mutated, so pushes cross the
+ * copied filter both from the parent side and from the child side.
+ *
+ * Each pinned query is also run under every flip assignment of its EXISTS gates (up to
+ * `maxFlips` gates). In production the planner can flip a pinned EXISTS child, and a
+ * flipped child is where the copied pin matters most: it is the only thing that limits
+ * the outer loop's read of the child.
+ */
+export function pinnedPushCases(
+  data: Data,
+  skels: readonly Skeleton[],
+  n: number,
+  maxFlips = 4,
+): readonly PushCase[] {
+  const cases: PushCase[] = [];
+  for (const s of skels) {
+    if (s.children.length === 0) {
+      continue;
+    }
+    const pin = pinOn(
+      s.table,
+      must(relOf(s.table, s.children[0].rel)).parentField[0],
+    );
+    if (!pin) {
+      continue;
+    }
+    const base = lower(s);
+    const mutations = [...queryTables(asQueryInternals(base).ast)].flatMap(t =>
+      fourPhase(data, t, n),
+    );
+    const pins: Array<[string, SimpleOperator, LiteralValue]> = [
+      ['eq', '=', pin.eq],
+      ['in', 'IN', pin.in],
+    ];
+    for (const [tag, op, value] of pins) {
+      // oxlint-disable-next-line @typescript-eslint/no-explicit-any
+      const pinned: AnyQuery = (base as any).where(pin.col, op, value);
+      for (const [suffix, query] of queryFlipVariants(pinned, maxFlips)) {
+        cases.push({
+          label: `pinpush|${tag}|${label(s)}${suffix}`,
+          query,
+          mutations,
+        });
+      }
+    }
+  }
+  return cases;
+}
+
+/**
+ * Check per-step push parity for each case inside a rolled-back transaction, collecting
+ * every failure.
+ */
+export async function checkPushCases(
+  transact: Transact,
+  cases: readonly PushCase[],
+): Promise<Report> {
+  const failures: Array<[string, string]> = [];
+  for (const c of cases) {
+    const msg = await capture(() =>
+      transact(d => pushWalk(d, c.query, c.mutations)),
+    );
+    if (msg) {
+      failures.push([c.label, msg]);
+    }
+  }
+  return {total: cases.length, failures};
+}
+
+/**
  * **Push sweep:** lower each skeleton, generate its four-phase push history (root +
  * deepest leaf), and check per-step push parity inside a rolled-back transaction. `n`
  * rows per mutated table. The four-phase sequence is net-zero (it restores the seed), so
@@ -736,46 +824,28 @@ function yieldPlanVariants(
   s: Skeleton,
   maxFlips: number,
 ): Array<[string, AnyQuery]> {
-  const base = lower(s);
-  const out: Array<[string, AnyQuery]> = [['', base]];
-  const ast = asQueryInternals(base).ast;
-  const k = flippableExistsCount(ast);
-  if (k === 0 || k > maxFlips) {
-    return out;
-  }
-  for (const bits of flipAssignments(k)) {
-    if (!bits.some(b => b)) {
-      continue; // all-false is the default lowering, already in `out`
-    }
-    out.push([
-      `|flip${bits.map(b => (b ? 1 : 0)).join('')}`,
-      wrapAst(setFlips(ast, bits)),
-    ]);
-  }
-  return out;
+  return queryFlipVariants(lower(s), maxFlips);
 }
 
 /**
- * The tables an AST touches (root + every correlated subquery / related child), so a
- * decorated case can be given mutations on both sides of a gate.
+ * `query` as lowered, plus **every** other flip assignment of its positive EXISTS gates
+ * (only `query` when it has none, or more than `maxFlips`). The planner only ever changes
+ * flips, so these are all the plans it can produce for `query`.
  */
-function astTables(ast: AST, out: Set<string> = new Set()): Set<string> {
-  out.add(ast.table);
-  for (const r of ast.related ?? []) {
-    astTables(r.subquery, out);
-  }
-  const walk = (c: Condition | undefined): void => {
-    if (!c) {
-      return;
-    }
-    if (c.type === 'and' || c.type === 'or') {
-      c.conditions.forEach(walk);
-    } else if (c.type === 'correlatedSubquery') {
-      astTables(c.related.subquery, out);
-    }
-  };
-  walk(ast.where);
-  return out;
+function queryFlipVariants(
+  query: AnyQuery,
+  maxFlips: number,
+): Array<[string, AnyQuery]> {
+  const ast = asQueryInternals(query).ast;
+  return [
+    ['', query],
+    ...flipVariants(ast, maxFlips).map(
+      ([suffix, flippedAst]): [string, AnyQuery] => [
+        suffix,
+        wrapAst(flippedAst),
+      ],
+    ),
+  ];
 }
 
 /**
@@ -826,7 +896,7 @@ export async function checkYieldPush(
     const ast = asQueryInternals(c.query).ast;
     // Mutate both sides of the gate: parent pushes drive the fan-out, child pushes drive
     // the flipped join's own push path into the fan-in.
-    const mutations = [...astTables(ast)].flatMap(t => fourPhase(data, t, n));
+    const mutations = [...queryTables(ast)].flatMap(t => fourPhase(data, t, n));
     if (mutations.length === 0) {
       continue;
     }

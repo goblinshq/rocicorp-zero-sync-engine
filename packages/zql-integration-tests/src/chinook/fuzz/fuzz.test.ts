@@ -10,8 +10,13 @@ import {describe, expect, test} from 'vitest';
 import {must} from '../../../../shared/src/must.ts';
 import type {AST, Condition} from '../../../../zero-protocol/src/ast.ts';
 import type {Row} from '../../../../zero-protocol/src/data.ts';
+import {pushDownCorrelatedPredicates} from '../../../../zql/src/builder/correlated-predicate-pushdown.ts';
 import {MemorySource} from '../../../../zql/src/ivm/memory-source.ts';
-import {makeSourceChangeAdd} from '../../../../zql/src/ivm/source.ts';
+import {
+  makeSourceChangeAdd,
+  makeSourceChangeEdit,
+  makeSourceChangeRemove,
+} from '../../../../zql/src/ivm/source.ts';
 import {consume} from '../../../../zql/src/ivm/stream.ts';
 import {RandomYieldSource} from '../../../../zql/src/ivm/test/random-yield-source.ts';
 import {asQueryInternals} from '../../../../zql/src/query/query-internals.ts';
@@ -23,27 +28,37 @@ import {
   AXES,
   axisIndex,
   EXISTS_VALS,
+  FILTER_VALS,
   FLIP_VALS,
   hasText,
   LIMIT_VALS,
+  N_AXES,
+  pinOf,
   pkOf,
   relsOf,
   tables,
 } from './axes.ts';
 import {CostModel} from './cost.ts';
 import {
+  applyLimit,
+  applyOrder,
   decorate,
   decorateChild,
   decoratableRoots,
   greedyCover,
 } from './cover.ts';
 import {Coverage, tags} from './coverage.ts';
-import {flipAssignments, flippableExistsCount, setFlips} from './flip.ts';
+import {
+  flipAssignments,
+  flippableExistsCount,
+  flipVariants,
+  setFlips,
+} from './flip.ts';
 import {Data} from './literals.ts';
 import {RELATIONS, transform} from './metamorphic.ts';
 import {miniData} from './mini.ts';
 import {mutate} from './mutate.ts';
-import {fourPhase, pushForSkeleton} from './push.ts';
+import {fourPhase, pushForQuery, pushForSkeleton} from './push.ts';
 import {
   loadRegressions,
   parseRegression,
@@ -64,6 +79,7 @@ import {
   enumerate,
   label,
   lower,
+  lowerOr,
   nExists,
   nRelated,
   type Skeleton,
@@ -107,10 +123,10 @@ describe('coverage', () => {
     }
     expect(cov.fraction()).toBe(1);
     expect(cov.missed()).toEqual([]);
-    // Far smaller than the full cross-product (16·7·4·3·4·2 = 10752) …
+    // Far smaller than the full cross-product (18·7·4·3·4·2 = 12096) …
     expect(rows.length).toBeLessThan(200);
-    // … but at least the largest single-pair domain product (filter·exists = 16·7).
-    expect(rows.length).toBeGreaterThanOrEqual(16 * 7);
+    // … but at least the largest single-pair domain product (filter·exists = 18·7).
+    expect(rows.length).toBeGreaterThanOrEqual(18 * 7);
   });
 
   test('observe marks every t-subset; total is the realizable pairwise tuple count', () => {
@@ -881,6 +897,75 @@ describe('random-yield interleave', () => {
   });
 });
 
+// ── join-column pins (the shape correlated predicate pushdown rewrites) ───────────────
+
+/**
+ * Whether correlated predicate pushdown copies a condition into a subquery of `q`. The
+ * pass returns its input when it copies nothing.
+ */
+function pushdownRewrites(q: AnyQuery): boolean {
+  const ast = asQueryInternals(q).ast;
+  return (
+    pushDownCorrelatedPredicates(
+      ast,
+      t => schema.tables[t as keyof typeof schema.tables].columns,
+    ) !== ast
+  );
+}
+
+describe('join-column pins', () => {
+  test('pin literals are present values of the join column', () => {
+    expect(pinOf('track')).toEqual({col: 'albumId', eq: 10, in: [10, 11]});
+    // Only one supportRepId is present, so `IN` has one value.
+    expect(pinOf('customer')).toEqual({col: 'supportRepId', eq: 2, in: [2]});
+    // The boss has no manager, so the first non-null value is used.
+    expect(pinOf('employee')?.eq).toBe(1);
+    expect(pinOf('playlistTrack')).toBeUndefined(); // no relationship
+  });
+
+  test('a pin filter is copied into the gate on every table with a relationship', () => {
+    for (const table of tables()) {
+      for (const [fv, ev] of [
+        ['pin_eq', 'exists_top'],
+        ['pin_in', 'exists_or'],
+        ['pin_eq', 'not_exists_and'],
+      ] as const) {
+        const row = new Array<number>(N_AXES).fill(0);
+        row[axisIndex('filter')] = FILTER_VALS.indexOf(fv);
+        row[axisIndex('exists')] = EXISTS_VALS.indexOf(ev);
+        const res = decorate(table, row, data);
+        if (relsOf(table).length === 0) {
+          expect(res).toBeNull();
+          continue;
+        }
+        expect(pushdownRewrites(must(res)[0]), `${table} ${fv} ${ev}`).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  test('swarm and tail generate pins that the pass copies into a child', () => {
+    const r = rng(0xbeef);
+    let swarm = 0;
+    for (let i = 0; i < 400; i++) {
+      const res = swarmGen(r, Mask.random(r), data);
+      if (res && pushdownRewrites(res[0])) {
+        swarm += 1;
+      }
+    }
+    let tail = 0;
+    for (let i = 0; i < 300; i++) {
+      const res = tailGen(r, tailBounds());
+      if (res && pushdownRewrites(res[0])) {
+        tail += 1;
+      }
+    }
+    expect(swarm).toBeGreaterThan(20);
+    expect(tail).toBeGreaterThan(30);
+  });
+});
+
 // ── sanity: relationships read from the schema ────────────────────────────────────────
 
 test('schema graph exposes junction + self-join relationships', () => {
@@ -891,4 +976,100 @@ test('schema graph exposes junction + self-join relationships', () => {
   expect(
     relsOf('employee').find(r => r.name === 'reportsToEmployee')?.child,
   ).toBe('employee');
+});
+
+/**
+ * The decorated-push cases the in-memory lane walks. Each skeleton is lowered with its
+ * root gates ANDed ({@link lower}) and, when it has any, ORed with a simple root filter
+ * ({@link lowerOr}); each lowering gets a root `orderBy` + small `limit` and runs under
+ * the builder's plan plus every flip assignment of its gates. The push history covers
+ * every table the query touches ({@link pushForQuery}).
+ *
+ * Each dimension closes a gap an earlier version of this lane had, and each one hid a
+ * `Take` push bug: the OR is what puts a fan-in under the `Take`, the flip is the only
+ * thing that builds a `UnionFanIn`, mutating every table sends one source change through
+ * two connections (the self-join, two paths to one table), and depth 2 is what nests an
+ * EXISTS gate under another.
+ */
+function decoratedPushLaneCases(skels: readonly Skeleton[], n: number) {
+  const cases: Array<{
+    label: string;
+    query: AnyQuery;
+    mutations: ReturnType<typeof pushForQuery>;
+  }> = [];
+  for (const s of skels) {
+    const shapes: Array<[string, AnyQuery]> = [['and', lower(s)]];
+    if (s.children.some(c => c.kind !== 'related')) {
+      shapes.push(['or', lowerOr(s)]);
+    }
+    for (const [shape, lowered] of shapes) {
+      const base = applyLimit(applyOrder(lowered, s.table, 'asc1'), 'small');
+      const ast = asQueryInternals(base).ast;
+      const mutations = pushForQuery(data, s, ast, n);
+      if (mutations.length === 0) {
+        continue;
+      }
+      const plans: Array<[string, AnyQuery]> = [
+        ['', base],
+        ...flipVariants(ast, 2).map(([suffix, flipped]): [string, AnyQuery] => [
+          suffix,
+          wrapAst(flipped),
+        ]),
+      ];
+      for (const [suffix, query] of plans) {
+        cases.push({
+          label: `decpush|${shape}|${label(s)}${suffix}`,
+          query,
+          mutations,
+        });
+      }
+    }
+  }
+  return cases;
+}
+
+describe('decorated push memory parity', () => {
+  test('all decpush cases', async () => {
+    const skels = enumerate({depth: 2, related: 1, exists: 2});
+    const cases = decoratedPushLaneCases(skels, 1);
+    // One line per failing case: the first step that diverged from a fresh hydrate.
+    const failures: string[] = [];
+    for (const c of cases) {
+      const delegate = memoryDelegate();
+      const memView = delegate.materialize(c.query);
+      // `null` checks the hydration; each later step checks a mutation.
+      const steps = [null, ...c.mutations];
+      try {
+        for (let i = 0; i < steps.length; i++) {
+          const m = steps[i];
+          if (m) {
+            const src = must(delegate.getSource(m.table));
+            if (m.kind === 'remove') {
+              consume(src.push(makeSourceChangeRemove(m.row)));
+            } else if (m.kind === 'add') {
+              consume(src.push(makeSourceChangeAdd(m.row)));
+            } else if (m.kind === 'edit') {
+              consume(src.push(makeSourceChangeEdit(m.row, m.old)));
+            }
+          }
+          const expected = await delegate.run(c.query);
+          try {
+            expect(memView.data).toEqual(expected);
+          } catch {
+            failures.push(
+              `${c.label}: ${m ? `step ${i - 1} (${m.kind} on ${m.table})` : 'hydrate'}`,
+            );
+            break;
+          }
+        }
+      } catch (e: unknown) {
+        failures.push(
+          `${c.label}: threw ${e instanceof Error ? e.message : String(e)}`,
+        );
+      } finally {
+        memView.destroy();
+      }
+    }
+    expect(failures).toEqual([]);
+  }, 60_000);
 });
