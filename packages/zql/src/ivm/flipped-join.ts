@@ -18,8 +18,12 @@ import {
   canonicalKey,
   canonicalKeyForTest,
   generateWithOverlayNoYield,
+  getMatchingParentEntries,
+  indexParentInStorage,
   isJoinMatch,
   rowEqualsForCompoundKey,
+  unindexParentInStorage,
+  type JoinStorage,
 } from './join-utils.ts';
 import {mergeSortedStreams} from './memory-source.ts';
 import {
@@ -28,6 +32,7 @@ import {
   type Input,
   type MultiConstraint,
   type Output,
+  type Storage,
 } from './operator.ts';
 import type {SourceSchema} from './schema.ts';
 import {type Stream} from './stream.ts';
@@ -85,6 +90,7 @@ type Args = {
   system: System;
   parentPartitionKey?: CompoundKey | undefined;
   boundProvider?: TakeBoundProvider | undefined;
+  storage: Storage;
 };
 
 /**
@@ -104,6 +110,7 @@ export class FlippedJoin implements Input {
   readonly #schema: SourceSchema;
   readonly #parentPartitionKey: CompoundKey | undefined;
   readonly #boundProvider: TakeBoundProvider | undefined;
+  readonly #storage: JoinStorage;
 
   #output: Output = throwOutput;
 
@@ -120,6 +127,7 @@ export class FlippedJoin implements Input {
     system,
     parentPartitionKey,
     boundProvider,
+    storage,
   }: Args) {
     assert(parent !== child, 'Parent and child must be different operators');
     assert(
@@ -133,6 +141,7 @@ export class FlippedJoin implements Input {
     this.#relationshipName = relationshipName;
     this.#parentPartitionKey = parentPartitionKey;
     this.#boundProvider = boundProvider;
+    this.#storage = storage as unknown as JoinStorage;
 
     const parentSchema = parent.getSchema();
     const childSchema = child.getSchema();
@@ -150,10 +159,18 @@ export class FlippedJoin implements Input {
 
     parent.setOutput({
       push: (change: Change) => this.#pushParent(change),
+      reconcile: () => this.#reconcile(),
     });
     child.setOutput({
       push: (change: Change) => this.#pushChild(change),
+      reconcile: () => this.#reconcile(),
     });
+  }
+
+  *#reconcile(): Stream<'yield'> {
+    if (this.#output.reconcile) {
+      yield* this.#output.reconcile(this);
+    }
   }
 
   destroy(): void {
@@ -402,6 +419,7 @@ export class FlippedJoin implements Input {
 
     // yield node if after the overlay it still has relationship nodes
     if (overlaidRelatedChildNodes.length > 0) {
+      this.#indexParentRow(minParentNode.row);
       yield {
         ...minParentNode,
         relationships: {
@@ -448,7 +466,53 @@ export class FlippedJoin implements Input {
       if (!constraint) {
         return;
       }
-      const parentNodeStream = this.#parent.fetch({constraint});
+      const childRow = change[ChangeIndex.NODE].row;
+      const changeType = change[ChangeIndex.TYPE];
+
+      const matching = getMatchingParentEntries(
+        this.#storage,
+        childRow,
+        this.#childKey,
+        this.#parentPartitionKey,
+      );
+      if (!matching) {
+        // If no matching parent is resident in the view, REMOVE and EDIT
+        // cannot affect any view-resident parent. (ADD and CHILD can qualify
+        // previously absent parents).
+        if (changeType !== ChangeType.ADD && changeType !== ChangeType.CHILD) {
+          return;
+        }
+      }
+
+      let parentNodeStream: Stream<Node | 'yield'>;
+      if (changeType !== ChangeType.ADD && changeType !== ChangeType.CHILD) {
+        assert(
+          matching,
+          'Matching entries must exist for non-add child change',
+        );
+        if (matching.length === 1) {
+          const [entry] = matching;
+          parentNodeStream = this.#parent.fetch({
+            constraint: entry.partitionConstraint
+              ? {...constraint, ...entry.partitionConstraint}
+              : constraint,
+          });
+        } else {
+          const streams = matching.map(entry =>
+            this.#parent.fetch({
+              constraint: entry.partitionConstraint
+                ? {...constraint, ...entry.partitionConstraint}
+                : constraint,
+            }),
+          );
+          const compare = (a: Node, b: Node) =>
+            this.#schema.compareRows(a.row, b.row);
+          parentNodeStream = mergeSortedStreams(streams, compare);
+        }
+      } else {
+        parentNodeStream = this.#parent.fetch({constraint});
+      }
+
       for (const parentNode of parentNodeStream) {
         if (parentNode === 'yield') {
           yield 'yield';
@@ -464,7 +528,8 @@ export class FlippedJoin implements Input {
           );
           return constraint ? this.#child.fetch({constraint}) : [];
         };
-        if (!exists) {
+        let parentExists = exists;
+        if (!parentExists) {
           for (const childNode of childNodeStream()) {
             if (childNode === 'yield') {
               yield 'yield';
@@ -475,12 +540,12 @@ export class FlippedJoin implements Input {
                 .getSchema()
                 .compareRows(childNode.row, change[ChangeIndex.NODE].row) !== 0
             ) {
-              exists = true;
+              parentExists = true;
               break;
             }
           }
         }
-        if (exists) {
+        if (parentExists) {
           yield* this.#output.push(
             makeChildChange(
               {
@@ -505,18 +570,39 @@ export class FlippedJoin implements Input {
               [this.#relationshipName]: () => [change[ChangeIndex.NODE]],
             },
           };
-          yield* this.#output.push(
-            change[ChangeIndex.TYPE] === ChangeType.ADD
-              ? makeAddChange(newNode)
-              : makeRemoveChange(newNode),
-            this,
-          );
+          if (change[ChangeIndex.TYPE] === ChangeType.ADD) {
+            this.#indexParentRow(parentNode.row);
+            yield* this.#output.push(makeAddChange(newNode), this);
+          } else {
+            this.#unindexParentRow(parentNode.row);
+            yield* this.#output.push(makeRemoveChange(newNode), this);
+          }
         }
       }
     } finally {
       this.#inprogressChildChange = undefined;
       this.#inprogressChildChangePosition = undefined;
     }
+  }
+
+  #indexParentRow(row: Row): void {
+    indexParentInStorage(
+      this.#storage,
+      row,
+      this.#parentKey,
+      this.#parent.getSchema().primaryKey,
+      this.#parentPartitionKey,
+    );
+  }
+
+  #unindexParentRow(row: Row): void {
+    unindexParentInStorage(
+      this.#storage,
+      row,
+      this.#parentKey,
+      this.#parent.getSchema().primaryKey,
+      this.#parentPartitionKey,
+    );
   }
 
   *#pushParent(change: Change): Stream<'yield'> {
@@ -554,12 +640,14 @@ export class FlippedJoin implements Input {
 
     switch (change[ChangeIndex.TYPE]) {
       case ChangeType.ADD:
+        this.#indexParentRow(change[ChangeIndex.NODE].row);
         yield* this.#output.push(
           makeAddChange(flip(change[ChangeIndex.NODE])),
           this,
         );
         break;
       case ChangeType.REMOVE:
+        this.#unindexParentRow(change[ChangeIndex.NODE].row);
         yield* this.#output.push(
           makeRemoveChange(flip(change[ChangeIndex.NODE])),
           this,
@@ -584,6 +672,8 @@ export class FlippedJoin implements Input {
           ),
           'Parent edit must not change relationship.',
         );
+        this.#unindexParentRow(change[ChangeIndex.OLD_NODE].row);
+        this.#indexParentRow(change[ChangeIndex.NODE].row);
         yield* this.#output.push(
           makeEditChange(
             flip(change[ChangeIndex.NODE]),

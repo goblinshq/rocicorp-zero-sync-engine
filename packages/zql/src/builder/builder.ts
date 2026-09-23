@@ -589,6 +589,7 @@ function applyFilterWithFlips(
         sq.correlation.childField,
         false,
       );
+      const flippedJoinName = `${name}:flipped-join(${sq.subquery.alias})`;
       const flippedJoin = new FlippedJoin({
         parent: end,
         child,
@@ -602,13 +603,11 @@ function applyFilterWithFlips(
         system: sq.system ?? 'client',
         parentPartitionKey,
         boundProvider,
+        storage: delegate.createStorage(flippedJoinName),
       });
       delegate.addEdge(end, flippedJoin);
       delegate.addEdge(child, flippedJoin);
-      end = delegate.decorateInput(
-        flippedJoin,
-        `${name}:flipped-join(${sq.subquery.alias})`,
-      );
+      end = delegate.decorateInput(flippedJoin, flippedJoinName);
       break;
     }
   }
@@ -780,7 +779,7 @@ function applyCorrelatedSubQuery(
     system: sq.system ?? 'client',
     parentPartitionKey: fromCondition ? undefined : parentPartitionKey,
     boundProvider,
-    trackPartitions: !fromCondition,
+    storage: delegate.createStorage(joinName),
   });
   delegate.addEdge(end, join);
   delegate.addEdge(child, join);

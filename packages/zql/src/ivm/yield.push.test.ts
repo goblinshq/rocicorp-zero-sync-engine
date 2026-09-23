@@ -306,6 +306,7 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
       const output = new YieldOutput();
       output.yields = false;
@@ -335,10 +336,12 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
       const output = new YieldOutput();
       output.yields = false;
       join.setOutput(output);
+      consume(join.fetch({}));
 
       // Push to child with parentId='1' which matches the existing parent.
       // Join fetches from parent. Parent has 1 matching node, so fetch yields 2 (1 before node + 1 at end).
@@ -364,10 +367,12 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
       const output = new YieldOutput();
       output.yields = true;
       join.setOutput(output);
+      consume(join.fetch({}));
 
       // Push to child with matching parent. YieldOutput yields.
       expect(
@@ -395,6 +400,7 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
       const output = new YieldOutput();
       output.yields = false;
@@ -424,6 +430,7 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
       const output = new YieldOutput();
       output.yields = false;
@@ -451,6 +458,7 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
       const output = new YieldOutput();
       output.yields = true;
@@ -478,6 +486,7 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
 
       const start = new FilterStart(join);
@@ -507,6 +516,7 @@ describe('Yield Propagation (Push)', () => {
         relationshipName: 'child',
         hidden: false,
         system: 'client',
+        storage: new MemoryStorage(),
       });
 
       const start = new FilterStart(join);
