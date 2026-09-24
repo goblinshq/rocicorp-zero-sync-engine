@@ -48,6 +48,7 @@ import {getMutationResultsQuery} from './cvr.ts';
 import {PipelineDriver, type RowChange, type Timer} from './pipeline-driver.ts';
 import {rowIDSignatureUnit} from './row-set-signature.ts';
 import type {RowID} from './schema/types.ts';
+import {SnapshotRowCache} from './snapshot-row-cache.ts';
 import {ResetPipelinesSignal, Snapshotter} from './snapshotter.ts';
 import {TimeSliceTimer} from './view-syncer.ts';
 
@@ -1786,6 +1787,68 @@ describe('view-syncer/pipeline-driver', () => {
     `);
   });
 
+  test('client groups sharing a row cache advance past a skipped unique-key edit', () => {
+    // Two client groups on one worker share a SnapshotRowCache. Group `a`
+    // cannot observe `foo`, so it skips `foo`'s edit, while group `b` applies
+    // it. The unique-key conflict probe for `baz` must still give each group
+    // the answer for its own `prev` snapshot.
+    const rowCache = new SnapshotRowCache(100);
+    const storage = new Database(lc, ':memory:');
+    storage.prepare(CREATE_STORAGE_TABLE).run();
+    const databaseStorage = new DatabaseStorage(storage);
+    const makeDriver = (clientGroupID: string) =>
+      new PipelineDriver(
+        lc,
+        testLogConfig,
+        new Snapshotter(
+          lc,
+          dbFile.path,
+          {appID: shardID.appID},
+          undefined,
+          rowCache,
+        ),
+        shardID,
+        databaseStorage.createClientGroupStorage(clientGroupID),
+        'pipeline-driver.test.ts',
+        new InspectorDelegate(undefined),
+        () => 200 /** yield threshold */,
+      );
+    const a = makeDriver('a');
+    const b = makeDriver('b');
+    a.init(clientSchema);
+    b.init(clientSchema);
+    [
+      ...a.addQuery(
+        'hash1',
+        'queryID1',
+        {
+          ...UNIQUES_QUERY,
+          where: {
+            type: 'simple',
+            left: {type: 'column', name: 'id'},
+            op: '=',
+            right: {type: 'literal', value: 'boo'},
+          },
+        },
+        startTimer(),
+      ),
+    ];
+    [...b.addQuery('hash1', 'queryID1', UNIQUES_QUERY, startTimer())];
+
+    replicator.processTransaction(
+      '134',
+      messages.update('uniques', {id: 'foo', name: 'wuzzy'}),
+      messages.insert('uniques', {id: 'baz', name: 'bar'}),
+    );
+
+    expect([...a.advance(NO_TIME_ADVANCEMENT_TIMER).changes]).toEqual([]);
+    expect(
+      Array.from(b.advance(NO_TIME_ADVANCEMENT_TIMER).changes, c =>
+        c === 'yield' ? c : `${c.type}:${String(c.rowKey.id)}`,
+      ),
+    ).toEqual([`${ChangeType.EDIT}:foo`, `${ChangeType.ADD}:baz`]);
+  });
+
   test('whereExists query', () => {
     pipelines.init(clientSchema);
     [
@@ -2212,6 +2275,78 @@ describe('view-syncer/pipeline-driver', () => {
         },
       ]
     `);
+  });
+
+  test('child change pushed to several parents streams each row once', () => {
+    // Adding issueLabels 2-1 is pushed to comments 20, 21 and 22 in turn.
+    // Issue 2 enters the query at comment 20, and its subtree must be read
+    // then: read after the push, it would already hold comments 21 and 22,
+    // which are then added again by their own pushes.
+    const query: AST = {
+      table: 'issues',
+      orderBy: [['id', 'asc']],
+      where: {
+        type: 'correlatedSubquery',
+        op: 'EXISTS',
+        related: {
+          system: 'client',
+          correlation: {parentField: ['id'], childField: ['issueID']},
+          subquery: {
+            table: 'comments',
+            alias: 'zsubq_comments',
+            orderBy: [['id', 'asc']],
+            where: {
+              type: 'correlatedSubquery',
+              op: 'EXISTS',
+              related: {
+                system: 'client',
+                correlation: {
+                  parentField: ['issueID'],
+                  childField: ['issueID'],
+                },
+                subquery: {
+                  table: 'issueLabels',
+                  alias: 'zsubq_issueLabels',
+                  orderBy: [
+                    ['issueID', 'asc'],
+                    ['labelID', 'asc'],
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+
+    pipelines.init(clientSchema);
+    [...pipelines.addQuery('hash1', 'queryID', query, startTimer())];
+
+    replicator.processTransaction(
+      '134',
+      messages.insert('issueLabels', {
+        issueID: '2',
+        labelID: '1',
+        legacyID: '2-1',
+      }),
+    );
+
+    const counts = new Map<string, number>();
+    for (const change of changes()) {
+      if (change === 'yield') {
+        continue;
+      }
+      const {table, rowKey} = change;
+      const key = `${table} ${JSON.stringify(rowKey)}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    expect(Object.fromEntries(counts)).toEqual({
+      'issues {"id":"2"}': 1,
+      'comments {"id":"20"}': 1,
+      'comments {"id":"21"}': 1,
+      'comments {"id":"22"}': 1,
+      'issueLabels {"issueID":"2","labelID":"1"}': 3,
+    });
   });
 
   test('getRow', () => {
