@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790073029546,
+  "lastUpdate": 1790332219596,
   "repoUrl": "https://github.com/goblinshq/rocicorp-zero-sync-engine",
   "entries": {
     "Bundle Sizes": [
@@ -55761,6 +55761,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "Size of replicache.min.mjs.br (Brotli compressed)",
             "value": 34130,
+            "unit": "bytes"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "41898282+github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "committer": {
+            "email": "41898282+github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "distinct": true,
+          "id": "7ebedda658bbe25cd4d58b1847ca0d021a590124",
+          "message": "Merge remote-tracking branch 'upstream/main'",
+          "timestamp": "2026-09-25T10:29:02Z",
+          "tree_id": "a35965799bfc2a68f45747508dfe4ffbccf5e0da",
+          "url": "https://github.com/goblinshq/rocicorp-zero-sync-engine/commit/7ebedda658bbe25cd4d58b1847ca0d021a590124"
+        },
+        "date": 1790332208545,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Size of replicache.mjs",
+            "value": 326494,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.mjs.br (Brotli compressed)",
+            "value": 59167,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs",
+            "value": 119478,
+            "unit": "bytes"
+          },
+          {
+            "name": "Size of replicache.min.mjs.br (Brotli compressed)",
+            "value": 34097,
             "unit": "bytes"
           }
         ]
