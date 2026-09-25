@@ -347,6 +347,37 @@ test('zero-cache --help', () => {
        ZERO_LOG_SLOW_HYDRATE_THRESHOLD env                                                                                                                                                                    
                                                                                    The number of milliseconds a query hydration must take to print a slow warning.                                            
                                                                                                                                                                                                               
+                                                                                   The warning logs the query with its literal values redacted, and is logged                                                 
+                                                                                   at most once every 5 minutes per query shape (the query with its values                                                    
+                                                                                   redacted), with a count of the slow hydrations suppressed in between.                                                      
+                                                                                                                                                                                                              
+     --log-slow-advance-threshold number                                           default: 100                                                                                                               
+       ZERO_LOG_SLOW_ADVANCE_THRESHOLD env                                                                                                                                                                    
+                                                                                   The number of milliseconds a query must take to process one advancement                                                    
+                                                                                   (the changes of a replicated transaction, or a batch of them) to print a                                                   
+                                                                                   slow warning.                                                                                                              
+                                                                                                                                                                                                              
+                                                                                   Like slowHydrateThreshold, the warning logs the query with its values                                                      
+                                                                                   redacted, at most once every 5 minutes per query shape. When an advancement                                                
+                                                                                   times out and resets the pipelines, the queries that took the most time are                                                
+                                                                                   logged regardless of this threshold.                                                                                       
+                                                                                                                                                                                                              
+     --log-plan-warning-row-threshold number                                       default: 10000                                                                                                             
+       ZERO_LOG_PLAN_WARNING_ROW_THRESHOLD env                                                                                                                                                                
+                                                                                   Log a warning when the query planner estimates that one read of a table                                                    
+                                                                                   scans or sorts at least this many rows: a read that scans the whole                                                        
+                                                                                   table because no index covers the columns it looks rows up by, or that                                                     
+                                                                                   sorts every matching row because no index covers the ordering.                                                             
+                                                                                                                                                                                                              
+                                                                                   The warning is logged at most once an hour per query shape (the query                                                      
+                                                                                   with its values redacted). Set to 0 to disable. Requires the query planner.                                                
+                                                                                                                                                                                                              
+     --log-plan-warning-cost-threshold number                                      default: 1000000                                                                                                           
+       ZERO_LOG_PLAN_WARNING_COST_THRESHOLD env                                                                                                                                                               
+                                                                                   Log a warning when the best plan the query planner finds for a query is                                                    
+                                                                                   still estimated to process at least this many rows. Throttled like                                                         
+                                                                                   planWarningRowThreshold. Set to 0 to disable.                                                                              
+                                                                                                                                                                                                              
      --log-ivm-sampling number                                                     default: 5000                                                                                                              
        ZERO_LOG_IVM_SAMPLING env                                                                                                                                                                              
                                                                                    How often to collect IVM metrics. 1 out of N requests will be sampled where N is this value.                               
@@ -1057,6 +1088,49 @@ test.each(['-1', '1.5'])(
         },
       }),
     ).toThrow();
+  },
+);
+
+test('deferred IVM writes are on by default and can be turned off', () => {
+  const parse = (env: Record<string, string>) =>
+    parseOptionsAdvanced(zeroOptions, {
+      envNamePrefix: 'ZERO_',
+      allowUnknown: false,
+      allowPartial: true,
+      env,
+    }).config.deferIvmWrites;
+  expect(parse({})).toBe(true);
+  expect(parse({ZERO_DEFER_IVM_WRITES: 'false'})).toBe(false);
+});
+
+test.each(['0', '-0.1', '2'])(
+  'deferred IVM writes heap proportion rejects %s',
+  proportion => {
+    expect(() =>
+      parseOptionsAdvanced(zeroOptions, {
+        envNamePrefix: 'ZERO_',
+        allowUnknown: false,
+        allowPartial: true,
+        env: {
+          ZERO_DEFER_IVM_WRITES_HEAP_PROPORTION: proportion,
+        },
+      }),
+    ).toThrow();
+  },
+);
+
+test.each(['0.25', '1'])(
+  'deferred IVM writes heap proportion accepts %s',
+  proportion => {
+    const {config} = parseOptionsAdvanced(zeroOptions, {
+      envNamePrefix: 'ZERO_',
+      allowUnknown: false,
+      allowPartial: true,
+      env: {
+        ZERO_DEFER_IVM_WRITES_HEAP_PROPORTION: proportion,
+      },
+    });
+    expect(config.deferIvmWritesHeapProportion).toBe(Number(proportion));
   },
 );
 
