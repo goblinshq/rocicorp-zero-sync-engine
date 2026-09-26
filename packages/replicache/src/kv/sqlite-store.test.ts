@@ -1,8 +1,13 @@
-import {expect, test, vi} from 'vitest';
+import {afterEach, describe, expect, test, vi} from 'vitest';
 import {getOrInsertComputed} from '../../../shared/src/map.ts';
+import {sleep} from '../../../shared/src/sleep.ts';
+import {StorageFailureError} from '../storage-failure.ts';
+import {withWrite} from '../with-transactions.ts';
 import {
+  SQLiteStore,
   SQLiteWrite,
   SQLiteStoreRead,
+  clearAllNamedStoresForTesting,
   type PreparedStatements,
   type SQLiteDatabase,
 } from './sqlite-store.ts';
@@ -147,4 +152,237 @@ test('SQLiteStoreRead rejects pending get and has operations when closed', async
   expect(preparedStatements.has.all).not.toHaveBeenCalled();
   expect(preparedStatements.getMany.all).not.toHaveBeenCalled();
   expect(preparedStatements.hasMany.all).not.toHaveBeenCalled();
+});
+
+describe('storage failures', () => {
+  afterEach(() => {
+    clearAllNamedStoresForTesting();
+  });
+
+  /** A driver whose `execSync` fails on the given statement. */
+  function failingDatabase(
+    failOn: string | undefined,
+    error: Error,
+    failExecWith?: Error | undefined,
+  ): SQLiteDatabase {
+    return {
+      close: () => undefined,
+      destroy: () => undefined,
+      execSync: sql => {
+        if (sql === failOn) {
+          throw error;
+        }
+      },
+      prepare: () => ({
+        all: () => Promise.resolve([]),
+        exec: () =>
+          failExecWith ? Promise.reject(failExecWith) : Promise.resolve(),
+      }),
+    };
+  }
+
+  test('a database that cannot be opened throws a cannot-open StorageFailureError from the constructor', () => {
+    const driverError = new Error(
+      '[op-sqlite] SQLite error code: 14, description: unable to open database file',
+    );
+    let thrown: unknown;
+    try {
+      new SQLiteStore('cannot-open', () => {
+        throw driverError;
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(StorageFailureError);
+    expect((thrown as StorageFailureError).kind).toBe('cannot-open');
+    expect((thrown as StorageFailureError).cause).toBe(driverError);
+  });
+
+  test('a transaction step that fails on the disk rejects with an io-error StorageFailureError', async () => {
+    const driverError = new Error('disk I/O error');
+    const store = new SQLiteStore('io-error', () =>
+      failingDatabase('BEGIN IMMEDIATE', driverError),
+    );
+    const error = await store.write().catch(e => e);
+    expect(error).toBeInstanceOf(StorageFailureError);
+    expect(error.kind).toBe('io-error');
+    expect(error.cause).toBe(driverError);
+  });
+
+  test('a statement that fails on a full disk rejects with a full StorageFailureError', async () => {
+    const driverError = new Error(
+      'Exception in HostFunction: [op-sqlite] SQLite error code: 13, description: database or disk is full',
+    );
+    const store = new SQLiteStore('full', () =>
+      failingDatabase(undefined, new Error('unused'), driverError),
+    );
+    const error = await withWrite(store, write => write.put('k', 'v')).catch(
+      e => e,
+    );
+    expect(error).toBeInstanceOf(StorageFailureError);
+    expect(error.kind).toBe('full');
+    expect(error.cause).toBe(driverError);
+  });
+
+  test('a database whose setup fails is closed', () => {
+    const close = vi.fn();
+    const db: SQLiteDatabase = {
+      close,
+      destroy: () => undefined,
+      execSync: sql => {
+        if (sql.startsWith('PRAGMA')) {
+          throw new Error('disk I/O error');
+        }
+      },
+      prepare: () => ({
+        all: () => Promise.resolve([]),
+        exec: () => Promise.resolve(),
+      }),
+    };
+    expect(() => new SQLiteStore('setup-fails', () => db)).toThrow(
+      StorageFailureError,
+    );
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  test('other SQLite errors pass through unchanged', async () => {
+    const driverError = new Error(
+      'SQLite error code: 5, description: database is locked',
+    );
+    const store = new SQLiteStore('busy', () =>
+      failingDatabase('BEGIN IMMEDIATE', driverError),
+    );
+    await expect(store.write()).rejects.toBe(driverError);
+  });
+});
+
+// A scripted `SQLiteDatabase` that fails exactly the statements a test asks it
+// to, the way SQLite does: an I/O error inside a statement rolls the open
+// transaction back on its own, so the store's later COMMIT/ROLLBACK is refused
+// with `cannot commit - no transaction is active`.
+function makeScriptedDatabase() {
+  const failNextExec = new Map<string, Error>();
+  let statementFailure: Error | undefined;
+  let transactionOpen = false;
+  const db: SQLiteDatabase = {
+    close: vi.fn(),
+    destroy: vi.fn(),
+    execSync(sql: string) {
+      const scripted = failNextExec.get(sql);
+      if (scripted) {
+        failNextExec.delete(sql);
+        throw scripted;
+      }
+      if (sql === 'BEGIN' || sql === 'BEGIN IMMEDIATE') {
+        transactionOpen = true;
+      }
+      if (sql === 'COMMIT' || sql === 'ROLLBACK') {
+        if (!transactionOpen) {
+          throw new Error(
+            `SQLite error code: 1, description: cannot ${sql.toLowerCase()} - no transaction is active`,
+          );
+        }
+        transactionOpen = false;
+      }
+    },
+    prepare() {
+      return {
+        exec: () => Promise.resolve(),
+        all: () => {
+          if (statementFailure) {
+            const failure = statementFailure;
+            statementFailure = undefined;
+            transactionOpen = false;
+            return Promise.reject(failure);
+          }
+          return Promise.resolve([]);
+        },
+      };
+    },
+  };
+  return {
+    db,
+    failNextStatement(error: Error) {
+      statementFailure = error;
+    },
+    failNextExec(sql: string, error: Error) {
+      failNextExec.set(sql, error);
+    },
+  };
+}
+
+// "granted" when the lock request is granted within `ms` (releasing the handle
+// so the probe holds nothing itself), otherwise "still waiting". A rejected
+// request propagates so a failed transaction start is not mistaken for a grant.
+function grantedWithin(
+  promise: Promise<{release(): void}>,
+  ms: number,
+): Promise<'granted' | 'still waiting'> {
+  return Promise.race([
+    promise.then(handle => {
+      try {
+        handle.release();
+      } catch {
+        // A refused ROLLBACK on the scripted database is not what is measured.
+      }
+      return 'granted' as const;
+    }),
+    sleep(ms).then(() => 'still waiting' as const),
+  ]);
+}
+
+test('SQLiteStore releases the read lock when the shared read transaction cannot be committed', async () => {
+  const scripted = makeScriptedDatabase();
+  const store = new SQLiteStore('read-commit-refused', () => scripted.db, {});
+
+  const read = await store.read();
+  scripted.failNextStatement(
+    new Error('SQLite error code: 10, description: disk I/O error'),
+  );
+  await expect(read.get('k')).rejects.toThrow(/disk I\/O error/);
+
+  // SQLite already rolled the shared read transaction back, so the last
+  // reader's closing COMMIT is refused. The error is the reader's to see...
+  expect(() => read.release()).toThrow(
+    /cannot commit - no transaction is active/,
+  );
+
+  // ...and the RWLock must still be released, or every write() on this store
+  // (persist, refresh, heartbeat, GC) waits forever from here on.
+  expect(await grantedWithin(store.write(), 50)).toBe('granted');
+  await store.close();
+});
+
+test('SQLiteStore releases the write lock when BEGIN IMMEDIATE throws', async () => {
+  const scripted = makeScriptedDatabase();
+  const store = new SQLiteStore(
+    'begin-immediate-refused',
+    () => scripted.db,
+    {},
+  );
+
+  scripted.failNextExec(
+    'BEGIN IMMEDIATE',
+    new Error('SQLite error code: 5, description: database is locked'),
+  );
+  await expect(store.write()).rejects.toThrow(/database is locked/);
+
+  // The caller was told; the store must be usable again.
+  expect(await grantedWithin(store.write(), 50)).toBe('granted');
+  expect(await grantedWithin(store.read(), 50)).toBe('granted');
+  await store.close();
+});
+
+test('SQLiteStore releases the read lock when BEGIN throws', async () => {
+  const scripted = makeScriptedDatabase();
+  const store = new SQLiteStore('begin-refused', () => scripted.db, {});
+
+  scripted.failNextExec(
+    'BEGIN',
+    new Error('SQLite error code: 10, description: disk I/O error'),
+  );
+  await expect(store.read()).rejects.toThrow(/disk I\/O error/);
+
+  expect(await grantedWithin(store.write(), 50)).toBe('granted');
+  await store.close();
 });
