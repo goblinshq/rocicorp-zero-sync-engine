@@ -59,6 +59,7 @@ function seed(db: Database, rows: number) {
 function config(file: string): NormalizedZeroConfig {
   return {
     adminPassword: 'secret',
+    operatorPassword: 'operator-secret',
     replica: {file},
     log: {level: 'error'},
     enableQueryPlanner: true,
@@ -192,6 +193,14 @@ describe('plannerz bundle', () => {
         stat4: undefined,
       },
     ]);
+  });
+
+  test('about does not point at routes that are not built', () => {
+    // `/plannerz/analyze` is designed (Phase 2 in
+    // designs/003_replica_stats_endpoint.md) but not built, so `about` must
+    // not send an LLM to it.
+    const bundle = buildPlannerzBundleFromDB(lc, db, config(file));
+    expect(JSON.stringify(bundle.about)).not.toContain('/plannerz/analyze');
   });
 
   test('a table with no unique key is reported as not syncable', () => {
@@ -353,5 +362,19 @@ describe('plannerz endpoint', () => {
     expect(bundle.about.whatThisIs).toContain('no row data');
     expect(bundle.server.zeroVersion).toBe('0.0.0-test');
     expect(tableNamed(bundle, 'issue').estimatedRows).toBe(100);
+  });
+
+  test('accepts the operator password', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/plannerz',
+      headers: {
+        authorization: `Basic ${Buffer.from('user:operator-secret').toString('base64')}`,
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).not.toContain(SENTINEL);
+    expect(tableNamed(JSON.parse(res.body), 'issue').estimatedRows).toBe(100);
   });
 });
