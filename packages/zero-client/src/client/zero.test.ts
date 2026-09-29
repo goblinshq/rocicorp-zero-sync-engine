@@ -3476,6 +3476,45 @@ test.each(clientStateNotFoundErrorCases)(
   },
 );
 
+test.each(
+  clientStateNotFoundErrorCases.filter(({dropsDatabase}) => dropsDatabase),
+)(
+  '$kind stops the instance persisting before dropping its database',
+  async ({kind, message}) => {
+    const {promise, resolve} = resolver();
+    const z = zeroForTest({onClientStateNotFound: resolve});
+    z.reload = vi.fn();
+    const rep = getInternalReplicacheImplForTesting(z);
+    const stopPersist = vi.spyOn(rep, 'stopPersist');
+    const stopRefresh = vi.spyOn(rep, 'stopRefresh');
+    const databaseStillThereWhenStopped: boolean[] = [];
+    const recordStop = () => {
+      databaseStillThereWhenStopped.push(hasMemStore(z.idbName));
+      return Promise.resolve();
+    };
+    stopPersist.mockImplementation(recordStop);
+    stopRefresh.mockImplementation(recordStop);
+
+    await z.triggerError({kind, message, origin: ErrorOrigin.ZeroCache});
+    await promise;
+
+    // Stopped BEFORE the drop, so nothing of this instance's runs into the
+    // dropped store: the run loop's refresh after the error, the next
+    // scheduled persist, the background processes.
+    expect(stopPersist).toHaveBeenCalledTimes(1);
+    expect(stopRefresh).toHaveBeenCalledTimes(1);
+    expect(databaseStillThereWhenStopped).toEqual([true, true]);
+    expect(hasMemStore(z.idbName)).toBe(false);
+    expect(
+      z.testLogSink.messages.filter(
+        ([level, , args]) =>
+          level === 'error' &&
+          String(args[0]).includes('Error during refresh from storage'),
+      ),
+    ).toEqual([]);
+  },
+);
+
 test('local onClientStateNotFound default handler', async () => {
   const storage: Record<string, string> = {};
   vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(() =>
@@ -4930,34 +4969,38 @@ describe('WebSocket event error handling', () => {
   });
 });
 
-test('socket close code 1006 is logged as info, not error', async () => {
-  const z = zeroForTest({logLevel: 'info'});
-  await z.triggerConnected();
-  const socket = await z.socket;
+test.each([1005, 1006])(
+  'socket close code %i is logged as info, not error',
+  async code => {
+    const z = zeroForTest({logLevel: 'info'});
+    await z.triggerConnected();
+    const socket = await z.socket;
 
-  const initialLogCount = z.testLogSink.messages.length;
-  socket.dispatchEvent(
-    new CloseEvent('close', {code: 1006, reason: '', wasClean: false}),
-  );
-  await z.waitForConnectionStatus(ConnectionStatus.Connecting);
+    const initialLogCount = z.testLogSink.messages.length;
+    socket.dispatchEvent(
+      new CloseEvent('close', {code, reason: '', wasClean: false}),
+    );
+    await z.waitForConnectionStatus(ConnectionStatus.Connecting);
 
-  const newLogs = z.testLogSink.messages.slice(initialLogCount);
-  const closeLog = newLogs.find(
-    ([, , args]) => Array.isArray(args) && args[0] === 'Got socket close event',
-  );
-  expect(closeLog).toBeDefined();
-  assert(closeLog, 'Expected close log entry to be defined');
-  expect(closeLog[0]).toBe('info');
-  expect(closeLog[2][1]).toEqual({code: 1006, reason: '', wasClean: false});
+    const newLogs = z.testLogSink.messages.slice(initialLogCount);
+    const closeLog = newLogs.find(
+      ([, , args]) =>
+        Array.isArray(args) && args[0] === 'Got socket close event',
+    );
+    expect(closeLog).toBeDefined();
+    assert(closeLog, 'Expected close log entry to be defined');
+    expect(closeLog[0]).toBe('info');
+    expect(closeLog[2][1]).toEqual({code, reason: '', wasClean: false});
 
-  const errorLog = newLogs.find(
-    ([level, , args]) =>
-      level === 'error' && args[0] === 'Got unexpected socket close event',
-  );
-  expect(errorLog).toBeUndefined();
+    const errorLog = newLogs.find(
+      ([level, , args]) =>
+        level === 'error' && args[0] === 'Got unexpected socket close event',
+    );
+    expect(errorLog).toBeUndefined();
 
-  await z.close().catch(() => {});
-});
+    await z.close().catch(() => {});
+  },
+);
 
 test('Logging stack on close', async () => {
   const z = zeroForTest({logLevel: 'debug'});
