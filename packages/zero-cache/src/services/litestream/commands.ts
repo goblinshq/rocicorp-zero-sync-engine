@@ -87,8 +87,8 @@ function getLitestream(
     forceCheckpointThresholdMB,
     incrementalBackupIntervalMinutes,
     incrementalBackupIntervalSeconds,
+    syncRequesterEnabled,
     snapshotBackupIntervalHours,
-    snapshotBackupIntervalHoursV5,
     multipartConcurrency,
     multipartSize,
   } = config;
@@ -100,9 +100,6 @@ function getLitestream(
     (v5 ? executableV5 : executable) ??
     must(executable, `Missing --litestream-executable`);
   const litestreamConfig = v5 ? configPathV5 : configPath;
-  const snapshotIntervalHours = v5
-    ? snapshotBackupIntervalHoursV5
-    : snapshotBackupIntervalHours;
   // Disable truncate-page-n if forced checkpoints are enabled,
   // and otherwise use litestream's default.
   const truncatePageN = forceCheckpointThresholdMB ? -1 : 121359;
@@ -125,13 +122,19 @@ function getLitestream(
       ['ZERO_LITESTREAM_INCREMENTAL_BACKUP_INTERVAL_SECONDS']: String(
         incrementalBackupIntervalSeconds, // v5 only
       ),
+      ['ZERO_LITESTREAM_MONITOR_INTERVAL_SECONDS']: String(
+        litestreamMonitorIntervalSeconds(
+          incrementalBackupIntervalSeconds,
+          syncRequesterEnabled,
+        ), // v5 only
+      ),
       ['ZERO_LITESTREAM_TRUNCATE_PAGE_N']: String(truncatePageN),
       ['ZERO_LITESTREAM_LOG_LEVEL']: logLevelOverride ?? logLevel,
       ['ZERO_LITESTREAM_SNAPSHOT_BACKUP_INTERVAL_HOURS']: String(
-        snapshotIntervalHours,
+        snapshotBackupIntervalHours,
       ),
       ['ZERO_LITESTREAM_SNAPSHOT_RETENTION_INTERVAL_HOURS']: String(
-        snapshotIntervalHours + 6, // delete old snapshots after 6 hours
+        snapshotBackupIntervalHours + 6, // delete old snapshots after 6 hours
       ),
       ['ZERO_LITESTREAM_MULTIPART_CONCURRENCY']: String(multipartConcurrency),
       ['ZERO_LITESTREAM_MULTIPART_SIZE']: String(multipartSize),
@@ -141,6 +144,7 @@ function getLitestream(
       ['LITESTREAM_PORT']: String(port),
       ...(endpoint ? {['ZERO_LITESTREAM_ENDPOINT']: endpoint} : {}),
       ...(region ? {['ZERO_LITESTREAM_REGION']: region} : {}),
+      ['LITESTREAM_COMPACTION_SERIALIZE']: 'false',
     },
   };
 }
@@ -386,6 +390,27 @@ function replicaIsValid(
   } finally {
     db?.close();
   }
+}
+
+/**
+ * The interval at which litestream v5 syncs the WAL on its own.
+ *
+ * With the sync requester enabled, zero-cache requests syncs at the
+ * incremental backup interval (see LitestreamSyncRequester), and litestream's
+ * own monitor becomes a backstop that keeps backups and checkpoints
+ * progressing if zero-cache stops requesting them. litestream resets its
+ * monitor tick after every requested sync, so the backstop only fires once
+ * requests stop for a full interval. It must still be longer than the request
+ * interval, or timer jitter would occasionally let a tick slip in just before
+ * a request and seal an extra backup file.
+ */
+export function litestreamMonitorIntervalSeconds(
+  incrementalBackupIntervalSeconds: number,
+  syncRequesterEnabled: boolean,
+): number {
+  return syncRequesterEnabled
+    ? 2 * incrementalBackupIntervalSeconds
+    : incrementalBackupIntervalSeconds;
 }
 
 export function startReplicaBackupProcess(
